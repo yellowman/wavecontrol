@@ -1,0 +1,74 @@
+{
+  "host": {
+    "uptime": 81032528,
+    "time": "2025-12-30 19:45:53",
+    "fwversion": "v4.1.0-rc.1.190.200205.1014",
+    "fwbuild": "190",
+    "hostname": "Three Creeks 2 Brad Kennedy",
+    "devmodel": "airFiber 5X ",
+    "netrole": "airfiber",
+    "loadavg": "0.510000",
+    "totalram": "63553536",
+    "freeram": "40452096"
+  },
+  "wireless": {
+    "mode": "airfiber",
+    "essid": "TC2BK",
+    "frequency": "5840 MHz",
+    "opmode": "master",
+    "antenna": "External",
+    "chains": "1X1",
+    "signal": -57,
+    "distance": 13342,
+    "security": "AES-128",
+    "chanbw": 100
+  },
+  "airfiber": {
+    "enabled": 1,
+    "linkmode": "master",
+    "linkstate": "operational",
+    "duplex": "half",
+    "tx_frequency": 5840000,
+    "rx_frequency": 5840000,
+    "txchanbw": "20MHz",
+    "rxchanbw": "20MHz",
+    "dutycycle": 50,
+    "regdomain": "fcc",
+    "gps_sync": 1,
+    "rxcapacity": 94718080,
+    "txcapacity": 97219840,
+    "txpower": 43,
+    "rxgain": "high",
+    "rxpower0": -58,
+    "rxpower1": -59,
+    "remote_mac": "04:18:D6:E3:2B:B1",
+    "remote_ip": "172.24.13.137",
+    "remote_rxpower0": -56,
+    "remote_rxpower1": -57,
+    "txmodrate": "8x",
+    "remote_txmodrate": "8x",
+    "data_speed": "1000Mbps-Full",
+    "linkuptime": 13737684,
+    "framelength": "2.0ms",
+    "antgain": 23
+  },
+  "gps": {
+    "status": 1,
+    "fix": 1,
+    "sats": 12,
+    "dop": 0.72,
+    "lat": 44.211205,
+    "lon": -121.577263,
+    "alt": 1217.7
+  },
+  "_notes": {
+    "band": "5GHz",
+    "api_style": "airmax (status.cgi)",
+    "unique_features": [
+      "Half duplex TDD (same TX/RX freq)",
+      "GPS sync support",
+      "DFS support available",
+      "20-100MHz channel widths"
+    ]
+  }
+}

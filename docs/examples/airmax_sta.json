@@ -1,0 +1,68 @@
+{
+  "host": {
+    "hostname": "NanoStation-Client1",
+    "uptime": "864000",
+    "fwversion": "8.7.11",
+    "cpuload": "8",
+    "totalram": "64487424",
+    "freeram": "32456789",
+    "time": "1704067200",
+    "loadavg": "0.12 0.08 0.05",
+    "netrole": "bridge"
+  },
+  "mca_status": {
+    "platform": "airmax",
+    "firmware": "XC.v8.7.11+build54321",
+    "shortVersion": "8.7.11",
+    "deviceModel": "NS-5ACL",
+    "deviceName": "NanoStation 5AC Loco"
+  },
+  "wireless": {
+    "mode": "sta",
+    "essid": "AirMAX-Network-Tower3",
+    "frequency": "5180",
+    "chanbw": "40",
+    "txpower": "23",
+    "signal": "-65",
+    "rssi": "-65",
+    "chainrssi": ["-66", "-67"],
+    "noisef": "-95",
+    "ccq": "95",
+    "distance": "1200",
+    "ap": {
+      "mac": "AA:BB:CC:22:33:40"
+    },
+    "stats": {
+      "txrate": "150",
+      "rxrate": "75",
+      "txbytes": "12345678901",
+      "rxbytes": "10987654321",
+      "txpackets": "123456789",
+      "rxpackets": "109876543",
+      "txerrors": "12",
+      "rxerrors": "45"
+    }
+  },
+  "interfaces": {
+    "eth0": {
+      "mac": "AA:BB:CC:22:33:51",
+      "ip": "192.168.3.10",
+      "netmask": "255.255.255.0",
+      "status": "enabled",
+      "speed": "100",
+      "duplex": "full"
+    }
+  },
+  "gps": {
+    "fix": "0"
+  },
+  "services": {
+    "pppoe": "disabled",
+    "dhcpc": "enabled",
+    "dhcpd": "disabled"
+  },
+  "firewall": {
+    "status": "enabled",
+    "iptables": "enabled"
+  }
+}

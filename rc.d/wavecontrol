@@ -1,0 +1,34 @@
+#!/bin/ksh
+#
+# $OpenBSD$
+
+daemon="/usr/local/bin/wavecontrol"
+
+# Run as root - daemon handles privilege separation
+daemon_user="root"
+
+. /etc/rc.d/rc.subr
+
+# Generate random JWT secret on each start (logins invalidated on restart)
+_jwt_secret=$(openssl rand -base64 48)
+
+# For persistent logins across restarts, uncomment and set a static secret:
+#_jwt_secret="changeme-use-openssl-rand-base64-48-to-generate"
+
+# Environment variables
+# Drops to _wavecontrol user automatically (or www, nobody)
+#
+# NOTE: Use IP address (not hostname) - no DNS after privilege drop
+wavecontrol_env="WAVECONTROL_DSN=postgres://wavecontrol:password@127.0.0.1/wavecontrol?sslmode=disable \
+WAVECONTROL_JWT_SECRET=${_jwt_secret}"
+
+# Use pexp to match the process (daemon backgrounds itself)
+pexp="/usr/local/bin/wavecontrol.*"
+
+rc_reload=NO
+
+rc_start() {
+	rc_exec "env ${wavecontrol_env} ${daemon} ${daemon_flags}"
+}
+
+rc_cmd $1

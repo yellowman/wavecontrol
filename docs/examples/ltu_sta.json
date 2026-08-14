@@ -1,0 +1,84 @@
+{
+  "host": {
+    "hostname": "LTU-Lite-Client1",
+    "uptime": 864000,
+    "firmware": "2.5.0+build12345",
+    "fwversion": "2.5.0",
+    "cpuload": 5,
+    "totalram": 67108864,
+    "freeram": 41943040,
+    "time": 1704067200
+  },
+  "identification": {
+    "role": "sta",
+    "mac": "AA:BB:CC:11:22:31",
+    "model": "LTU-Lite",
+    "flavor": "AFLTULITE",
+    "serial": "LTULTE123456",
+    "board": {
+      "shortname": "LTU-Lite",
+      "boardId": "0xe8f7"
+    }
+  },
+  "wireless": {
+    "mode": "sta",
+    "essid": "LTU-Network-Tower2",
+    "frequency": 5800,
+    "channelWidth": 40,
+    "txPower": 25,
+    "signal": -62,
+    "signalPerChain": [-63, -64],
+    "noise": -95,
+    "cinr": {
+      "dl": 25,
+      "ul": 23
+    },
+    "txrate": 100000000,
+    "rxrate": 40000000,
+    "capacity": {
+      "dl": 100000000,
+      "ul": 40000000,
+      "combined": 140000000
+    },
+    "mcs": {
+      "tx": 7,
+      "rx": 6
+    },
+    "airtime": {
+      "dl": 35.2,
+      "ul": 18.5
+    }
+  },
+  "gps": {
+    "fix": true,
+    "lat": 45.535000,
+    "lon": -122.695000,
+    "altitude": 25,
+    "satellites": 9
+  },
+  "interfaces": {
+    "eth0": {
+      "mac": "AA:BB:CC:11:22:31",
+      "ip": "192.168.2.10",
+      "netmask": "255.255.255.0",
+      "status": "up",
+      "speed": 100,
+      "duplex": "full"
+    }
+  },
+  "ap": {
+    "mac": "AA:BB:CC:11:22:30",
+    "name": "LTU-Rocket-Tower2",
+    "ip": "192.168.2.1",
+    "distance": 2500,
+    "connectedTime": 864000
+  },
+  "stats": {
+    "txBytes": 5678901234,
+    "rxBytes": 4321098765,
+    "txPackets": 56789012,
+    "rxPackets": 43210987,
+    "txErrors": 5,
+    "rxErrors": 23
+  }
+}

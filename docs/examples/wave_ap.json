@@ -1,0 +1,224 @@
+{
+  "device": {
+    "uptime": 2592000,
+    "powerTime": 2592000,
+    "ram": {
+      "total": 268435456,
+      "free": 134217728,
+      "usage": 50
+    },
+    "cpu": [
+      {"identifier": "cpu0", "usage": 15}
+    ],
+    "orientation": {
+      "tilt": -2.5,
+      "roll": 0.3,
+      "tiltAvg24h": -2.4,
+      "rollAvg24h": 0.2
+    }
+  },
+  "identification": {
+    "role": "ap",
+    "mac": "AA:BB:CC:DD:EE:F0",
+    "model": "Wave-AP",
+    "product": "Wave-AP",
+    "family": "gp",
+    "firmwareVersion": "1.0.0",
+    "firmware": "gp.wave.v1.0.0.12345.build"
+  },
+  "wireless": {
+    "mode": "ap-ptmp",
+    "essid": "Wave-Network-Tower1",
+    "radios": [
+      {
+        "id": "main",
+        "frequency": {"center": 60480},
+        "channelWidth": {"tx": 2160},
+        "outputPower": {"conducted": 20, "eirp": 66},
+        "gpsSyncState": 3,
+        "linkQuality": {
+          "capacity": {
+            "dl": 1347500,
+            "ul": 1617000,
+            "combined": 1617000,
+            "dlIdeal": 1617000,
+            "ulIdeal": 1617000,
+            "combinedIdeal": 1617000
+          }
+        }
+      },
+      {
+        "id": "backup",
+        "frequency": {"center": 5180},
+        "channelWidth": {"tx": 80},
+        "outputPower": {"conducted": 25, "eirp": 47}
+      }
+    ],
+    "peers": [
+      {
+        "common": {
+          "hostname": "Wave-STA-Site1",
+          "mgmtIp": "192.168.1.10",
+          "distance": 1500,
+          "uptime": 86400,
+          "counters": {
+            "txRate": 800000000,
+            "rxRate": 750000000,
+            "txBytes": 1234567890,
+            "rxBytes": 9876543210
+          },
+          "identification": {
+            "mac": "AA:BB:CC:DD:EE:F1",
+            "model": "Wave-LR",
+            "product": "Wave-LR",
+            "family": "gp",
+            "firmwareVersion": "1.0.0"
+          }
+        },
+        "local": [
+          {
+            "id": "main",
+            "active": true,
+            "connectionTime": 86400,
+            "linkQuality": {
+              "signal": -55,
+              "idealSignal": -55,
+              "signalDay": -57,
+              "mcs": {
+                "txRate": 12,
+                "rxHistogram": []
+              },
+              "capacity": {
+                "dl": 875875,
+                "ul": 1000000,
+                "combined": 976937,
+                "dlIdeal": 1000000,
+                "ulIdeal": 1000000,
+                "combinedIdeal": 1617000
+              },
+              "linkScore": {"dl": 95, "ul": 92},
+              "airtime": {"dl": 45.5, "ul": 32.1}
+            },
+            "connected": true
+          },
+          {
+            "id": "backup",
+            "active": false,
+            "connectionTime": 86400,
+            "linkQuality": {
+              "signal": -59,
+              "signalPerChain": [-64, -61],
+              "noiseFloor": -94,
+              "idealSignal": -59,
+              "signalDay": -60
+            }
+          }
+        ],
+        "remote": [
+          {
+            "id": "main",
+            "serviceUptime": 86400,
+            "antenna": {"name": "Wave-LR-60G", "gain": 46},
+            "linkQuality": {
+              "outputPower": {"eirp": 66, "conducted": 20},
+              "signal": -55,
+              "mcs": {"rxHistogram": []}
+            }
+          },
+          {
+            "id": "backup",
+            "serviceUptime": 86400,
+            "linkQuality": {
+              "signal": -62,
+              "signalPerChain": [-64, -66],
+              "noiseFloor": -94,
+              "idealSignal": -57,
+              "signalDay": -63
+            }
+          }
+        ]
+      },
+      {
+        "common": {
+          "hostname": "Wave-STA-Site2",
+          "mgmtIp": "192.168.1.11",
+          "distance": 2800,
+          "uptime": 172800,
+          "counters": {
+            "txRate": 700000000,
+            "rxRate": 680000000,
+            "txBytes": 2345678901,
+            "rxBytes": 8765432109
+          },
+          "identification": {
+            "mac": "AA:BB:CC:DD:EE:F2",
+            "model": "Wave-LR",
+            "product": "Wave-LR",
+            "family": "gp",
+            "firmwareVersion": "1.0.0"
+          }
+        },
+        "local": [
+          {
+            "id": "main",
+            "active": true,
+            "connectionTime": 172800,
+            "linkQuality": {
+              "signal": -66,
+              "idealSignal": -62,
+              "signalDay": -67,
+              "capacity": {
+                "dl": 700000,
+                "ul": 680000,
+                "combined": 780000,
+                "dlIdeal": 1000000,
+                "ulIdeal": 1000000,
+                "combinedIdeal": 1617000
+              },
+              "linkScore": {"dl": 88, "ul": 85},
+              "airtime": {"dl": 38.2, "ul": 28.7}
+            },
+            "connected": true
+          },
+          {
+            "id": "backup",
+            "active": false,
+            "connectionTime": 172800,
+            "linkQuality": {
+              "signal": -65,
+              "signalPerChain": [-67, -68],
+              "noiseFloor": -95,
+              "idealSignal": -62
+            }
+          }
+        ],
+        "remote": [
+          {
+            "id": "main",
+            "serviceUptime": 172800,
+            "antenna": {"name": "Wave-LR-60G", "gain": 46},
+            "linkQuality": {
+              "signal": -67
+            }
+          },
+          {
+            "id": "backup",
+            "serviceUptime": 172800,
+            "linkQuality": {
+              "signal": -68,
+              "signalPerChain": [-70, -71],
+              "noiseFloor": -95
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "gps": {
+    "fix": true,
+    "lat": 45.523100,
+    "lon": -122.676500,
+    "alt": 150,
+    "sats": 12
+  }
+}

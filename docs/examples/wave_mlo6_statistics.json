@@ -1,0 +1,97 @@
+{
+  "timestamp": 1766421717343,
+  "device": {
+    "cpu": [{"identifier": "ARMv7 Processor rev 4 (v7l)", "usage": 32}],
+    "ram": {"usage": 38, "free": 515686400, "total": 839618560},
+    "uptime": 408,
+    "gps": {
+      "fix": false,
+      "lat": 0.0,
+      "lon": 0.0,
+      "sats": 0
+    }
+  },
+  "interfaces": [
+    {
+      "id": "main",
+      "name": "wifi0",
+      "status": {
+        "enabled": true,
+        "description": "5.2 GHz WiFi interface",
+        "plugged": true
+      }
+    },
+    {
+      "id": "lan/0",
+      "name": "eth0",
+      "status": {
+        "enabled": true,
+        "description": "10000 Mbps LAN interface",
+        "plugged": false,
+        "mtu": 2024
+      }
+    },
+    {
+      "id": "lan/1",
+      "name": "eth1",
+      "statistics": {
+        "txRate": 42984,
+        "rxRate": 14350,
+        "txBytes": 2904107,
+        "rxBytes": 190463
+      },
+      "status": {
+        "enabled": true,
+        "plugged": true,
+        "currentSpeed": "2500-full",
+        "mtu": 2024
+      }
+    }
+  ],
+  "wireless": {
+    "serviceTime": 8203,
+    "serviceUptime": 226,
+    "radios": [
+      {
+        "id": "main",
+        "linkState": "connecting",
+        "frequency": {"type": "channels", "tx": 0},
+        "channelWidth": {"tx": 20, "rx": 20},
+        "outputPower": {"conducted": 0, "eirp": 10},
+        "dfs": {"enabled": false}
+      },
+      {
+        "id": "backup",
+        "linkState": "disabled",
+        "frequency": {"type": "channels", "tx": 0},
+        "channelWidth": {"tx": 20, "rx": 20},
+        "outputPower": {"conducted": 0, "eirp": 0},
+        "dfs": {"enabled": false}
+      }
+    ],
+    "peers": []
+  },
+  "airview": {
+    "utilization": [
+      {"frequency": 5180, "usage": 17},
+      {"frequency": 5745, "usage": 19},
+      {"frequency": 5955, "usage": 20},
+      {"frequency": 6515, "usage": 21},
+      {"frequency": 7055, "usage": 18}
+    ]
+  },
+  "_notes": {
+    "new_fields_vs_wave": [
+      "wireless.radios[] - array of radio states (main + backup)",
+      "wireless.radios[].linkState - connecting/operational/disabled",
+      "wireless.radios[].frequency - per-radio frequency info",
+      "wireless.radios[].channelWidth - per-radio TX/RX widths",
+      "airview.utilization covers both 5GHz and 6GHz spectrum"
+    ],
+    "considerations": [
+      "Need to track both radios separately for full MLO monitoring",
+      "Backup radio (6GHz) may be disabled or operating independently",
+      "Per-radio signal/capacity metrics needed for MLO links"
+    ]
+  }
+}

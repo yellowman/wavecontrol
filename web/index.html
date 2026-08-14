@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>waveControl</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="css/styles.css?v=57"/>
+</head>
+<body class="not-authed">
+  <div id="networkBanner" class="network-banner hidden">Checking connection...</div>
+  <div class="app">
+    <header class="app-header">
+      <div class="logo">
+        <img src="waveControl_wordmark.svg" alt="waveControl" class="logo-img" />
+      </div>
+      <nav class="header-tabs">
+        <a href="#" class="active" data-page="dashboard">Dashboard</a>
+        <a href="#" data-page="map">Map</a>
+        <a href="#" data-page="associations">Quality</a>
+        <a href="#" data-page="drilldown">Drilldown</a>
+        <a href="#" data-page="config">Config</a>
+        <a href="#" data-page="scheduler">Scheduler</a>
+        <a href="#" data-page="firmware">Firmware</a>
+        <a href="#" data-page="reports">Reports</a>
+        <a href="#" data-page="alerts">Alerts <span id="alertNavBadge" class="nav-alert-badge hidden">0</span></a>
+        <a href="#" data-page="settings">Settings</a>
+      </nav>
+      <div class="header-status">
+        <label class="status-badge online">
+          <input type="checkbox" id="filterOnline" checked>
+          <span class="badge-dot"></span>
+          ONLINE <span id="countOnline">0</span>
+        </label>
+        <label class="status-badge offline">
+          <input type="checkbox" id="filterOffline" checked>
+          <span class="badge-dot"></span>
+          OFFLINE <span id="countOffline">0</span>
+        </label>
+        <label class="status-badge unknown">
+          <input type="checkbox" id="filterUnknown" checked>
+          <span class="badge-dot"></span>
+          UNKNOWN <span id="countUnknown">0</span>
+        </label>
+        <button id="ultraBtn" class="status-badge ultra ultra-btn hidden" title="Ultra Debug">
+          <span class="badge-dot"></span>
+          ULTRA <span id="countUltra">0</span>
+        </button>
+      </div>
+      <div class="header-search">
+        <input type="text" id="searchInput" placeholder="Search devices..." class="search-input" />
+        <span id="searchInfo" class="search-info"></span>
+        <button id="searchPrev" class="search-nav" title="Previous (Up)">▲</button>
+        <button id="searchNext" class="search-nav" title="Next (Dn)">▼</button>
+      </div>
+      <div class="header-right">
+        <button id="jobPanelBtn" class="job-panel-toggle" title="View Jobs">
+          <span>Jobs</span>
+          <span class="job-badge" id="jobBadge"></span>
+        </button>
+        <span id="userBadge" class="user-badge">not signed in</span>
+        <button id="logoutBtn" class="logout-btn" title="Sign out">logout</button>
+        <button class="theme-toggle" id="themeToggle" title="Toggle theme"></button>
+      </div>
+    </header>
+    <div class="app-body">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <button class="btn-add" id="btnAddDevice" title="Add Device">+ ADD</button>
+          <button class="btn-add btn-secondary" id="btnBulkAdd" title="Bulk Add">+ BULK</button>
+        </div>
+        <div class="sidebar-search">
+          <input type="text" id="treeSearch" placeholder="Filter tree..." />
+        </div>
+        <div class="sidebar-tree" id="deviceTree"></div>
+        <div class="sidebar-footer">
+          <a href="#" data-page="logs" class="sidebar-link">> Logs</a>
+        </div>
+      </aside>
+      <main id="app" class="main-content"></main>
+      <aside class="detail-panel hidden" id="detailPanel"></aside>
+    </div>
+  </div>
+  
+  <!-- Add Device Modal -->
+  <div id="addDeviceModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Add Device</h3>
+        <button class="modal-close" id="closeAddDevice">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>IP Address</label>
+          <input type="text" id="addDeviceIP" placeholder="192.168.1.1" />
+        </div>
+        <div class="form-group">
+          <label>Username <small>(optional)</small></label>
+          <input type="text" id="addDeviceUser" placeholder="ubnt" />
+        </div>
+        <div class="form-group">
+          <label>Password <small>(optional)</small></label>
+          <input type="password" id="addDevicePass" placeholder="password" />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancelAddDevice">Cancel</button>
+        <button class="btn btn-primary" id="confirmAddDevice">Add Device</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Bulk Add Modal -->
+  <div id="bulkAddModal" class="modal hidden">
+  <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>Bulk Add Devices</h3>
+        <button class="modal-close" id="closeBulkAdd">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>IP Addresses <small>(one per line or comma-separated)</small></label>
+          <textarea id="bulkAddIPs" rows="10" placeholder="192.168.1.1&#10;192.168.1.2&#10;192.168.1.3"></textarea>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" id="bulkAddUser" placeholder="ubnt" />
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="bulkAddPass" placeholder="password" />
+          </div>
+        </div>
+        <div id="bulkAddResults" class="bulk-results hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancelBulkAdd">Cancel</button>
+        <button class="btn btn-primary" id="confirmBulkAdd">Add All</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Upgrade Modal -->
+  <div id="upgradeModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Firmware Upgrade</h3>
+        <button class="modal-close" id="closeUpgrade">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="upgrade-info" id="upgradeInfo"></div>
+        <div class="form-group">
+          <label>Target Version</label>
+          <select id="upgradeSelect"></select>
+          <small class="form-hint">Correct firmware file selected automatically based on device type</small>
+        </div>
+        <div id="upgradeWarning" class="form-warning hidden"></div>
+        <div class="form-check">
+          <input type="checkbox" id="upgradeForce" />
+          <label for="upgradeForce">Force upgrade (re-upload even if same version)</label>
+        </div>
+        <div class="form-check" id="upgradeFanoutOption">
+          <input type="checkbox" id="upgradeFanout" />
+          <label for="upgradeFanout">Fanout: Include connected STAs in upgrade</label>
+        </div>
+        <div id="upgradeProgress" class="upgrade-progress hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancelUpgrade">Cancel</button>
+        <button class="btn btn-primary" id="confirmUpgrade">Upgrade</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Auth Retry Modal (for failed STA credentials) -->
+  <div id="authRetryModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Authentication Required</h3>
+        <button class="modal-close" id="closeAuthRetry">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="authRetryInfo">Some devices failed authentication. Enter credentials to retry:</p>
+        <div id="authRetryDevices" class="auth-retry-list"></div>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="authRetryUser" placeholder="ubnt" />
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="authRetryPass" />
+        </div>
+        <div class="form-check">
+          <input type="checkbox" id="authRetryForce" />
+          <label for="authRetryForce">Force upgrade</label>
+        </div>
+        <div id="authRetryResults" class="bulk-results hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancelAuthRetry">Skip</button>
+        <button class="btn btn-primary" id="confirmAuthRetry">Retry with Credentials</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Batch Config Modal -->
+  <div id="batchConfigModal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>Batch Configuration</h3>
+        <button class="modal-close" onclick="document.getElementById('batchConfigModal').classList.add('hidden')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Select Devices</label>
+          <select id="batchDevices" multiple size="6"></select>
+        </div>
+        <div class="config-grid">
+          <div class="config-row">
+            <input type="checkbox" id="cfgSSID" />
+            <label for="cfgSSID">SSID</label>
+            <input type="text" id="cfgSSIDValue" placeholder="New SSID" />
+          </div>
+          <div class="config-row">
+            <input type="checkbox" id="cfgChannel" />
+            <label for="cfgChannel">Channel</label>
+            <input type="number" id="cfgChannelValue" placeholder="Channel" />
+          </div>
+          <div class="config-row">
+            <input type="checkbox" id="cfgPower" />
+            <label for="cfgPower">TX Power</label>
+            <input type="number" id="cfgPowerValue" placeholder="dBm" />
+          </div>
+          <div class="config-row">
+            <input type="checkbox" id="cfgPassword" />
+            <label for="cfgPassword">Password</label>
+            <input type="password" id="cfgPasswordValue" placeholder="New Password" />
+          </div>
+        </div>
+        <div id="batchConfigResults" class="batch-results"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="document.getElementById('batchConfigModal').classList.add('hidden')">Cancel</button>
+        <button class="btn btn-primary" id="confirmBatchConfig">Apply Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Antenna parameters (RF modeling prep) -->
+  <div id="antennaConfigModal" class="modal hidden">
+    <div class="modal-content modal-xwide antenna-modal">
+      <div class="modal-header">
+        <h2>AP Antenna Parameters</h2>
+        <button class="modal-close" id="closeAntennaConfig">&times;</button>
+      </div>
+      <div class="modal-body antenna-body" id="antennaConfigBody"></div>
+      <div class="modal-footer">
+        <button class="btn" id="closeAntennaConfigFooter">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sector CSV Export Modal -->
+  <div id="exportSectorsModal" class="modal hidden">
+    <div class="modal-content modal-xwide">
+      <div class="modal-header">
+        <h2>Sector CSV Export</h2>
+        <button class="modal-close" id="closeExportSectors">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted" style="margin-top:0; font-size: 13px;">
+          This export is intended for external planning / modeling tools.
+          Rows are generated from AP devices and their assigned Sites.
+        </p>
+
+        <div class="viewer-shell export-viewer">
+          <div class="viewer-head">
+            <div class="viewer-tabs">
+              <button id="exportTabPreview" class="viewer-tab active" data-view="preview">Preview</button>
+              <button id="exportTabRaw" class="viewer-tab" data-view="raw">Raw CSV</button>
+            </div>
+            <div class="viewer-actions">
+              <button class="btn btn-secondary btn-xs" id="copyExportSectors">Copy</button>
+              <button class="btn btn-primary btn-xs" id="downloadExportSectors">Download CSV</button>
+            </div>
+          </div>
+          <div class="viewer-body">
+            <div id="exportSectorsPreview" class="viewer-pane export-preview"></div>
+            <textarea id="exportSectorsTextarea" class="viewer-raw hidden" readonly></textarea>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:flex-end; gap: 10px; flex-wrap:wrap;">
+        <button class="btn" id="closeExportSectorsFooter">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Job Events Modal -->
+  <div id="jobEventsModal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>Job Events</h3>
+        <button class="modal-close" id="closeJobEvents">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="jobEventsInfo" class="job-events-info"></div>
+        <div id="jobEventsList" class="job-events-list"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="document.getElementById('jobEventsModal').classList.add('hidden')">Close</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Toast notifications -->
+  <div id="toastRoot" class="toast-root"></div>
+
+  <!-- Ultra Debug Modal -->
+  <div id="ultraDebugModal" class="modal hidden">
+    <div class="modal-content modal-xwide ultra-modal">
+      <div class="modal-header">
+        <h3>Ultra Debug</h3>
+        <button class="modal-close" id="closeUltraDebug">&times;</button>
+      </div>
+      <div class="modal-body ultra-body">
+        <div class="ultra-controls">
+          <div class="form-group">
+            <label>Target</label>
+            <select id="ultraTargetSelect"></select>
+          </div>
+          <div class="form-group ultra-tail">
+            <label>Tail</label>
+            <input type="number" id="ultraTail" min="1" max="5000" value="500" />
+          </div>
+          <div class="form-check ultra-autorefresh">
+            <input type="checkbox" id="ultraAutoRefresh" checked />
+            <label for="ultraAutoRefresh">Auto refresh</label>
+          </div>
+          <button class="btn btn-secondary btn-xs" id="ultraRefreshBtn">Refresh</button>
+          <button class="btn btn-secondary btn-xs" id="ultraClearBtn" title="Clear the selected ultra debug buffer">Clear</button>
+          <button class="btn btn-danger btn-xs" id="ultraDisableBtn" title="Disable ultra debug for the selected target">Disable</button>
+        </div>
+        <div id="ultraDebugMeta" class="ultra-meta"></div>
+
+        <div class="viewer-shell ultra-viewer">
+          <div class="viewer-head">
+            <div class="viewer-tabs">
+              <button id="ultraTabPretty" class="viewer-tab active" data-view="pretty">Pretty</button>
+              <button id="ultraTabRaw" class="viewer-tab" data-view="raw">Raw JSON</button>
+            </div>
+            <div class="viewer-actions">
+              <button class="btn btn-secondary btn-xs" id="ultraCopyBtn">Copy</button>
+              <button class="btn btn-secondary btn-xs" id="ultraDownloadBtn">Download JSON</button>
+            </div>
+          </div>
+          <div class="viewer-body">
+            <div id="ultraDebugEntries" class="ultra-entries viewer-pane"></div>
+            <textarea id="ultraDebugRaw" class="viewer-raw hidden" readonly></textarea>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="ultraCloseBtn">Close</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Context Menu -->
+  <div id="contextMenu" class="context-menu hidden">
+    <div class="context-item" data-action="refresh">Refresh</div>
+    <div class="context-item" data-action="upgrade">Upgrade</div>
+    <div class="context-item" data-action="fanout">Fanout Upgrade</div>
+    <div class="context-divider"></div>
+    <div class="context-item" data-action="backup">Backup</div>
+    <div class="context-item" data-action="restore">Restore</div>
+    <div class="context-divider"></div>
+    <div class="context-item" data-action="copy-ip">Copy IP</div>
+    <div class="context-item" data-action="copy-mac">Copy MAC</div>
+    <div class="context-item" data-action="copy-firmware">Copy Firmware</div>
+    <div class="context-item" data-action="open-ui">Open Device UI</div>
+    <div class="context-item" data-action="ultra-debug">Enable Ultra Debug</div>
+    <div class="context-divider"></div>
+    <div class="context-item danger" data-action="reboot">Reboot</div>
+    <div class="context-item danger" data-action="delete">Delete</div>
+  </div>
+  
+  <!-- Bulk Action Toolbar -->
+  <div id="bulkToolbar" class="bulk-toolbar hidden">
+    <span class="bulk-count"><span id="bulkSelectedCount">0</span> selected</span>
+    <button class="btn btn-secondary" id="bulkRefresh">Refresh</button>
+    <button class="btn btn-secondary" id="bulkBackup">Backup</button>
+    <button class="btn btn-secondary" id="bulkConfig">Configure</button>
+    <button class="btn btn-secondary" id="bulkMarkAlertable">Mark Alertable</button>
+    <button class="btn btn-secondary" id="bulkMuteAlerts">Mute Alerts</button>
+    <button class="btn btn-primary" id="bulkUpgrade">Upgrade</button>
+    <button class="btn btn-danger" id="bulkDelete">Delete</button>
+    <button class="btn btn-secondary" id="bulkCancel">Cancel</button>
+  </div>
+  
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="js/jszip.min.js"></script>
+    <script type="module" src="js/app.js?v=118"></script>
+</body>
+</html>

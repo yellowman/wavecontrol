@@ -1,0 +1,97 @@
+{
+  "device": {
+    "name": "Wave-STA-Site1",
+    "mac": "AA:BB:CC:DD:EE:F1",
+    "role": "sta",
+    "time": 1704067200
+  },
+  "host": {
+    "hostname": "Wave-STA-Site1",
+    "uptime": 432000,
+    "fwversion": "2.0.0-rc2+12345.abc123",
+    "fwprefix": "WA",
+    "cpuload": 8,
+    "totalram": 268435456,
+    "freeram": 167772160
+  },
+  "identification": {
+    "firmwareVersion": "2.0.0-rc2",
+    "model": "Wave-LR",
+    "product": "Wave Long-Range",
+    "flavor": "GMP",
+    "serial": "WAVESTA123456"
+  },
+  "wireless": {
+    "radio60g": {
+      "enabled": true,
+      "mode": "sta",
+      "frequency": 60480,
+      "channelWidth": 2160,
+      "txPower": 40,
+      "signal": -55,
+      "signalPerChain": [-56, -57],
+      "noise": -95,
+      "txRate": 800000000,
+      "rxRate": 750000000,
+      "mcs": {
+        "tx": 9,
+        "rx": 8
+      },
+      "capacity": {
+        "tx": 450000000,
+        "rx": 400000000,
+        "combined": 850000000
+      },
+      "airtime": {
+        "dl": 45.5,
+        "ul": 32.1
+      },
+      "quality": 92
+    },
+    "radio5g": {
+      "enabled": true,
+      "mode": "backup",
+      "frequency": 5180,
+      "channelWidth": 80,
+      "signal": -70,
+      "signalPerChain": [-71, -72],
+      "txPower": 23
+    }
+  },
+  "gps": {
+    "fix": true,
+    "lat": 45.530000,
+    "lon": -122.690000,
+    "altitude": 45,
+    "satellites": 10
+  },
+  "interfaces": {
+    "eth0": {
+      "mac": "AA:BB:CC:DD:EE:F1",
+      "ip": "192.168.1.10",
+      "netmask": "255.255.255.0",
+      "status": "up",
+      "speed": 1000,
+      "duplex": "full"
+    }
+  },
+  "ap": {
+    "mac": "AA:BB:CC:DD:EE:F0",
+    "name": "Wave-AP-Tower1",
+    "ip": "192.168.1.1",
+    "distance": 1500,
+    "connectedTime": 86400
+  },
+  "linkScore": {
+    "dl": 95,
+    "ul": 92
+  },
+  "stats": {
+    "txBytes": 1234567890,
+    "rxBytes": 9876543210,
+    "txPackets": 12345678,
+    "rxPackets": 98765432,
+    "txErrors": 0,
+    "rxErrors": 12
+  }
+}

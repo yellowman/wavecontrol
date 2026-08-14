@@ -1,0 +1,78 @@
+{
+  "host": {
+    "uptime": 5771822,
+    "time": "2025-12-30 19:57:06",
+    "fwversion": "v4.1.0",
+    "fwbuild": "250",
+    "hostname": "Awbrey 2 Point",
+    "devmodel": "airFiber 24G ",
+    "netrole": "airfiber",
+    "loadavg": "0.670000",
+    "totalram": "63553536",
+    "freeram": "40706048"
+  },
+  "wireless": {
+    "mode": "airfiber",
+    "essid": "POINT",
+    "channel": 11,
+    "frequency": "24100 MHz",
+    "opmode": "master",
+    "antenna": "External",
+    "chains": "2X2",
+    "signal": -64,
+    "distance": 3432,
+    "security": "AES-128",
+    "chanbw": 100
+  },
+  "airfiber": {
+    "enabled": 1,
+    "linkmode": "master",
+    "linkstate": "operational",
+    "duplex": "full",
+    "tx_frequency": 24100000,
+    "rx_frequency": 24200000,
+    "txchanbw": "100MHz",
+    "rxchanbw": "100MHz",
+    "dutycycle": 50,
+    "regdomain": "fcc",
+    "gps_sync": 0,
+    "rxcapacity": 773815040,
+    "txcapacity": 774081280,
+    "txpower": 33,
+    "rxgain": "high",
+    "rxpower0": -67,
+    "rxpower1": -69,
+    "remote_mac": "80:2A:A8:CF:21:49",
+    "remote_ip": "172.20.99.115",
+    "remote_rxpower0": -63,
+    "remote_rxpower1": -64,
+    "txmodrate": "6x",
+    "remote_txmodrate": "6x",
+    "data_speed": "1000Mbps-Full",
+    "linkuptime": 5771732,
+    "framelength": "2.0ms",
+    "antgain": 33,
+    "dualfreqmode": 1
+  },
+  "gps": {
+    "status": 1,
+    "fix": 1,
+    "sats": 7,
+    "dop": 0.65,
+    "lat": 44.077679,
+    "lon": -121.331154,
+    "alt": 1298.9
+  },
+  "_notes": {
+    "band": "24GHz",
+    "api_style": "airmax (status.cgi)",
+    "unique_features": [
+      "Full duplex FDD (24.1/24.2 GHz)",
+      "2x2 MIMO (chains=2X2)",
+      "100MHz channel width",
+      "Highest capacity (~750Mbps each direction)",
+      "Shortest range due to 24GHz propagation",
+      "Licensed band"
+    ]
+  }
+}

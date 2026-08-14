@@ -1,0 +1,67 @@
+{
+  "host": {
+    "uptime": 6512168,
+    "time": "2025-12-30 19:44:44",
+    "fwversion": "v4.1.0",
+    "fwbuild": "250",
+    "hostname": "1540 Coyote Rock Ranch (Sue Hagerty)",
+    "devmodel": "airFiber 11FX ",
+    "netrole": "airfiber",
+    "loadavg": "0.710000",
+    "totalram": "63553536",
+    "freeram": "41910272"
+  },
+  "wireless": {
+    "mode": "airfiber",
+    "essid": "Cinder2Coyote",
+    "frequency": "11645 MHz",
+    "opmode": "slave",
+    "antenna": "External",
+    "chains": "1X1",
+    "signal": -46,
+    "distance": 8433,
+    "security": "AES-128",
+    "chanbw": 100
+  },
+  "airfiber": {
+    "enabled": 1,
+    "linkmode": "slave",
+    "linkstate": "operational",
+    "duplex": "full",
+    "tx_frequency": 11645000,
+    "rx_frequency": 11155000,
+    "txchanbw": "56MHz",
+    "rxchanbw": "56MHz",
+    "dutycycle": 50,
+    "regdomain": "none",
+    "gps_sync": 0,
+    "rxcapacity": 402083200,
+    "txcapacity": 322793600,
+    "txpower": 65,
+    "rxgain": "high",
+    "rxpower0": -46,
+    "rxpower1": -49,
+    "remote_mac": "80:2A:A8:CE:56:F9",
+    "remote_ip": "172.20.51.104",
+    "remote_rxpower0": -47,
+    "remote_rxpower1": -48,
+    "txmodrate": "5x",
+    "remote_txmodrate": "6x",
+    "data_speed": "1000Mbps-Full",
+    "linkuptime": 6020121,
+    "framelength": "2.0ms",
+    "antgain": 36,
+    "dualfreqmode": 1
+  },
+  "_notes": {
+    "band": "11GHz",
+    "api_style": "airmax (status.cgi)",
+    "unique_features": [
+      "Full duplex FDD (separate TX/RX freq)",
+      "dualfreqmode=1 indicates FDD",
+      "Higher TX power (65)",
+      "56MHz fixed channel width",
+      "Licensed band - no DFS"
+    ]
+  }
+}

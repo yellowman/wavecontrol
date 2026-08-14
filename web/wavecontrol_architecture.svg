@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#888"/>
+    </marker>
+    <marker id="arrow-rev" markerWidth="10" markerHeight="7" refX="1" refY="3.5" orient="auto">
+      <polygon points="10 0, 0 3.5, 10 7" fill="#888"/>
+    </marker>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="600" height="400" fill="#0f0f1a"/>
+  
+  <!-- Title -->
+  <text x="300" y="32" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif" font-size="18" font-weight="600">waveControl Architecture</text>
+  
+  <!-- Central Engine Box -->
+  <rect x="225" y="155" width="150" height="70" rx="4" fill="#333" stroke="#555" stroke-width="1.5"/>
+  <text x="300" y="185" text-anchor="middle" fill="#ff8c00" font-family="system-ui, sans-serif" font-size="15" font-weight="600">ENGINE</text>
+  <text x="300" y="205" text-anchor="middle" fill="#999" font-family="system-ui, sans-serif" font-size="10">Poller / API / Jobs</text>
+  
+  <!-- Database Box (left) -->
+  <rect x="40" y="165" width="110" height="50" rx="4" fill="#333" stroke="#555" stroke-width="1.5"/>
+  <text x="95" y="195" text-anchor="middle" fill="#4a9eff" font-family="system-ui, sans-serif" font-size="13" font-weight="600">PostgreSQL</text>
+  
+  <!-- Web UI Box (top) -->
+  <rect x="245" y="55" width="110" height="50" rx="4" fill="#333" stroke="#555" stroke-width="1.5"/>
+  <text x="300" y="85" text-anchor="middle" fill="#a78bfa" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Web UI</text>
+  
+  <!-- Devices Box (right) -->
+  <rect x="450" y="165" width="110" height="50" rx="4" fill="#333" stroke="#555" stroke-width="1.5"/>
+  <text x="505" y="188" text-anchor="middle" fill="#22d3ee" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Devices</text>
+  <text x="505" y="203" text-anchor="middle" fill="#777" font-family="system-ui, sans-serif" font-size="9">Wave / airMAX / LTU</text>
+  
+  <!-- Monitoring Box (bottom) -->
+  <rect x="245" y="275" width="110" height="50" rx="4" fill="#333" stroke="#555" stroke-width="1.5"/>
+  <text x="300" y="298" text-anchor="middle" fill="#34d399" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Monitoring</text>
+  <text x="300" y="313" text-anchor="middle" fill="#777" font-family="system-ui, sans-serif" font-size="9">Zabbix / Alerts</text>
+  
+  <!-- Connection Lines -->
+  <!-- Engine <-> Database -->
+  <line x1="225" y1="190" x2="150" y2="190" stroke="#666" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow-rev)"/>
+  
+  <!-- Engine <-> Web UI -->
+  <line x1="300" y1="155" x2="300" y2="105" stroke="#666" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow-rev)"/>
+  
+  <!-- Engine <-> Devices -->
+  <line x1="375" y1="190" x2="450" y2="190" stroke="#666" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow-rev)"/>
+  
+  <!-- Engine -> Monitoring -->
+  <line x1="300" y1="225" x2="300" y2="275" stroke="#666" stroke-width="1.5" marker-end="url(#arrow)"/>
+  
+  <!-- Protocol Labels (on dark pill backgrounds) -->
+  <!-- DB connection -->
+  <rect x="160" y="173" width="55" height="14" rx="7" fill="#222"/>
+  <text x="187" y="183" text-anchor="middle" fill="#888" font-family="Menlo, monospace" font-size="9">pgsql</text>
+  
+  <!-- Web UI connection -->
+  <rect x="308" y="122" width="75" height="14" rx="7" fill="#222"/>
+  <text x="345" y="132" text-anchor="middle" fill="#888" font-family="Menlo, monospace" font-size="9">HTTP + WS</text>
+  
+  <!-- Devices connection -->
+  <rect x="388" y="173" width="52" height="14" rx="7" fill="#222"/>
+  <text x="414" y="183" text-anchor="middle" fill="#888" font-family="Menlo, monospace" font-size="9">HTTPS</text>
+  
+  <!-- Monitoring connection -->
+  <rect x="283" y="242" width="122" height="14" rx="7" fill="#222"/>
+  <text x="344" y="252" text-anchor="middle" fill="#888" font-family="Menlo, monospace" font-size="9">Zabbix agent protocol</text>
+  
+  <!-- Legend -->
+  <text x="40" y="370" fill="#555" font-family="system-ui, sans-serif" font-size="9">WS = WebSocket for real-time updates</text>
+</svg>

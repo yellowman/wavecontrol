@@ -1,0 +1,177 @@
+{
+  "device": {
+    "uptime": 1728000,
+    "powerTime": 1728000,
+    "ram": {
+      "total": 134217728,
+      "free": 67108864,
+      "usage": 50
+    },
+    "cpu": [
+      {"identifier": "cpu0", "usage": 12}
+    ]
+  },
+  "identification": {
+    "role": "ap",
+    "mac": "AA:BB:CC:11:22:30",
+    "model": "LTU-Rocket",
+    "product": "LTU-Rocket",
+    "family": "ltu",
+    "firmwareVersion": "2.5.0",
+    "firmware": "aflturocket.soc.v2.5.0.12345.build"
+  },
+  "wireless": {
+    "mode": "ap-ptmp",
+    "essid": "LTU-Network-Tower2",
+    "radios": [
+      {
+        "id": "main",
+        "frequency": {"center": 5800},
+        "channelWidth": {"tx": 40},
+        "outputPower": {"conducted": 27, "eirp": 50},
+        "antenna": {"gain": 23},
+        "linkQuality": {
+          "capacity": {
+            "dl": 170240,
+            "ul": 62848,
+            "combined": 233088,
+            "dlIdeal": 170240,
+            "ulIdeal": 78560,
+            "combinedIdeal": 248800
+          }
+        }
+      }
+    ],
+    "peers": [
+      {
+        "common": {
+          "hostname": "LTU-Lite-Client1",
+          "mgmtIp": "192.168.2.10",
+          "distance": 2500,
+          "uptime": 864000,
+          "counters": {
+            "txRate": 24165,
+            "rxRate": 10021,
+            "txBytes": 5678901234,
+            "rxBytes": 4321098765
+          },
+          "identification": {
+            "mac": "AA:BB:CC:11:22:31",
+            "model": "LTU-Lite",
+            "product": "LTU-Lite",
+            "family": "ltu",
+            "firmwareVersion": "2.3.2"
+          }
+        },
+        "local": [
+          {
+            "id": "main",
+            "connectionTime": 864000,
+            "linkQuality": {
+              "signal": -50,
+              "signalPerChain": [-50, -51],
+              "idealSignal": -49,
+              "noiseFloor": -91,
+              "linkScore": {"dl": 98.4, "ul": 85.2},
+              "airtime": {"dl": 3, "ul": 8},
+              "mcs": {
+                "txIdx": 4, "rxIdx": 4,
+                "txRate": 10, "rxRate": 10,
+                "txLabel": "QAM1024", "rxLabel": "QAM1024"
+              },
+              "cinr": {"dl": 37, "ul": 31},
+              "capacity": {
+                "dl": 170240,
+                "ul": 62848,
+                "combined": 233088,
+                "dlIdeal": 170240,
+                "ulIdeal": 78560,
+                "combinedIdeal": 248800
+              }
+            }
+          }
+        ],
+        "remote": [
+          {
+            "id": "main",
+            "antenna": {"gain": 26},
+            "linkQuality": {
+              "signal": -51,
+              "signalPerChain": [-50, -52],
+              "idealSignal": -49,
+              "noiseFloor": -91
+            }
+          }
+        ]
+      },
+      {
+        "common": {
+          "hostname": "LTU-Lite-Client2",
+          "mgmtIp": "192.168.2.11",
+          "distance": 3200,
+          "uptime": 432000,
+          "counters": {
+            "txRate": 18000,
+            "rxRate": 8000,
+            "txBytes": 3456789012,
+            "rxBytes": 2109876543
+          },
+          "identification": {
+            "mac": "AA:BB:CC:11:22:32",
+            "model": "LTU-Lite",
+            "product": "LTU-Lite",
+            "family": "ltu",
+            "firmwareVersion": "2.3.2"
+          }
+        },
+        "local": [
+          {
+            "id": "main",
+            "connectionTime": 432000,
+            "linkQuality": {
+              "signal": -58,
+              "signalPerChain": [-58, -59],
+              "idealSignal": -53,
+              "noiseFloor": -101,
+              "linkScore": {"dl": 96.7, "ul": 92.8},
+              "airtime": {"dl": 9, "ul": 244},
+              "mcs": {
+                "txIdx": 4, "rxIdx": 3,
+                "txRate": 10, "rxRate": 8,
+                "txLabel": "QAM1024", "rxLabel": "QAM256"
+              },
+              "cinr": {"dl": 35, "ul": 24},
+              "capacity": {
+                "dl": 150000,
+                "ul": 50000,
+                "combined": 200000,
+                "dlIdeal": 170240,
+                "ulIdeal": 62848,
+                "combinedIdeal": 233088
+              }
+            }
+          }
+        ],
+        "remote": [
+          {
+            "id": "main",
+            "antenna": {"gain": 26},
+            "linkQuality": {
+              "signal": -60,
+              "signalPerChain": [-60, -60],
+              "idealSignal": -53,
+              "noiseFloor": -101
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "gps": {
+    "fix": true,
+    "lat": 45.520000,
+    "lon": -122.680000,
+    "alt": 180,
+    "sats": 11
+  }
+}

@@ -1,0 +1,128 @@
+{
+  "chain_names": [
+    {"number": 1, "name": "Chain 0"},
+    {"number": 2, "name": "Chain 1"}
+  ],
+  "host": {
+    "hostname": "Rocket-5AC-Tower3",
+    "uptime": 2592000,
+    "time": "2025-01-01 12:00:00",
+    "timestamp": 1704067200,
+    "fwversion": "v8.7.11",
+    "devmodel": "Rocket 5AC Prism",
+    "netrole": "bridge",
+    "loadavg": 0.25,
+    "totalram": 128974848,
+    "freeram": 45678912,
+    "temperature": 42,
+    "cpuload": 18.0,
+    "uservice": false
+  },
+  "mca_status": {
+    "platform": "airmax",
+    "firmware": "XC.v8.7.11+build54321",
+    "shortVersion": "8.7.11",
+    "deviceModel": "R5AC-Prism",
+    "deviceName": "Rocket 5AC Prism"
+  },
+  "genuine": "/images/genuine.png",
+  "services": {
+    "dhcpc": false,
+    "dhcpd": false,
+    "pppoe": false
+  },
+  "wireless": {
+    "mode": "ap-ptmp",
+    "essid": "AirMAX-Network-Tower3",
+    "hide_essid": "off",
+    "apmac": "AA:BB:CC:22:33:40",
+    "frequency": 5180,
+    "center1_freq": 5180,
+    "chanbw": 40,
+    "txpower": 27,
+    "dfs": 1,
+    "wds": 1,
+    "security": "wpa2",
+    "noisef": -95,
+    "ack": 64,
+    "polling": {
+      "enabled": true,
+      "dcap": 300000,
+      "ucap": 150000,
+      "use": 45,
+      "tx_use": 30,
+      "rx_use": 15
+    },
+    "count": 3,
+    "distance": 5000,
+    "antenna_gain": 16,
+    "compat_11n": 1,
+    "rx_chainmask": 3,
+    "tx_chainmask": 3
+  },
+  "interfaces": {
+    "eth0": {
+      "mac": "AA:BB:CC:22:33:40",
+      "ip": "192.168.3.1",
+      "netmask": "255.255.255.0",
+      "status": "enabled",
+      "speed": "1000",
+      "duplex": "full"
+    },
+    "eth1": {
+      "mac": "AA:BB:CC:22:33:41",
+      "status": "disabled"
+    }
+  },
+  "gps": {
+    "fix": 1,
+    "lat": 45.518,
+    "lon": -122.672,
+    "alt": 150.5,
+    "sats": 8
+  },
+  "stations": [
+    {
+      "mac": "AA:BB:CC:22:33:51",
+      "name": "NanoStation-Client1",
+      "lastip": "192.168.3.10",
+      "associd": 1,
+      "apts": 1704067000,
+      "signal": -65,
+      "rssi": -65,
+      "noisefloor": -95,
+      "chainrssi": [-66, -67],
+      "ccq": 95,
+      "tx": 150,
+      "rx": 75,
+      "txpower": 23,
+      "distance": 1200,
+      "uptime": 864000,
+      "txbytes": 12345678901,
+      "rxbytes": 10987654321,
+      "txpackets": 123456789,
+      "rxpackets": 109876543
+    },
+    {
+      "mac": "AA:BB:CC:22:33:52",
+      "name": "NanoStation-Client2",
+      "lastip": "192.168.3.11",
+      "associd": 2,
+      "apts": 1704066000,
+      "signal": -68,
+      "rssi": -68,
+      "noisefloor": -95,
+      "chainrssi": [-69, -70],
+      "ccq": 92,
+      "tx": 130,
+      "rx": 65,
+      "txpower": 23,
+      "distance": 1800,
+      "uptime": 432000,
+      "txbytes": 8765432109,
+      "rxbytes": 7654321098,
+      "txpackets": 87654321,
+      "rxpackets": 76543210
+    }
+  ]
+}

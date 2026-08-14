@@ -1,0 +1,77 @@
+{
+  "identification": {
+    "mac": "1C:6A:1B:6D:4E:A9",
+    "model": "Wave-MLO6",
+    "family": "airMAX MLO",
+    "firmwareVersion": "2.4.2",
+    "firmware": "MW.ipq53xx.v2.4.2.69fdca7b.251223.1612",
+    "product": "Wave MLO6"
+  },
+  "capabilities": {
+    "interfaces": [
+      {
+        "id": "main",
+        "type": "wireless"
+      },
+      {
+        "id": "backup",
+        "type": "wireless"
+      },
+      {
+        "id": "lan/0",
+        "type": "ethernet",
+        "media": "SFP-plus",
+        "speedValues": ["autodetect", "auto", "1000-full", "2500-full", "5000-full", "10000-full"]
+      },
+      {
+        "id": "lan/1",
+        "type": "ethernet",
+        "media": "10GE",
+        "speedValues": ["auto", "100-full", "1000-full", "2500-full", "5000-full", "10000-full"]
+      }
+    ],
+    "device": {
+      "gps": true,
+      "supportPtpAp": true,
+      "supportPtmpAp": false,
+      "supportPtpSta": true,
+      "supportPtmpSta": false,
+      "supportMultiLinkOperation": true
+    },
+    "radios": [
+      {
+        "id": "main",
+        "freqRanges": [{"start": 5170, "end": 5835}],
+        "channelWidths": {"ptp": [20, 40, 80, 160, 240]},
+        "ieeeModes": ["mode_ac", "mode_ax", "mode_be"],
+        "txpower": {"min": 1, "max": 24}
+      },
+      {
+        "id": "backup",
+        "freqRanges": [{"start": 5945, "end": 7065}],
+        "channelWidths": {"ptp": [20, 40, 80, 160, 320]},
+        "ieeeModes": ["mode_be"],
+        "txpower": {"min": 1, "max": 24},
+        "features": ["DISABLEABLE", "TOGGLEABLE_AP_PTP", "TOGGLEABLE_STA_PTP"]
+      }
+    ]
+  },
+  "_notes": {
+    "platform": "wave",
+    "api_style": "Wave REST API",
+    "firmware_prefix": "MW (vs GMC/GMP for Wave 60GHz)",
+    "unique_features": [
+      "Dual-band: 5GHz (main) + 6GHz (backup)",
+      "Multi-Link Operation (MLO) - WiFi 7",
+      "802.11be with 4096-QAM (MCS 12/13)",
+      "Up to 240MHz (5GHz) and 320MHz (6GHz) channels",
+      "10GbE SFP+ and 10GbE copper interfaces",
+      "PTP only - no PTMP support"
+    ],
+    "implementation_notes": [
+      "Device radios assigned by frequency band: 5GHz->Radio5GHz, 6GHz->Radio6GHz",
+      "Peer radio assignment still uses ID-based mapping (no frequency in peer data)",
+      "Radio6GHz field added to stats structures for 6GHz band support"
+    ]
+  }
+}
