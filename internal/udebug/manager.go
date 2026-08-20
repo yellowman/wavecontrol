@@ -159,7 +159,7 @@ func (m *Manager) Record(deviceID int64, entry any) {
 	if b == nil {
 		return
 	}
-	b.append(entry)
+	b.append(sanitizeEntry(entry))
 }
 
 // Snapshot returns the snapshot for a device buffer.
@@ -257,7 +257,7 @@ func (m *Manager) RecordHost(host string, entry any) {
 	if b == nil {
 		return
 	}
-	b.append(entry)
+	b.append(sanitizeEntry(entry))
 }
 
 // SnapshotHost returns the snapshot for a host buffer.

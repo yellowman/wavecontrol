@@ -8,7 +8,7 @@ This document maps AirMAX status.cgi fields to WaveControl internal structures.
 POST /login.cgi
 Content-Type: application/x-www-form-urlencoded
 
-username=ubnt&password=ubnt
+username=${DEVICE_USER}&password=${DEVICE_PASSWORD}
 ```
 
 Response: Sets session cookie. Check for "Invalid credentials" in body.

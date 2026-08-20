@@ -12,6 +12,118 @@ import (
 	"time"
 )
 
+func (p *Poller) decryptSecret(value string) (string, error) {
+	if value == "" || p.secretStore == nil {
+		return value, nil
+	}
+	return p.secretStore.Decrypt(value)
+}
+
+func dedupePollerCredentials(in []Credential) []Credential {
+	out := make([]Credential, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, c := range in {
+		c.Username = strings.TrimSpace(c.Username)
+		if c.Username == "" || c.Password == "" {
+			continue
+		}
+		key := c.Username + "\x00" + c.Password
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, c)
+	}
+	return out
+}
+
+func (p *Poller) loadSettingCredentialPairs(prefix string) ([]Credential, error) {
+	pairs := make([]Credential, 0, 3)
+	for i := 1; i <= 3; i++ {
+		var username, stored string
+		userKey := fmt.Sprintf("%s_cred%d_user", prefix, i)
+		passKey := fmt.Sprintf("%s_cred%d_pass", prefix, i)
+		if err := p.db.QueryRow(`SELECT value FROM settings WHERE key=$1`, userKey).Scan(&username); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("read %s: %w", userKey, err)
+		}
+		if err := p.db.QueryRow(`SELECT value FROM settings WHERE key=$1`, passKey).Scan(&stored); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("read %s: %w", passKey, err)
+		}
+		if strings.TrimSpace(username) == "" || stored == "" {
+			continue
+		}
+		password, err := p.decryptSecret(stored)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt %s: %w", passKey, err)
+		}
+		pairs = append(pairs, Credential{Username: username, Password: password})
+	}
+	return dedupePollerCredentials(pairs), nil
+}
+
+func (p *Poller) loadLegacySettingCredentialPairs(prefix string) ([]Credential, error) {
+	var username, stored string
+	if err := p.db.QueryRow(`SELECT value FROM settings WHERE key=$1`, prefix+"_username").Scan(&username); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err := p.db.QueryRow(`SELECT value FROM settings WHERE key=$1`, prefix+"_passwords").Scan(&stored); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	username = strings.TrimSpace(username)
+	if username == "" || stored == "" {
+		return nil, nil
+	}
+	plain, err := p.decryptSecret(stored)
+	if err != nil {
+		return nil, err
+	}
+	var passwords []string
+	if err := json.Unmarshal([]byte(plain), &passwords); err != nil {
+		return nil, fmt.Errorf("parse %s_passwords: %w", prefix, err)
+	}
+	pairs := make([]Credential, 0, len(passwords))
+	for _, password := range passwords {
+		pairs = append(pairs, Credential{Username: username, Password: password})
+	}
+	return dedupePollerCredentials(pairs), nil
+}
+
+func (p *Poller) loadCredentialTable() (apCreds, staCreds []Credential, err error) {
+	var exists bool
+	if err := p.db.QueryRow(`SELECT to_regclass('public.device_credentials') IS NOT NULL`).Scan(&exists); err != nil {
+		return nil, nil, err
+	}
+	if !exists {
+		return nil, nil, nil
+	}
+	rows, err := p.db.Query(`SELECT username, password, role FROM device_credentials WHERE enabled = true ORDER BY id`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var username, stored, role string
+		if err := rows.Scan(&username, &stored, &role); err != nil {
+			return nil, nil, err
+		}
+		password, err := p.decryptSecret(stored)
+		if err != nil {
+			return nil, nil, err
+		}
+		cred := Credential{Username: username, Password: password}
+		switch strings.ToLower(strings.TrimSpace(role)) {
+		case "sta":
+			staCreds = append(staCreds, cred)
+		case "", "ap":
+			apCreds = append(apCreds, cred)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return dedupePollerCredentials(apCreds), dedupePollerCredentials(staCreds), nil
+}
+
 // watchConfig reloads config from settings table periodically
 func (p *Poller) watchConfig(ctx context.Context) {
 	// Load settings immediately on startup.
@@ -48,68 +160,32 @@ func (p *Poller) loadConfig() {
 		log.Printf("Error loading poll_interval: %v", err)
 	}
 
-	// Credentials
+	// Credentials. Credential pairs are loaded intact and decrypted before use.
+	// When a legacy device_credentials table exists, its entries are prepended;
+	// the current settings-backed pairs remain the canonical configuration.
 	newAPCreds := oldCfg.apCreds
 	newSTACreds := oldCfg.staCreds
 
-	if rows, err := p.db.Query(`SELECT username, password, role FROM device_credentials WHERE enabled = true`); err == nil {
-		defer rows.Close()
+	settingsAP, credErr := p.loadSettingCredentialPairs("ap")
+	if credErr == nil && len(settingsAP) == 0 {
+		settingsAP, credErr = p.loadLegacySettingCredentialPairs("ap")
+	}
+	settingsSTA, staErr := p.loadSettingCredentialPairs("sta")
+	if staErr == nil && len(settingsSTA) == 0 {
+		settingsSTA, staErr = p.loadLegacySettingCredentialPairs("sta")
+	}
+	tableAP, tableSTA, tableErr := p.loadCredentialTable()
 
-		apCreds := make([]Credential, 0)
-		staCreds := make([]Credential, 0)
-
-		for rows.Next() {
-			var u, pw, role string
-			if err := rows.Scan(&u, &pw, &role); err != nil {
-				log.Printf("Error scanning device_credentials row: %v", err)
-				continue
-			}
-
-			if role == "ap" || role == "" {
-				apCreds = append(apCreds, Credential{Username: u, Password: pw})
-			} else if role == "sta" {
-				staCreds = append(staCreds, Credential{Username: u, Password: pw})
-			}
-		}
-
-		if err := rows.Err(); err != nil {
-			log.Printf("Error iterating device_credentials: %v", err)
-		} else {
-			// Fallback to default credentials only when no explicit AP/STA creds exist.
-			if len(apCreds) == 0 && len(staCreds) == 0 {
-				var defaultUser, defaultPass string
-				if err := p.db.QueryRow(`SELECT value FROM settings WHERE key = 'default_username'`).Scan(&defaultUser); err != nil && err != sql.ErrNoRows {
-					log.Printf("Error loading default_username: %v", err)
-				}
-				if err := p.db.QueryRow(`SELECT value FROM settings WHERE key = 'default_password'`).Scan(&defaultPass); err != nil && err != sql.ErrNoRows {
-					log.Printf("Error loading default_password: %v", err)
-				}
-				if defaultUser != "" && defaultPass != "" {
-					apCreds = append(apCreds, Credential{Username: defaultUser, Password: defaultPass})
-				}
-
-				var defaultStaUser, defaultStaPass string
-				if err := p.db.QueryRow(`SELECT value FROM settings WHERE key = 'default_sta_username'`).Scan(&defaultStaUser); err != nil && err != sql.ErrNoRows {
-					log.Printf("Error loading default_sta_username: %v", err)
-				}
-				if err := p.db.QueryRow(`SELECT value FROM settings WHERE key = 'default_sta_password'`).Scan(&defaultStaPass); err != nil && err != sql.ErrNoRows {
-					log.Printf("Error loading default_sta_password: %v", err)
-				}
-				if defaultStaUser != "" && defaultStaPass != "" {
-					staCreds = append(staCreds, Credential{Username: defaultStaUser, Password: defaultStaPass})
-				}
-			}
-
-			if len(staCreds) == 0 {
-				// Copy to avoid accidentally sharing the underlying slice if someone ever appends.
-				staCreds = append([]Credential(nil), apCreds...)
-			}
-
-			newAPCreds = apCreds
-			newSTACreds = staCreds
-		}
+	if credErr != nil || staErr != nil || tableErr != nil {
+		log.Printf("Error loading credentials: ap=%v sta=%v legacy_table=%v", credErr, staErr, tableErr)
 	} else {
-		log.Printf("Error loading credentials: %v", err)
+		apCreds := dedupePollerCredentials(append(tableAP, settingsAP...))
+		staCreds := dedupePollerCredentials(append(tableSTA, settingsSTA...))
+		if len(staCreds) == 0 {
+			staCreds = append([]Credential(nil), apCreds...)
+		}
+		newAPCreds = apCreds
+		newSTACreds = staCreds
 	}
 
 	// Management IP prefixes
@@ -469,9 +545,13 @@ func (p *Poller) GetCredentialsForDevice(deviceID int64) DeviceCredentials {
 
 	// Add stored credentials first if present
 	if storedUser.Valid && storedUser.String != "" && storedPass.Valid && storedPass.String != "" {
-		key := storedUser.String + ":" + storedPass.String
-		result.Credentials = append(result.Credentials, Credential{Username: storedUser.String, Password: storedPass.String})
-		seen[key] = true
+		if password, err := p.decryptSecret(storedPass.String); err == nil && password != "" {
+			key := storedUser.String + ":" + password
+			result.Credentials = append(result.Credentials, Credential{Username: storedUser.String, Password: password})
+			seen[key] = true
+		} else if err != nil {
+			log.Printf("GetCredentialsForDevice %d: decrypt stored password: %v", deviceID, err)
+		}
 	}
 
 	if isAP {
@@ -525,4 +605,11 @@ func (p *Poller) GetSTACredentials() []Credential {
 	out := make([]Credential, len(cfg.staCreds))
 	copy(out, cfg.staCreds)
 	return out
+}
+
+// ReloadSettings applies database-backed runtime settings immediately. It is
+// safe to call after an administrator updates settings; the periodic watcher
+// remains as a reconciliation fallback.
+func (p *Poller) ReloadSettings() {
+	p.loadConfig()
 }

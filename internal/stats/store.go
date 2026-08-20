@@ -951,8 +951,8 @@ func (s *Store) BindIdentityByMAC(mac, ip string, deviceID, siteID int) {
 	}
 	if deviceID > 0 {
 		ds.DeviceID = deviceID
-	}
-	if siteID > 0 {
+		// A zero site ID is meaningful: it clears stale site identity when a
+		// device is repurposed, changes SSID, or otherwise becomes unassigned.
 		ds.SiteID = siteID
 	}
 	if mac != "" {

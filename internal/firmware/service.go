@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,6 +23,7 @@ import (
 	"time"
 
 	"github.com/yellowman/wavecontrol/internal/airmax"
+	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/udebug"
 	"github.com/yellowman/wavecontrol/internal/wave"
 )
@@ -33,11 +36,18 @@ type Service struct {
 
 	tlsManager TLSManager
 
-	// Default credentials (cached, reload with ReloadConfig)
-	apUser  string
-	apPass  []string
-	staUser string
-	staPass []string
+	// Default credential pairs (cached, reload with ReloadConfig).
+	configMu    sync.RWMutex
+	apCreds     []Credential
+	staCreds    []Credential
+	secretStore *secrets.Manager
+}
+
+// Credential is a username/password pair. Pairs are kept intact so accounts
+// with different usernames are never recombined with the wrong password.
+type Credential struct {
+	Username string
+	Password string
 }
 
 // TLSManager interface for certificate verification
@@ -73,6 +83,21 @@ type UpgradeResult struct {
 	NewVersion string `json:"new_version"`
 }
 
+// normalizeUpgradeResult guarantees bulk/fanout callers never publish a nil
+// result when UpgradeDevice fails before it can construct device metadata.
+// Individual upgrade failures remain represented in-band so the caller can
+// report every requested device without panicking or emitting JSON nulls.
+func normalizeUpgradeResult(result *UpgradeResult, deviceID int64, err error) *UpgradeResult {
+	if result != nil {
+		return result
+	}
+	message := "upgrade failed"
+	if err != nil {
+		message = err.Error()
+	}
+	return &UpgradeResult{DeviceID: deviceID, Status: "failed", Message: message}
+}
+
 // dbExecIgnore executes a query, logs errors but doesn't return them (fire-and-forget)
 func dbExecIgnore(db *sql.DB, query string, args ...any) {
 	if _, err := db.Exec(query, args...); err != nil {
@@ -81,7 +106,7 @@ func dbExecIgnore(db *sql.DB, query string, args ...any) {
 }
 
 // NewService creates a new firmware service
-func NewService(db *sql.DB, tlsMgr TLSManager, udbg *udebug.Manager) *Service {
+func NewService(db *sql.DB, tlsMgr TLSManager, udbg *udebug.Manager, secretStore *secrets.Manager) (*Service, error) {
 	var transport http.RoundTripper
 	if tlsMgr != nil {
 		transport = tlsMgr.GetInsecureTransport() // Default, override per-device
@@ -92,16 +117,19 @@ func NewService(db *sql.DB, tlsMgr TLSManager, udbg *udebug.Manager) *Service {
 	}
 
 	s := &Service{
-		db:         db,
-		ultraDebug: udbg,
-		tlsManager: tlsMgr,
+		db:          db,
+		ultraDebug:  udbg,
+		tlsManager:  tlsMgr,
+		secretStore: secretStore,
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute,
 		},
 	}
-	s.loadConfig()
-	return s
+	if err := s.loadConfig(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // getDeviceClient returns an HTTP client for a specific device with TLS verification
@@ -218,119 +246,299 @@ func (s *Service) getFirmwarePath() string {
 	return path
 }
 
-// ReloadConfig reloads settings from the database
-func (s *Service) ReloadConfig() {
-	s.loadConfig()
+// ReloadConfig reloads settings from the database. Existing credentials remain
+// active if the replacement configuration cannot be read or decrypted.
+func (s *Service) ReloadConfig() error {
+	return s.loadConfig()
 }
 
-func (s *Service) loadConfig() {
-	// Load AP credentials (up to 3 pairs - new format)
-	s.apPass = nil
+func (s *Service) decryptSecret(value string) (string, error) {
+	if value == "" || s.secretStore == nil {
+		return value, nil
+	}
+	return s.secretStore.Decrypt(value)
+}
+
+func (s *Service) readCredentialPairs(prefix string) ([]Credential, error) {
+	pairs := make([]Credential, 0, 3)
 	for i := 1; i <= 3; i++ {
-		var user, pass string
-		userKey := fmt.Sprintf("ap_cred%d_user", i)
-		passKey := fmt.Sprintf("ap_cred%d_pass", i)
-		s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user)
-		s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&pass)
-		if user != "" && pass != "" {
-			if s.apUser == "" {
-				s.apUser = user // Use first credential pair's username
+		var user, stored string
+		userKey := fmt.Sprintf("%s_cred%d_user", prefix, i)
+		passKey := fmt.Sprintf("%s_cred%d_pass", prefix, i)
+		if err := s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("read %s: %w", userKey, err)
+		}
+		if err := s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&stored); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("read %s: %w", passKey, err)
+		}
+		user = strings.TrimSpace(user)
+		if user == "" || stored == "" {
+			continue
+		}
+		pass, err := s.decryptSecret(stored)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt %s: %w", passKey, err)
+		}
+		if pass != "" {
+			pairs = append(pairs, Credential{Username: user, Password: pass})
+		}
+	}
+	return dedupeCredentials(pairs), nil
+}
+
+func (s *Service) readLegacyCredentialPairs(prefix string) ([]Credential, error) {
+	var username, stored string
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, prefix+"_username").Scan(&username); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, prefix+"_passwords").Scan(&stored); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	username = strings.TrimSpace(username)
+	if username == "" || stored == "" {
+		return nil, nil
+	}
+	plain, err := s.decryptSecret(stored)
+	if err != nil {
+		return nil, err
+	}
+	var passwords []string
+	if err := json.Unmarshal([]byte(plain), &passwords); err != nil {
+		return nil, fmt.Errorf("parse %s_passwords: %w", prefix, err)
+	}
+	pairs := make([]Credential, 0, len(passwords))
+	for _, password := range passwords {
+		if password != "" {
+			pairs = append(pairs, Credential{Username: username, Password: password})
+		}
+	}
+	return dedupeCredentials(pairs), nil
+}
+
+func dedupeCredentials(in []Credential) []Credential {
+	out := make([]Credential, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, c := range in {
+		c.Username = strings.TrimSpace(c.Username)
+		if c.Username == "" || c.Password == "" {
+			continue
+		}
+		key := c.Username + "\x00" + c.Password
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, c)
+	}
+	return out
+}
+
+func (s *Service) loadConfig() error {
+	apCreds, err := s.readCredentialPairs("ap")
+	if err != nil {
+		return fmt.Errorf("load AP credentials: %w", err)
+	}
+	if len(apCreds) == 0 {
+		apCreds, err = s.readLegacyCredentialPairs("ap")
+		if err != nil {
+			return fmt.Errorf("load legacy AP credentials: %w", err)
+		}
+	}
+
+	staCreds, err := s.readCredentialPairs("sta")
+	if err != nil {
+		return fmt.Errorf("load STA credentials: %w", err)
+	}
+	if len(staCreds) == 0 {
+		staCreds, err = s.readLegacyCredentialPairs("sta")
+		if err != nil {
+			return fmt.Errorf("load legacy STA credentials: %w", err)
+		}
+	}
+	if len(staCreds) == 0 {
+		staCreds = append([]Credential(nil), apCreds...)
+	}
+
+	s.configMu.Lock()
+	s.apCreds = append([]Credential(nil), apCreds...)
+	s.staCreds = append([]Credential(nil), staCreds...)
+	s.configMu.Unlock()
+	return nil
+}
+
+func (s *Service) credentialSnapshot(isAP bool) []Credential {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	if isAP {
+		return append([]Credential(nil), s.apCreds...)
+	}
+	return append([]Credential(nil), s.staCreds...)
+}
+
+func (s *Service) firstCredential(isAP bool) (Credential, bool) {
+	creds := s.credentialSnapshot(isAP)
+	if len(creds) == 0 {
+		return Credential{}, false
+	}
+	return creds[0], true
+}
+
+func (s *Service) resolveCredential(username, password string, isAP bool) (Credential, error) {
+	username = strings.TrimSpace(username)
+	if password != "" {
+		plain, err := s.decryptSecret(password)
+		if err != nil {
+			return Credential{}, fmt.Errorf("decrypt device credential: %w", err)
+		}
+		password = plain
+	}
+	if username != "" && password != "" {
+		return Credential{Username: username, Password: password}, nil
+	}
+	if username != "" || password != "" {
+		return Credential{}, errors.New("username and password must be supplied together")
+	}
+	cred, ok := s.firstCredential(isAP)
+	if !ok {
+		return Credential{}, errors.New("no device credentials configured")
+	}
+	return cred, nil
+}
+
+const (
+	firmwareIDPrefix = "fw_"
+	maxFirmwareSize  = int64(1 << 30) // 1 GiB hard ceiling for all callers
+)
+
+func encodeFirmwareID(relativePath string) string {
+	return firmwareIDPrefix + base64.RawURLEncoding.EncodeToString([]byte(filepath.ToSlash(relativePath)))
+}
+
+func decodeFirmwareID(reference string) (string, bool) {
+	if !strings.HasPrefix(reference, firmwareIDPrefix) {
+		return "", false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(reference, firmwareIDPrefix))
+	if err != nil || len(decoded) == 0 {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+func (s *Service) canonicalFirmwareRoot(create bool) (string, error) {
+	root := strings.TrimSpace(s.getFirmwarePath())
+	if root == "" {
+		return "", errors.New("firmware_path setting is empty")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve firmware directory: %w", err)
+	}
+	if create {
+		if err := os.MkdirAll(abs, 0o750); err != nil {
+			return "", fmt.Errorf("create firmware directory: %w", err)
+		}
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(real)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", errors.New("firmware_path is not a directory")
+	}
+	return real, nil
+}
+
+func (s *Service) resolveFirmwareReference(reference string) (FirmwareFile, error) {
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return FirmwareFile{}, errors.New("firmware reference is required")
+	}
+	files, err := s.ListFirmware()
+	if err != nil {
+		return FirmwareFile{}, err
+	}
+	if rel, ok := decodeFirmwareID(reference); ok {
+		rel = filepath.ToSlash(filepath.Clean(filepath.FromSlash(rel)))
+		if rel == "." || strings.HasPrefix(rel, "../") || filepath.IsAbs(filepath.FromSlash(rel)) {
+			return FirmwareFile{}, errors.New("invalid firmware reference")
+		}
+		for _, fw := range files {
+			if fw.RelativePath == rel {
+				return fw, nil
 			}
-			s.apPass = append(s.apPass, pass)
 		}
+		return FirmwareFile{}, errors.New("firmware not found")
 	}
 
-	// Fallback to legacy format if no new credentials
-	if len(s.apPass) == 0 {
-		var apUser string
-		if s.db.QueryRow(`SELECT value FROM settings WHERE key = 'ap_username'`).Scan(&apUser) == nil && apUser != "" {
-			s.apUser = apUser
-		} else {
-			s.db.QueryRow(`SELECT value FROM settings WHERE key = 'default_username'`).Scan(&s.apUser)
-		}
-
-		var apPassJSON string
-		if s.db.QueryRow(`SELECT value FROM settings WHERE key = 'ap_passwords'`).Scan(&apPassJSON) == nil {
-			json.Unmarshal([]byte(apPassJSON), &s.apPass)
-		}
-		if len(s.apPass) == 0 {
-			// Fallback to legacy default_passwords
-			var passJSON string
-			if s.db.QueryRow(`SELECT value FROM settings WHERE key = 'default_passwords'`).Scan(&passJSON) == nil {
-				json.Unmarshal([]byte(passJSON), &s.apPass)
-			}
+	// Backwards compatibility for callers that still send a basename or exact
+	// relative path. A duplicated basename is rejected rather than selecting an
+	// arbitrary file from the recursive scan.
+	var matches []FirmwareFile
+	for _, fw := range files {
+		if fw.RelativePath == filepath.ToSlash(reference) || fw.Name == reference {
+			matches = append(matches, fw)
 		}
 	}
-
-	if s.apUser == "" {
-		s.apUser = "ubnt"
+	if len(matches) == 0 {
+		return FirmwareFile{}, errors.New("firmware not found")
 	}
-	if len(s.apPass) == 0 {
-		s.apPass = []string{"ubnt"}
+	if len(matches) > 1 {
+		return FirmwareFile{}, fmt.Errorf("firmware name %q is ambiguous; use its id", reference)
 	}
-
-	// Load STA credentials (up to 3 pairs - new format)
-	s.staPass = nil
-	s.staUser = ""
-	for i := 1; i <= 3; i++ {
-		var user, pass string
-		userKey := fmt.Sprintf("sta_cred%d_user", i)
-		passKey := fmt.Sprintf("sta_cred%d_pass", i)
-		s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user)
-		s.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&pass)
-		if user != "" && pass != "" {
-			if s.staUser == "" {
-				s.staUser = user // Use first credential pair's username
-			}
-			s.staPass = append(s.staPass, pass)
-		}
-	}
-
-	// Fallback to legacy format if no new credentials
-	if len(s.staPass) == 0 {
-		var staUser string
-		if s.db.QueryRow(`SELECT value FROM settings WHERE key = 'sta_username'`).Scan(&staUser) == nil && staUser != "" {
-			s.staUser = staUser
-		}
-
-		var staPassJSON string
-		if s.db.QueryRow(`SELECT value FROM settings WHERE key = 'sta_passwords'`).Scan(&staPassJSON) == nil {
-			json.Unmarshal([]byte(staPassJSON), &s.staPass)
-		}
-	}
-
-	// Final fallback to AP credentials
-	if s.staUser == "" {
-		s.staUser = s.apUser
-	}
-	if len(s.staPass) == 0 {
-		s.staPass = s.apPass
-	}
+	return matches[0], nil
 }
 
 // ListFirmware returns available firmware files
-// Note: Path is not exposed to clients - use Name to reference firmware
+// Path is internal. API clients use ID, which uniquely identifies the relative path.
 func (s *Service) ListFirmware() ([]FirmwareFile, error) {
-	var files []FirmwareFile
-	firmwarePath := s.getFirmwarePath()
-
-	err := filepath.WalkDir(firmwarePath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	firmwareRoot, err := s.canonicalFirmwareRoot(false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []FirmwareFile{}, nil
+		}
+		return nil, err
+	}
+	files := make([]FirmwareFile, 0)
+	err = filepath.WalkDir(firmwareRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
 			return nil
 		}
-		if strings.HasSuffix(strings.ToLower(d.Name()), ".bin") {
-			info, _ := d.Info()
-			fw := parseFirmwareFilename(d.Name())
-			// Don't expose full path to clients - they should use Name
-			// Path is kept internally for service use only
-			fw.Path = path
-			fw.Size = info.Size()
-			files = append(files, fw)
+		if d.Type()&os.ModeSymlink != 0 || !strings.EqualFold(filepath.Ext(d.Name()), ".bin") {
+			return nil
 		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(firmwareRoot, path)
+		if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return fmt.Errorf("firmware path outside configured root: %s", path)
+		}
+		rel = filepath.ToSlash(rel)
+		fw := parseFirmwareFilename(filepath.Base(rel))
+		fw.ID = encodeFirmwareID(rel)
+		fw.RelativePath = rel
+		fw.Path = path
+		fw.Size = info.Size()
+		files = append(files, fw)
 		return nil
 	})
-
-	return files, err
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].RelativePath < files[j].RelativePath })
+	return files, nil
 }
 
 // ListFirmwarePublic returns firmware files with paths stripped for API responses
@@ -339,190 +547,102 @@ func (s *Service) ListFirmwarePublic() ([]FirmwareFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Strip paths from response - clients should reference by Name
+	// Strip absolute paths from responses; clients reference files by ID.
 	for i := range files {
 		files[i].Path = ""
 	}
 	return files, err
 }
 
-// DeleteFirmware removes a firmware file by name
-func (s *Service) DeleteFirmware(name string) error {
-	// Validate filename - no path separators or traversal
-	if strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
-		return fmt.Errorf("invalid firmware name")
-	}
-	if !strings.HasSuffix(strings.ToLower(name), ".bin") {
-		return fmt.Errorf("invalid firmware file extension")
-	}
-
-	// Find the actual file path by scanning firmware directory
-	// This handles files in subdirectories
-	files, err := s.ListFirmware()
+// DeleteFirmware removes a firmware file by stable ID or unambiguous legacy name.
+func (s *Service) DeleteFirmware(reference string) error {
+	fw, err := s.resolveFirmwareReference(reference)
 	if err != nil {
-		return fmt.Errorf("failed to scan firmware: %v", err)
+		return err
 	}
-
-	var filePath string
-	for _, fw := range files {
-		if fw.Name == name {
-			filePath = fw.Path
-			break
+	if err := os.Remove(fw.Path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("firmware not found")
 		}
+		return fmt.Errorf("delete firmware: %w", err)
 	}
-
-	// If not found in scan, try direct path (maybe file exists but wasn't scanned yet)
-	if filePath == "" {
-		directPath := filepath.Join(s.getFirmwarePath(), name)
-		if _, err := os.Stat(directPath); err == nil {
-			filePath = directPath
-		}
-	}
-
-	// If still not found, that's fine - the goal is for it to not exist, and it doesn't
-	if filePath == "" {
-		log.Printf("Firmware %q not found on disk - already deleted or never existed", name)
-		return nil // Success - file doesn't exist which is what we wanted
-	}
-
-	// Verify the path is within firmware directory (security check)
-	absPath, err := filepath.Abs(filePath)
-	if err != nil {
-		return fmt.Errorf("invalid path")
-	}
-	absFwPath, err := filepath.Abs(s.getFirmwarePath())
-	if err != nil {
-		return fmt.Errorf("invalid firmware path")
-	}
-	if !strings.HasPrefix(absPath, absFwPath) {
-		return fmt.Errorf("path traversal detected")
-	}
-
-	// Delete the file
-	if err := os.Remove(filePath); err != nil {
-		if os.IsNotExist(err) {
-			// Race condition - file was deleted between scan and now
-			return nil
-		}
-		return fmt.Errorf("failed to delete: %v", err)
-	}
-
-	log.Printf("Deleted firmware: %s", filePath)
+	log.Printf("Deleted firmware: %s", fw.RelativePath)
 	return nil
 }
 
 // GetFirmwareFilePath returns the validated filesystem path to a firmware file
-func (s *Service) GetFirmwareFilePath(name string) (string, error) {
-	// Validate filename - no path separators or traversal
-	if strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
-		return "", fmt.Errorf("invalid firmware name")
-	}
-	if !strings.HasSuffix(strings.ToLower(name), ".bin") {
-		return "", fmt.Errorf("invalid firmware file extension")
-	}
-
-	firmwarePath := s.getFirmwarePath()
-	path := filepath.Join(firmwarePath, name)
-
-	// Verify the file exists and is within firmware directory
-	absPath, err := filepath.Abs(path)
+func (s *Service) GetFirmwareFilePath(reference string) (string, error) {
+	fw, err := s.resolveFirmwareReference(reference)
 	if err != nil {
-		return "", fmt.Errorf("invalid path")
+		return "", err
 	}
-	absFwPath, err := filepath.Abs(firmwarePath)
-	if err != nil {
-		return "", fmt.Errorf("invalid firmware path")
-	}
-	if !strings.HasPrefix(absPath, absFwPath) {
-		return "", fmt.Errorf("path traversal detected")
-	}
-
-	// Check file exists
-	if _, err := os.Stat(absPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("firmware not found")
-	}
-
-	return absPath, nil
+	return fw.Path, nil
 }
 
 // SaveFirmware saves an uploaded firmware file
 func (s *Service) SaveFirmware(name string, data io.Reader) (*FirmwareFile, error) {
-	// Validate filename
-	if strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
+	originalName := strings.TrimSpace(name)
+	name = filepath.Base(originalName)
+	if originalName == "" || name == "." || name == ".." || name != originalName || strings.ContainsAny(originalName, `/\`) {
 		return nil, fmt.Errorf("invalid firmware name")
 	}
-	if !strings.HasSuffix(strings.ToLower(name), ".bin") {
+	if !strings.EqualFold(filepath.Ext(name), ".bin") {
 		return nil, fmt.Errorf("firmware must have .bin extension")
 	}
-
-	firmwarePath := s.getFirmwarePath()
-
-	// Ensure firmware directory exists
-	if err := os.MkdirAll(firmwarePath, 0755); err != nil {
-		return nil, fmt.Errorf("create firmware directory: %w", err)
-	}
-
-	path := filepath.Join(firmwarePath, name)
-
-	// Verify path is within firmware directory
-	absPath, err := filepath.Abs(path)
+	firmwareRoot, err := s.canonicalFirmwareRoot(true)
 	if err != nil {
-		return nil, fmt.Errorf("invalid path")
+		return nil, err
 	}
-	absFwPath, err := filepath.Abs(firmwarePath)
-	if err != nil {
-		return nil, fmt.Errorf("invalid firmware path")
-	}
-	if !strings.HasPrefix(absPath, absFwPath) {
-		return nil, fmt.Errorf("path traversal detected")
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(path); err == nil {
+	path := filepath.Join(firmwareRoot, name)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
+	if errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("firmware already exists")
 	}
-
-	// Create temp file first, then rename for atomicity
-	tmpPath := path + ".tmp"
-	f, err := os.Create(tmpPath)
 	if err != nil {
-		return nil, fmt.Errorf("create file: %w", err)
+		return nil, fmt.Errorf("create firmware: %w", err)
 	}
+	keep := false
+	defer func() {
+		_ = f.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
 
-	size, err := io.Copy(f, data)
+	limited := &io.LimitedReader{R: data, N: maxFirmwareSize + 1}
+	size, err := io.Copy(f, limited)
 	if err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return nil, fmt.Errorf("write file: %w", err)
+		return nil, fmt.Errorf("write firmware: %w", err)
 	}
-
-	// Close and check for write errors (important for fsync)
+	if size > maxFirmwareSize {
+		return nil, fmt.Errorf("firmware exceeds %d-byte limit", maxFirmwareSize)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("sync firmware: %w", err)
+	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return nil, fmt.Errorf("close file: %w", err)
+		return nil, fmt.Errorf("close firmware: %w", err)
 	}
-
-	// Rename to final name
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return nil, fmt.Errorf("finalize file: %w", err)
-	}
-
-	// Parse and return firmware info
+	keep = true
 	fw := parseFirmwareFilename(name)
+	fw.ID = encodeFirmwareID(name)
+	fw.RelativePath = name
+	fw.Path = path
 	fw.Size = size
 	return &fw, nil
 }
 
 // FirmwareFile represents an available firmware file
 type FirmwareFile struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	Flavor   string `json:"flavor"`   // GMC, GMP, Rocket, LiteBeam, etc.
-	Platform string `json:"platform"` // wave, ltu, airmax
-	AirMAX   string `json:"airmax"`   // XC, XM, XW (for AirMAX only)
-	Version  string `json:"version"`  // Extracted version number
+	ID           string `json:"id"`            // URL-safe stable reference derived from relative path
+	Name         string `json:"name"`          // Basename for display
+	RelativePath string `json:"relative_path"` // Unique path below the configured firmware root
+	Path         string `json:"-"`             // Internal filesystem path; never serialized to API clients
+	Size         int64  `json:"size"`
+	Flavor       string `json:"flavor"`   // GMC, GMP, Rocket, LiteBeam, etc.
+	Platform     string `json:"platform"` // wave, ltu, airmax
+	AirMAX       string `json:"airmax"`   // XC, XM, XW (for AirMAX only)
+	Version      string `json:"version"`  // Extracted version number
 }
 
 // FindFirmwareForFlavor finds the best firmware file for a flavor
@@ -595,19 +715,12 @@ func (s *Service) SelectFirmwareForDevice(flavor string) (*FirmwareFile, error) 
 }
 
 // GetFirmwareInfo returns information about a specific firmware file
-func (s *Service) GetFirmwareInfo(filename string) (*FirmwareFile, error) {
-	files, err := s.ListFirmware()
+func (s *Service) GetFirmwareInfo(reference string) (*FirmwareFile, error) {
+	fw, err := s.resolveFirmwareReference(reference)
 	if err != nil {
 		return nil, err
 	}
-
-	for i := range files {
-		if files[i].Name == filename {
-			return &files[i], nil
-		}
-	}
-
-	return nil, fmt.Errorf("firmware not found: %s", filename)
+	return &fw, nil
 }
 
 // FindFirmwareByVersion finds firmware matching version and flavor
@@ -803,39 +916,12 @@ func isPrerelease(s string) bool {
 // ResolveFirmwarePath safely resolves a firmware name to a validated path
 // This prevents directory traversal attacks by only accepting firmware names,
 // not paths, and verifying the resolved path stays within firmwarePath
-func (s *Service) ResolveFirmwarePath(firmwareName string) (string, error) {
-	// Reject any path separators or traversal attempts
-	if strings.ContainsAny(firmwareName, `/\`) || strings.Contains(firmwareName, "..") {
-		return "", fmt.Errorf("invalid firmware name: path separators not allowed")
-	}
-
-	// Look up by name in our known firmware list
-	files, err := s.ListFirmware()
+func (s *Service) ResolveFirmwarePath(reference string) (string, error) {
+	fw, err := s.resolveFirmwareReference(reference)
 	if err != nil {
 		return "", err
 	}
-
-	firmwarePath := s.getFirmwarePath()
-
-	for _, f := range files {
-		if f.Name == firmwareName {
-			// Verify the resolved path is still within firmwarePath
-			absPath, err := filepath.Abs(f.Path)
-			if err != nil {
-				return "", fmt.Errorf("invalid firmware path")
-			}
-			absFirmwarePath, err := filepath.Abs(firmwarePath)
-			if err != nil {
-				return "", fmt.Errorf("invalid firmware directory")
-			}
-			if !strings.HasPrefix(absPath, absFirmwarePath+string(filepath.Separator)) {
-				return "", fmt.Errorf("firmware path outside allowed directory")
-			}
-			return f.Path, nil
-		}
-	}
-
-	return "", fmt.Errorf("firmware not found: %s", firmwareName)
+	return fw.Path, nil
 }
 
 // File returns the filename from a FirmwareFile
@@ -871,32 +957,31 @@ func (s *Service) UpgradeDevice(ctx context.Context, deviceID int64, firmwareFil
 		OldVersion: currentFW.String,
 	}
 
-	// Get credentials - use device credentials if stored, else default based on AP/STA
+	// Use a complete per-device credential pair when present. Otherwise use the
+	// first configured pair for the device role; never mix a username from one
+	// slot with a password from another.
 	isAP := !parentID.Valid
-	user := username.String
-	pass := password.String
-
-	if user == "" {
-		if isAP {
-			user = s.apUser
-		} else {
-			user = s.staUser
-		}
+	storedPassword, err := s.decryptSecret(password.String)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "stored device credential cannot be decrypted"
+		return result, fmt.Errorf("decrypt device credential: %w", err)
 	}
-	if pass == "" {
-		if isAP && len(s.apPass) > 0 {
-			pass = s.apPass[0]
-		} else if !isAP && len(s.staPass) > 0 {
-			pass = s.staPass[0]
-		}
+	credential, err := s.resolveCredential(username.String, storedPassword, isAP)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = err.Error()
+		return result, err
 	}
+	user, pass := credential.Username, credential.Password
 
 	// Normalize platform for lookups/dispatch
 	platformLower := strings.ToLower(strings.TrimSpace(platform.String))
 
 	// Some operations (auto-select latest, or version lookup) require a device flavor.
 	// Stations learned indirectly may not have flavor populated in the DB yet, so infer it on-demand.
-	needsFlavor := firmwareFile == "" || !strings.HasSuffix(strings.ToLower(firmwareFile), ".bin")
+	isDirectReference := strings.HasPrefix(firmwareFile, firmwareIDPrefix) || strings.HasSuffix(strings.ToLower(firmwareFile), ".bin")
+	needsFlavor := firmwareFile == "" || !isDirectReference
 	if needsFlavor && strings.TrimSpace(flavor.String) == "" {
 		inferred, infErr := s.inferDeviceFlavor(ctx, deviceID, ip.String, platformLower, user, pass)
 		if infErr != nil {
@@ -931,7 +1016,7 @@ func (s *Service) UpgradeDevice(ctx context.Context, deviceID int64, firmwareFil
 			result.Message = err.Error()
 			return result, err
 		}
-	} else if strings.HasSuffix(strings.ToLower(firmwareFile), ".bin") {
+	} else if isDirectReference {
 		// User-provided firmware name - securely resolve to path
 		// This validates the input and prevents directory traversal
 		actualFirmwarePath, err = s.ResolveFirmwarePath(firmwareFile)
@@ -1023,13 +1108,11 @@ func (s *Service) doUpgrade(ctx context.Context, deviceID int64, ip, username, p
 	if username != "" && password != "" {
 		creds = append(creds, cred{username, password})
 	}
-	// Add AP credential pairs
-	for i := 0; i < len(s.apPass); i++ {
-		creds = append(creds, cred{s.apUser, s.apPass[i]})
+	for _, c := range s.credentialSnapshot(true) {
+		creds = append(creds, cred{c.Username, c.Password})
 	}
-	// Add STA credential pairs
-	for i := 0; i < len(s.staPass); i++ {
-		creds = append(creds, cred{s.staUser, s.staPass[i]})
+	for _, c := range s.credentialSnapshot(false) {
+		creds = append(creds, cred{c.Username, c.Password})
 	}
 
 	// Try all credential pairs
@@ -1150,19 +1233,11 @@ func (s *Service) doUpgradeAirMAX(ctx context.Context, deviceID int64, ip, usern
 	if username != "" && password != "" {
 		creds = append(creds, airmax.Credential{Username: username, Password: password})
 	}
-	// Add AP credential pairs
-	for i := 0; i < len(s.apPass); i++ {
-		user := s.apUser
-		if i < len(s.apPass) {
-			creds = append(creds, airmax.Credential{Username: user, Password: s.apPass[i]})
-		}
+	for _, c := range s.credentialSnapshot(true) {
+		creds = append(creds, airmax.Credential{Username: c.Username, Password: c.Password})
 	}
-	// Add STA credential pairs
-	for i := 0; i < len(s.staPass); i++ {
-		user := s.staUser
-		if i < len(s.staPass) {
-			creds = append(creds, airmax.Credential{Username: user, Password: s.staPass[i]})
-		}
+	for _, c := range s.credentialSnapshot(false) {
+		creds = append(creds, airmax.Credential{Username: c.Username, Password: c.Password})
 	}
 
 	// Try all credentials
@@ -1784,7 +1859,8 @@ func (s *Service) UpgradeFanout(ctx context.Context, apID int64, force bool) ([]
 				return
 			}
 
-			result, _ := s.UpgradeDevice(ctx, sta.ID, fwFile, force)
+			result, upgradeErr := s.UpgradeDevice(ctx, sta.ID, fwFile, force)
+			result = normalizeUpgradeResult(result, sta.ID, upgradeErr)
 			mu.Lock()
 			results = append(results, result)
 			mu.Unlock()
@@ -1816,7 +1892,8 @@ func (s *Service) UpgradeFanout(ctx context.Context, apID int64, force bool) ([]
 		return results, nil
 	}
 
-	apResult, _ := s.UpgradeDevice(ctx, apID, apFWFile, force)
+	apResult, upgradeErr := s.UpgradeDevice(ctx, apID, apFWFile, force)
+	apResult = normalizeUpgradeResult(apResult, apID, upgradeErr)
 	results = append(results, apResult)
 
 	return results, nil
@@ -1898,7 +1975,7 @@ func (s *Service) RetryUpgradeWithCredentials(ctx context.Context, deviceIDs []i
 				upgradeErr = s.doUpgradeAirMAX(ctx, id, ip.String, username, password, fwFile)
 			} else {
 				// Wave and LTU use JSON API (/api/v1.0/system/upgrade/direct)
-				upgradeErr = s.doUpgradeWithCreds(ctx, deviceID, ip.String, username, password, fwFile, platformLower)
+				upgradeErr = s.doUpgradeWithCreds(ctx, id, ip.String, username, password, fwFile, platformLower)
 			}
 
 			if upgradeErr != nil {
@@ -1919,8 +1996,18 @@ func (s *Service) RetryUpgradeWithCredentials(ctx context.Context, deviceIDs []i
 				result.Message = "upgrade initiated, device rebooting"
 				dbExecIgnore(s.db, `UPDATE firmware_jobs SET status = 'success', completed_at = NOW() WHERE id = $1`, jobID)
 				dbExecIgnore(s.db, `UPDATE devices SET status = 'upgrading' WHERE id = $1`, id)
-				// Update device credentials if upgrade succeeded
-				dbExecIgnore(s.db, `UPDATE devices SET username = $1, password = $2 WHERE id = $3`, username, password, id)
+				// Persist the successful credential only in encrypted form.
+				storedPassword := password
+				if s.secretStore != nil {
+					storedPassword, err = s.secretStore.Encrypt(password)
+					if err != nil {
+						log.Printf("firmware: cannot persist credential for device %d: %v", id, err)
+						storedPassword = ""
+					}
+				}
+				if storedPassword != "" {
+					dbExecIgnore(s.db, `UPDATE devices SET username = $1, password = $2 WHERE id = $3`, username, storedPassword, id)
+				}
 			}
 
 			mu.Lock()
@@ -2014,7 +2101,8 @@ func (s *Service) UpgradeBulk(ctx context.Context, deviceIDs []int64, firmwareFi
 				wg.Add(1)
 				go func(deviceID int64) {
 					defer wg.Done()
-					result, _ := s.UpgradeDevice(ctx, deviceID, firmwareFile, force)
+					result, upgradeErr := s.UpgradeDevice(ctx, deviceID, firmwareFile, force)
+					result = normalizeUpgradeResult(result, deviceID, upgradeErr)
 					mu.Lock()
 					results = append(results, result)
 					mu.Unlock()
@@ -2025,7 +2113,8 @@ func (s *Service) UpgradeBulk(ctx context.Context, deviceIDs []int64, firmwareFi
 
 		// Now upgrade this AP
 		log.Printf("UpgradeBulk: upgrading AP %d", apID)
-		result, _ := s.UpgradeDevice(ctx, apID, firmwareFile, force)
+		result, upgradeErr := s.UpgradeDevice(ctx, apID, firmwareFile, force)
+		result = normalizeUpgradeResult(result, apID, upgradeErr)
 		mu.Lock()
 		results = append(results, result)
 		mu.Unlock()
@@ -2049,7 +2138,8 @@ func (s *Service) UpgradeBulk(ctx context.Context, deviceIDs []int64, firmwareFi
 			wg.Add(1)
 			go func(deviceID int64) {
 				defer wg.Done()
-				result, _ := s.UpgradeDevice(ctx, deviceID, firmwareFile, force)
+				result, upgradeErr := s.UpgradeDevice(ctx, deviceID, firmwareFile, force)
+				result = normalizeUpgradeResult(result, deviceID, upgradeErr)
 				mu.Lock()
 				results = append(results, result)
 				mu.Unlock()
@@ -2107,12 +2197,11 @@ func (s *Service) FindByAirMAXPlatform(platform string) *FirmwareFile {
 
 // FetchConfig retrieves the configuration backup from a device
 func (s *Service) FetchConfig(ip, username, password string) ([]byte, error) {
-	if username == "" {
-		username = s.apUser
+	credential, err := s.resolveCredential(username, password, true)
+	if err != nil {
+		return nil, err
 	}
-	if password == "" && len(s.apPass) > 0 {
-		password = s.apPass[0]
-	}
+	username, password = credential.Username, credential.Password
 
 	// Login to Wave device
 	token, err := s.login(ip, username, password)
@@ -2154,12 +2243,11 @@ func (s *Service) FetchConfig(ip, username, password string) ([]byte, error) {
 
 // PushConfig uploads a configuration to a device
 func (s *Service) PushConfig(ip, username, password string, config []byte) error {
-	if username == "" {
-		username = s.apUser
+	credential, err := s.resolveCredential(username, password, true)
+	if err != nil {
+		return err
 	}
-	if password == "" && len(s.apPass) > 0 {
-		password = s.apPass[0]
-	}
+	username, password = credential.Username, credential.Password
 
 	// Login to Wave device
 	token, err := s.login(ip, username, password)
@@ -2196,12 +2284,11 @@ func (s *Service) PushConfig(ip, username, password string, config []byte) error
 
 // ApplyConfig applies specific configuration changes to a device
 func (s *Service) ApplyConfig(ip, username, password string, changes map[string]any) error {
-	if username == "" {
-		username = s.apUser
+	credential, err := s.resolveCredential(username, password, true)
+	if err != nil {
+		return err
 	}
-	if password == "" && len(s.apPass) > 0 {
-		password = s.apPass[0]
-	}
+	username, password = credential.Username, credential.Password
 
 	// Login to Wave device
 	token, err := s.login(ip, username, password)

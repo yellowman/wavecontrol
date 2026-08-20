@@ -1084,22 +1084,10 @@ From `wireless.radios[].afc`:
 - A short validation note + any minor fixes bundled into the final zip.
 
 
-# Phase 41 — Native mobile push clients
-**Objective:** make Android/iOS clients efficient full-time alert receivers without relying on background WebSockets.
+# Phase 41 — Native mobile push experiment (removed)
+**Disposition:** removed from the application because native mobile delivery is outside waveControl's scope.
 
-**Implemented in this bundle:**
-- Added server-authoritative mobile push architecture: Alert Manager -> durable notification_outbox -> FCM/APNs.
-- Added encrypted mobile token registry (`mobile_devices`) and per-user mobile preferences.
-- Added mobile REST endpoints for token registration, preferences, bootstrap/reconcile, and test push.
-- Added `mobile` as an alert notify channel for active and resolved alerts.
-- Added direct FCM HTTP v1 and APNs token-auth providers using existing settings storage.
-- Documented Android/Kotlin and iOS/SwiftUI client runtime expectations.
-
-**Future client work:**
-- Android Kotlin/Compose client with FCM, Room cache, DataStore settings, and foreground-only WebSocket.
-- iOS SwiftUI client with APNs/FCM bridge, Keychain auth, local cache, and foreground-only WebSocket.
-- Optional visible Android NOC foreground-service mode for charging/kiosk/field monitoring.
-- Alert grouping by site/outage blast radius once site-level correlation is defined.
+The server-side token registry, provider clients, routes, settings, schema objects, UI controls, and client documentation from this experiment are not shipped. Alert delivery is limited to the durable email, webhook, and Zabbix outbox.
 
 
 # Phase 42 — Explicit replacement AP/STA MAC adoption
@@ -1186,18 +1174,17 @@ From `wireless.radios[].afc`:
 - Added Alert Rules table with edit/copy/delete controls.
 - Added operator-facing rule form for all/site/device scoping, metric/operator/threshold, persistence delay, cooldown, and channels.
 - Added presets for Host down, weak 5 GHz, weak 60 GHz, weak LTU, high CPU, high temperature, low 60 GHz capacity, peer count dropped, and low link score.
-- Added mobile test push action from the Alerts page.
 - Updated alert-rule creation so explicit `enabled: false` is preserved; omitted enabled still defaults to true for old clients.
 
 Validation:
 - `node --check web/js/api.js web/js/app.js web/js/components.js`
 - Go parser over all Go files.
-- `GOPROXY=off go test ./internal/airmax ./internal/firmware ./internal/stats ./internal/push`
+- `GOPROXY=off go test ./internal/airmax ./internal/firmware ./internal/stats`
 
 Known limitation:
 - Full dependency-backed `go test ./...` still requires module cache or network access for external dependencies.
 
-- Added one-click recommended alert rule installer on the Alerts page; duplicate-safe and defaults to mobile push.
+- Added one-click recommended alert rule installer on the Alerts page; duplicate-safe and leaves external delivery channels unset until configured by an operator.
 
 ## v144 alert target policy
 

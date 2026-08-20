@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/yellowman/wavecontrol/internal/configbackup"
 	"github.com/yellowman/wavecontrol/internal/firmware"
 	"github.com/yellowman/wavecontrol/internal/websocket"
 )
@@ -620,7 +619,11 @@ func (r *Runner) runFanoutUpgradeJob(ctx context.Context, job *JobRun) (interfac
 // runBackupJob backs up device configs to filesystem
 func (r *Runner) runBackupJob(ctx context.Context, job *JobRun) (interface{}, error) {
 	var params BackupParams
-	json.Unmarshal(job.Parameters, &params)
+	if len(job.Parameters) > 0 {
+		if err := json.Unmarshal(job.Parameters, &params); err != nil {
+			return nil, fmt.Errorf("decode backup parameters: %w", err)
+		}
+	}
 
 	type BackupResult struct {
 		DeviceID int    `json:"device_id"`
@@ -629,14 +632,17 @@ func (r *Runner) runBackupJob(ctx context.Context, job *JobRun) (interface{}, er
 		Path     string `json:"path,omitempty"`
 	}
 
-	// Get backup directory from settings
 	backupPath := "backups"
-	r.db.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
+	if err := r.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("load backup directory: %w", err)
+	}
+	backupRoot, err := configbackup.EnsureRoot(backupPath)
+	if err != nil {
+		return nil, err
+	}
 
-	var results []BackupResult
+	results := make([]BackupResult, 0, len(job.DeviceIDs))
 	completed := 0
-
-	// Set total_steps for progress visibility (same as fanout)
 	dbExecIgnore(r.db, `UPDATE job_runs SET total_steps = $1 WHERE id = $2`, len(job.DeviceIDs), job.ID)
 
 	for _, deviceID := range job.DeviceIDs {
@@ -647,67 +653,69 @@ func (r *Runner) runBackupJob(ctx context.Context, job *JobRun) (interface{}, er
 		}
 
 		r.logEvent(job.ID, EventProgress, &deviceID, "Backing up config", nil)
+		result := BackupResult{DeviceID: deviceID, Status: "failed"}
 
-		// Get device info including hostname and parent
 		var ip, hostname, username, password string
 		var parentID sql.NullInt64
 		err := r.db.QueryRowContext(ctx, `
 			SELECT host(ip_address), COALESCE(hostname, ''), COALESCE(username, ''), COALESCE(password, ''), parent_id
 			FROM devices WHERE id = $1
 		`, deviceID).Scan(&ip, &hostname, &username, &password, &parentID)
-
 		if err != nil {
-			results = append(results, BackupResult{DeviceID: deviceID, Status: "failed", Message: "device not found"})
+			result.Message = "device not found"
+			results = append(results, result)
+			completed++
+			r.updateProgress(job.ID, completed, len(job.DeviceIDs))
 			continue
 		}
 
-		// Fetch config
 		config, err := r.fwService.FetchConfig(ip, username, password)
 		if err != nil {
+			result.Message = err.Error()
 			r.logEvent(job.ID, EventWarning, &deviceID, fmt.Sprintf("Backup failed: %v", err), nil)
-			results = append(results, BackupResult{DeviceID: deviceID, Status: "failed", Message: err.Error()})
-		} else {
-			// Save to filesystem with same structure as API backup
-			safeIP := sanitizeIPForPath(ip)
-			var dirPath string
-			if parentID.Valid {
-				// STA - get parent AP's IP
-				var apIP string
-				r.db.QueryRow(`SELECT host(ip_address) FROM devices WHERE id = $1`, parentID.Int64).Scan(&apIP)
-				if apIP == "" {
-					apIP = "unknown-ap"
-				}
-				safeAPIP := sanitizeIPForPath(apIP)
-				dirPath = filepath.Join(backupPath, safeAPIP, safeIP)
-			} else {
-				dirPath = filepath.Join(backupPath, safeIP)
-			}
-
-			if err := os.MkdirAll(dirPath, 0755); err != nil {
-				results = append(results, BackupResult{DeviceID: deviceID, Status: "failed", Message: "mkdir: " + err.Error()})
-				continue
-			}
-
-			// Filename: hostname_timestamp.cfg
-			name := hostname
-			if name == "" {
-				name = strings.ReplaceAll(safeIP, ".", "-")
-			}
-			name = strings.ReplaceAll(name, "/", "-")
-			name = strings.ReplaceAll(name, "\\", "-")
-			name = strings.ReplaceAll(name, ":", "-")
-
-			timestamp := time.Now().Format("20060102-150405")
-			filename := filepath.Join(dirPath, fmt.Sprintf("%s_%s.cfg", name, timestamp))
-
-			if err := os.WriteFile(filename, config, 0644); err != nil {
-				results = append(results, BackupResult{DeviceID: deviceID, Status: "failed", Message: "write: " + err.Error()})
-			} else {
-				r.logEvent(job.ID, EventStepComplete, &deviceID, fmt.Sprintf("Config backed up to %s", filename), nil)
-				results = append(results, BackupResult{DeviceID: deviceID, Status: "success", Path: filename})
-			}
+			results = append(results, result)
+			completed++
+			r.updateProgress(job.ID, completed, len(job.DeviceIDs))
+			continue
 		}
 
+		parts := make([]string, 0, 2)
+		if parentID.Valid {
+			var apIP string
+			if err := r.db.QueryRowContext(ctx, `SELECT host(ip_address) FROM devices WHERE id = $1`, parentID.Int64).Scan(&apIP); err != nil && err != sql.ErrNoRows {
+				result.Message = "lookup parent device: " + err.Error()
+				results = append(results, result)
+				completed++
+				r.updateProgress(job.ID, completed, len(job.DeviceIDs))
+				continue
+			}
+			if apIP == "" {
+				apIP = "unknown-ap"
+			}
+			parts = append(parts, sanitizeIPForPath(apIP))
+		}
+		parts = append(parts, sanitizeIPForPath(ip))
+		dirPath, err := configbackup.EnsureDir(backupRoot, parts...)
+		if err != nil {
+			result.Message = err.Error()
+			results = append(results, result)
+			completed++
+			r.updateProgress(job.ID, completed, len(job.DeviceIDs))
+			continue
+		}
+		name := hostname
+		if name == "" {
+			name = sanitizeIPForPath(ip)
+		}
+		filename, err := configbackup.Write(dirPath, name, config)
+		if err != nil {
+			result.Message = err.Error()
+		} else {
+			result.Status = "success"
+			result.Path = filename
+			r.logEvent(job.ID, EventStepComplete, &deviceID, fmt.Sprintf("Config backed up to %s", filename), nil)
+		}
+		results = append(results, result)
 		completed++
 		r.updateProgress(job.ID, completed, len(job.DeviceIDs))
 	}

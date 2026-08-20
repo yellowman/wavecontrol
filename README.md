@@ -36,7 +36,7 @@ Previous tools like UNMS/UISP would grind to a halt with 500+ devices. waveContr
 ### Monitoring
 - **Real-time Stats**: Per-chain signal levels, TX/RX rates, capacity, airtime
 - **WebSocket Updates**: Live stats push without polling
-- **Alerting**: Operator-facing alert rules UI, one-click recommended alert-rule installer, active-alert workflow, signal/offline/capacity thresholds, and native mobile push
+- **Alerting**: Operator-facing alert rules UI, one-click recommended rule installer, active-alert workflow, signal/offline/capacity thresholds, and durable email, webhook, and Zabbix delivery
 - **Map View**: Leaflet/OpenStreetMap with GPS markers and signal-colored links
 - **KMZ Export**: Export device locations to Google Earth (APs-only or all devices)
 - **Quality**: Table-based AP<->client quality monitoring (Signal + Modulation) with issues queue
@@ -69,7 +69,7 @@ Generate point-in-time snapshots of network health, inventory, and performance. 
 - **Top Offenders**: Offline devices, flapping devices, poor signal STAs, high CPU devices
 
 **Performance Report Features:**
-- **Throughput History Chart**: D3 line chart showing TX/RX over last 30 minutes
+- **Throughput History Chart**: Native SVG line chart showing TX/RX over the last 30 minutes
 - **Signal Quality Bar**: Visual distribution of good/fair/poor STAs
 - **AP Performance Tab**: Top 50 APs by throughput with client counts and poor %
 - **STA Performance Tab**: Top 50 STAs by throughput with parent AP
@@ -93,8 +93,8 @@ Generate point-in-time snapshots of network health, inventory, and performance. 
 ### Integration
 - **Zabbix Bridge**: Native agent protocol on port 10050
 - **TLS Management**: Pin certificates, trust-on-first-use, or skip verification
-- **REST API**: Full API for automation, external integrations, and native mobile client bootstrap
-- **Mobile Push**: Server-authoritative Android/iOS notifications through durable FCM/APNs outbox
+- **REST API**: Cookie-authenticated API for the browser and same-origin automation
+- **Durable Notifications**: Retryable email, webhook, and Zabbix delivery through a PostgreSQL outbox
 
 ### Security
 - **Role-Based Access**: Viewer, Creator, Editor, Administrator roles
@@ -164,16 +164,16 @@ The Quality page provides **table-driven analytics** for AP<->Client monitoring 
 |   HTTP API   |   Poller     | Stats Store  | Firmware Svc   |
 |   (chi)      |  (30s loop)  | (in-memory)  |  (upgrades)    |
 +--------------+--------------+--------------+----------------+
-| Alert Manager| Push Outbox  | FCM / APNs   | WebSocket Hub  |
-+--------------+--------------+--------------+----------------+
+| Alert Manager| Notification Outbox         | WebSocket Hub  |
++--------------+-----------------------------+----------------+
 |                     PostgreSQL (inventory)                   |
 +-------------------------------------------------------------+
 ```
 
 **Data Split:**
-- **Database**: Static inventory (MAC, IP, firmware version, credentials), alert history, mobile push token registry, notification outbox
+- **Database**: Static inventory, encrypted operational credentials, alert history, and the notification outbox
 - **Memory**: Real-time stats (signal, rates, uptime, peer details)
-- **Mobile clients**: Push for outage alarms; WebSocket only for foreground live UI or explicit visible NOC mode
+- **Browser**: Same-origin REST plus an authenticated WebSocket for live updates
 
 ## Installation
 
@@ -249,10 +249,14 @@ psql -U wavecontrol -h localhost wavecontrol < schema.sql
 ### Build and Run
 
 ```bash
-# Set environment
-# NOTE: Use IP address (127.0.0.1) instead of hostname for chroot compatibility
+# Generate persistent secrets once. Keep both values across restarts.
 export WAVECONTROL_DSN="postgres://wavecontrol:your-password-here@127.0.0.1/wavecontrol?sslmode=disable"
-export WAVECONTROL_JWT_SECRET="$(openssl rand -base64 32)"
+export WAVECONTROL_JWT_SECRET="$(openssl rand -base64 48)"
+export WAVECONTROL_DATA_KEY="$(openssl rand -base64 32)"
+
+# An empty database also requires an explicit first administrator.
+export WAVECONTROL_BOOTSTRAP_USERNAME="wavecontrol-admin"
+export WAVECONTROL_BOOTSTRAP_PASSWORD="replace-with-a-strong-password"
 
 # Build
 go build -o wavecontrol ./cmd/server
@@ -264,7 +268,7 @@ go build -o wavecontrol ./cmd/server
 ./wavecontrol -d
 
 # Access UI: http://localhost:8080
-# Default login: admin / admin (change this!)
+# Remove the two WAVECONTROL_BOOTSTRAP_* variables after the first successful start.
 ```
 
 ### Directory Setup
@@ -455,33 +459,36 @@ rcctl start relayd
 
 #### systemd (Linux)
 
-Copy `systemd/wavecontrol.service` from the archive:
+Install the supplied unit and root-owned environment file:
 
 ```bash
-cp systemd/wavecontrol.service /etc/systemd/system/
+install -d -m 0750 /etc/wavecontrol
+install -m 0600 systemd/wavecontrol.env.example /etc/wavecontrol/wavecontrol.env
+install -m 0644 systemd/wavecontrol.service /etc/systemd/system/wavecontrol.service
 
-# Edit DSN and JWT_SECRET in the service file, then:
+# Edit the DSN and generate the two persistent secrets in wavecontrol.env.
+# For an empty database, temporarily enable the two bootstrap variables.
 systemctl daemon-reload
-systemctl enable wavecontrol
-systemctl start wavecontrol
+systemctl enable --now wavecontrol
 ```
 
-Note: Uses `-d` flag since systemd manages the process lifecycle.
+After the first administrator is created, remove the bootstrap username/password from the environment file and restart. Never regenerate `WAVECONTROL_DATA_KEY` on an existing database; it protects stored device and service credentials.
 
 #### OpenBSD rc.d
 
-Copy `rc.d/wavecontrol` from the archive:
+Install the supplied rc.d script and the same persistent environment file:
 
 ```bash
-cp rc.d/wavecontrol /etc/rc.d/
-chmod +x /etc/rc.d/wavecontrol
+install -d -m 0750 /etc/wavecontrol
+install -m 0600 systemd/wavecontrol.env.example /etc/wavecontrol/wavecontrol.env
+install -m 0555 rc.d/wavecontrol /etc/rc.d/wavecontrol
 
-# Edit DSN in /etc/rc.d/wavecontrol, then:
+# Edit /etc/wavecontrol/wavecontrol.env before starting.
 rcctl enable wavecontrol
 rcctl start wavecontrol
 ```
 
-The script generates a random JWT secret on each start. For persistent logins across restarts, edit the script and set a static `_jwt_secret`.
+The rc.d script refuses to start without all three required variables. It never generates replacement keys at boot.
 
 ## Quick Start
 
@@ -492,16 +499,19 @@ For development/testing:
 psql -U postgres -c "CREATE DATABASE wavecontrol;"
 psql -U postgres wavecontrol < schema.sql
 
-# 2. Set environment
+# 2. Set persistent application secrets and an explicit first administrator
 export WAVECONTROL_DSN="postgres://postgres@127.0.0.1/wavecontrol?sslmode=disable"
-export WAVECONTROL_JWT_SECRET="dev-secret-change-in-prod"
+export WAVECONTROL_JWT_SECRET="$(openssl rand -base64 48)"
+export WAVECONTROL_DATA_KEY="$(openssl rand -base64 32)"
+export WAVECONTROL_BOOTSTRAP_USERNAME="wavecontrol-admin"
+export WAVECONTROL_BOOTSTRAP_PASSWORD="replace-with-a-strong-password"
 
 # 3. Build and run
 go build -o wavecontrol ./cmd/server
-./wavecontrol
+./wavecontrol -d
 
-# 4. Access UI at http://localhost:8080
-# Login: admin / admin
+# 4. Access UI at http://localhost:8080, sign in with the bootstrap account,
+# then remove the two bootstrap variables.
 ```
 
 ## Security & Privileges
@@ -565,14 +575,14 @@ All configuration is done via the web UI Settings page:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `default_username` | `ubnt` | Default device username |
-| `default_passwords` | `["ubnt"]` | Passwords to try (one per line in UI) |
+| `ap_cred1_user` … `ap_cred3_pass` | empty | Up to three AP username/password pairs |
+| `sta_cred1_user` … `sta_cred3_pass` | empty | Up to three STA username/password pairs |
 | `firmware_path` | `firmware` | Directory containing firmware files (relative) |
 | `backup_dir` | `backups` | Directory for config backups (relative) |
 | `listen_addr` | `127.0.0.1:8080` | HTTP listen address |
 | `zabbix_enabled` | `false` | Enable Zabbix bridge |
 | `zabbix_listen` | `127.0.0.1:10050` | Zabbix agent listen address |
-| `cors_origins` | (empty) | CORS allowed origins: empty=same-origin, `*`=all, or JSON array |
+| `cors_origins` | (empty) | Additional exact HTTP(S) origins; wildcard-all is rejected for cookie authentication |
 | `csp_img_sources` | (empty) | Additional CSP img-src domains for map tiles (space-separated) |
 | `csp_connect_sources` | (empty) | Additional CSP connect-src domains for APIs (space-separated) |
 
@@ -680,15 +690,20 @@ See [SPEC.md](SPEC.md#management-ip-prefix-filter) for implementation details.
 
 See [Security & Privileges](#security--privileges) for how relative paths are resolved.
 
-Environment variables (required):
-- `WAVECONTROL_DSN` - PostgreSQL connection string
-- `WAVECONTROL_JWT_SECRET` - JWT signing key
+Environment variables:
+- `WAVECONTROL_DSN` — required PostgreSQL connection string
+- `WAVECONTROL_JWT_SECRET` — required persistent session-signing key
+- `WAVECONTROL_DATA_KEY` — required persistent 32-byte AES key, base64 encoded
+- `WAVECONTROL_BOOTSTRAP_USERNAME` and `WAVECONTROL_BOOTSTRAP_PASSWORD` — required only while creating the first user in an empty database
 
 ## API Endpoints
 
 ### Authentication
-- `POST /api/wavecontrol/auth/login` - Get JWT token
-- `GET /api/wavecontrol/me` - Current user info
+- `POST /api/wavecontrol/auth/login` — verifies credentials and sets a Secure/HttpOnly/SameSite session cookie
+- `POST /api/wavecontrol/auth/logout` — revokes the current user's sessions and clears the cookie
+- `GET /api/wavecontrol/me` — returns the current user
+
+Protected browser API requests use the HttpOnly cookie. State-changing requests must be same-origin and include `X-WaveControl-CSRF: 1`; the JavaScript client adds this header automatically.
 
 ### Devices
 - `GET /api/wavecontrol/devices` - List all devices with live stats
@@ -713,7 +728,8 @@ Environment variables (required):
 
 ### Settings
 - `GET /api/wavecontrol/settings` - All settings
-- `PATCH /api/wavecontrol/settings/{key}` - Update setting
+- `PATCH /api/wavecontrol/settings` - Atomically update a settings form
+- `PATCH /api/wavecontrol/settings/{key}` - Update one setting
 
 ## Supported Devices
 
@@ -889,23 +905,31 @@ Schedule firmware upgrades or device reboots from the Settings page.
 ### API
 
 ```bash
-# List jobs
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/wavecontrol/jobs
+# Establish a cookie session.
+curl -sS -c cookies.txt \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"operator","password":"your-password"}' \
+  http://localhost:8080/api/wavecontrol/auth/login
 
-# Schedule upgrade
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+# List jobs.
+curl -sS -b cookies.txt http://localhost:8080/api/wavecontrol/jobs
+
+# Schedule an upgrade. All state-changing cookie requests need the CSRF header.
+curl -sS -b cookies.txt -X POST \
+  -H 'X-WaveControl-CSRF: 1' \
+  -H 'Content-Type: application/json' \
   -d '{
     "job_type": "upgrade",
     "device_ids": [1, 2, 3],
     "parameters": {"force": false, "fanout": true},
-    "scheduled_at": "2024-01-15T03:00:00Z",
+    "scheduled_at": "2026-08-20T03:00:00Z",
     "repeat_cron": "@daily"
   }' \
   http://localhost:8080/api/wavecontrol/jobs
 
-# Cancel job
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+# Cancel a job.
+curl -sS -b cookies.txt -X DELETE \
+  -H 'X-WaveControl-CSRF: 1' \
   http://localhost:8080/api/wavecontrol/jobs/123
 ```
 

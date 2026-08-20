@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
 	"github.com/yellowman/wavecontrol/internal/udebug"
 	"github.com/yellowman/wavecontrol/internal/websocket"
@@ -60,6 +61,9 @@ type Poller struct {
 	// Ultra debug manager (optional; in-memory per-device request/response capture)
 	ultraDebug *udebug.Manager
 
+	// AES-GCM store used to decrypt device and settings credentials.
+	secretStore *secrets.Manager
+
 	// Circuit breaker state per device
 	circuitMu    sync.RWMutex
 	circuitState map[string]*circuitBreaker
@@ -67,6 +71,11 @@ type Poller struct {
 	// Poll cycle counter per device (for periodic config fetch)
 	pollCycleMu sync.RWMutex
 	pollCycles  map[string]int
+
+	// Consecutive authoritative empty AP peer snapshots. A single empty
+	// response is treated as transient to avoid mass false-offline events.
+	emptyPeerMu    sync.Mutex
+	emptyPeerPolls map[int64]int
 
 	// Interval change notification
 	intervalChanged chan time.Duration
@@ -122,10 +131,11 @@ type Config struct {
 	STACreds          []Credential // STA credential pairs (tried in order)
 	WorkerCount       int
 	Debug             bool
-	WavePeerFallback  bool            // Feature flag: probe alternate endpoints for Wave/MLO peer lists when peers are missing
-	WaveMLOMultiRadio bool            // Feature flag: infer Wave radio band from frequency/AFC and surface dual 5GHz radios
-	TLSManager        TLSManager      // TLS certificate manager (optional)
-	UltraDebug        *udebug.Manager // Ultra debug manager (optional)
+	WavePeerFallback  bool             // Feature flag: probe alternate endpoints for Wave/MLO peer lists when peers are missing
+	WaveMLOMultiRadio bool             // Feature flag: infer Wave radio band from frequency/AFC and surface dual 5GHz radios
+	TLSManager        TLSManager       // TLS certificate manager (optional)
+	UltraDebug        *udebug.Manager  // Ultra debug manager (optional)
+	SecretStore       *secrets.Manager // encrypted credential store (required in production)
 }
 
 // compactQuery condenses whitespace for readable logging without truncating context.
@@ -183,11 +193,8 @@ func NewPoller(db *sql.DB, store *stats.Store, wsHub *websocket.Hub, cfg Config)
 	if cfg.Interval == 0 {
 		cfg.Interval = 30 * time.Second
 	}
-	if len(cfg.APCreds) == 0 {
-		cfg.APCreds = []Credential{{Username: "ubnt", Password: "ubnt"}}
-	}
 	if len(cfg.STACreds) == 0 {
-		cfg.STACreds = cfg.APCreds // Default to AP credentials
+		cfg.STACreds = append([]Credential(nil), cfg.APCreds...)
 	}
 
 	// Calculate job queue size based on expected device count
@@ -222,15 +229,67 @@ func NewPoller(db *sql.DB, store *stats.Store, wsHub *websocket.Hub, cfg Config)
 		waveMLOMultiRadio: cfg.WaveMLOMultiRadio,
 		tlsManager:        cfg.TLSManager,
 		ultraDebug:        cfg.UltraDebug,
+		secretStore:       cfg.SecretStore,
 		jobs:              make(chan pollJob, jobQueueSize),
 		circuitState:      make(map[string]*circuitBreaker),
 		pollCycles:        make(map[string]int),
+		emptyPeerPolls:    make(map[int64]int),
 		intervalChanged:   make(chan time.Duration, 1), // Buffered to avoid blocking
 		httpClient: &http.Client{
 			Transport: defaultTransport,
 			Timeout:   15 * time.Second, // Reduced from 30s for faster failure detection
 		},
 	}
+}
+
+// acceptPeerSnapshot returns whether an AP peer snapshot is authoritative enough
+// to replace the prior list. Non-empty snapshots apply immediately. An empty
+// snapshot must be observed twice consecutively for the same AP, which filters
+// one-off empty/partial API responses without indefinitely hiding real disconnects.
+func (p *Poller) acceptPeerSnapshot(apID int64, peers []*stats.PeerStats) bool {
+	p.emptyPeerMu.Lock()
+	defer p.emptyPeerMu.Unlock()
+
+	if len(peers) > 0 {
+		delete(p.emptyPeerPolls, apID)
+		return true
+	}
+	p.emptyPeerPolls[apID]++
+	if p.emptyPeerPolls[apID] < 2 {
+		p.logDebug("AP %d returned an empty peer snapshot; retaining the prior peer list until a second consecutive empty poll", apID)
+		return false
+	}
+	// Keep the counter bounded while continuing to accept confirmed empties.
+	p.emptyPeerPolls[apID] = 2
+	return true
+}
+
+func (p *Poller) prepareJobCredential(job *pollJob, isSTA bool) error {
+	if job == nil {
+		return fmt.Errorf("nil poll job")
+	}
+	if job.Password != "" {
+		plain, err := p.decryptSecret(job.Password)
+		if err != nil {
+			return fmt.Errorf("decrypt credential for device %d: %w", job.DeviceID, err)
+		}
+		job.Password = plain
+	}
+	if job.Username != "" && job.Password != "" {
+		return nil
+	}
+	// Do not combine a partial per-device override with a global credential.
+	job.Username, job.Password = "", ""
+	cfg := p.cfgSnapshot()
+	creds := cfg.apCreds
+	if isSTA {
+		creds = cfg.staCreds
+	}
+	if len(creds) > 0 {
+		job.Username = creds[0].Username
+		job.Password = creds[0].Password
+	}
+	return nil
 }
 
 // logDebug logs only when debug mode is enabled
@@ -588,17 +647,9 @@ func (p *Poller) RefreshDevice(ip string) {
 		Role:     role.String,
 	}
 
-	// Default credentials if per-device creds are missing.
-	// If the device is known to be a STA (role=sta OR has parent_id), prefer STA creds.
-	creds := p.cfgSnapshot().apCreds
-	if (strings.EqualFold(job.Role, "sta") || parentID.Valid) && len(p.cfgSnapshot().staCreds) > 0 {
-		creds = p.cfgSnapshot().staCreds
-	}
-	if job.Username == "" && len(creds) > 0 {
-		job.Username = creds[0].Username
-	}
-	if job.Password == "" && len(creds) > 0 {
-		job.Password = creds[0].Password
+	if err := p.prepareJobCredential(&job, strings.EqualFold(job.Role, "sta") || parentID.Valid); err != nil {
+		log.Printf("RefreshDevice %s: %v", ip, err)
+		return
 	}
 
 	select {
@@ -652,16 +703,8 @@ func (p *Poller) RefreshDeviceByID(deviceID int64) error {
 		Role:     role.String,
 	}
 
-	// Default credentials if per-device creds are missing.
-	creds := p.cfgSnapshot().apCreds
-	if (strings.EqualFold(job.Role, "sta") || parentID.Valid) && len(p.cfgSnapshot().staCreds) > 0 {
-		creds = p.cfgSnapshot().staCreds
-	}
-	if job.Username == "" && len(creds) > 0 {
-		job.Username = creds[0].Username
-	}
-	if job.Password == "" && len(creds) > 0 {
-		job.Password = creds[0].Password
+	if err := p.prepareJobCredential(&job, strings.EqualFold(job.Role, "sta") || parentID.Valid); err != nil {
+		return err
 	}
 
 	select {
@@ -730,16 +773,9 @@ enqueue:
 		job.Flavor = flavor.String
 		job.Role = role.String
 
-		// Default credentials (role-aware)
-		creds := p.cfgSnapshot().apCreds
-		if (strings.EqualFold(job.Role, "sta") || parentID.Valid) && len(p.cfgSnapshot().staCreds) > 0 {
-			creds = p.cfgSnapshot().staCreds
-		}
-		if job.Username == "" && len(creds) > 0 {
-			job.Username = creds[0].Username
-		}
-		if job.Password == "" && len(creds) > 0 {
-			job.Password = creds[0].Password
+		if err := p.prepareJobCredential(&job, strings.EqualFold(job.Role, "sta") || parentID.Valid); err != nil {
+			log.Printf("pollAllDevices: device %d credential error: %v", job.DeviceID, err)
+			continue
 		}
 
 		select {

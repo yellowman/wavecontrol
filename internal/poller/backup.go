@@ -13,6 +13,17 @@ import (
 )
 
 func (p *Poller) FetchDeviceBackup(deviceID int64, ip, platform, username, password string) ([]byte, error) {
+	if password != "" {
+		plain, err := p.decryptSecret(password)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt device credential: %w", err)
+		}
+		password = plain
+	}
+	if (username == "") != (password == "") {
+		// Ignore incomplete overrides rather than combining unrelated fields.
+		username, password = "", ""
+	}
 	platformLower := strings.ToLower(platform)
 	isWaveLTU := platformLower == "wave" || platformLower == "ltu"
 
@@ -38,7 +49,9 @@ func (p *Poller) fetchWaveBackup(deviceID int64, ip, username, password string) 
 	if username != "" && password != "" {
 		creds = append(creds, Credential{Username: username, Password: password})
 	}
-	creds = append(creds, p.cfgSnapshot().apCreds...)
+	cfg := p.cfgSnapshot()
+	creds = append(creds, cfg.apCreds...)
+	creds = append(creds, cfg.staCreds...)
 
 	// Try all credential pairs
 	var token string
@@ -112,10 +125,6 @@ func (p *Poller) fetchAirMAXBackup(deviceID int64, ip, username, password string
 	for _, c := range p.cfgSnapshot().staCreds {
 		creds = append(creds, airmax.Credential{Username: c.Username, Password: c.Password})
 	}
-	if len(creds) == 0 {
-		creds = append(creds, airmax.Credential{Username: "ubnt", Password: "ubnt"})
-	}
-
 	if err := client.LoginWithCredentials(creds); err != nil {
 		return nil, fmt.Errorf("login failed: %w", err)
 	}

@@ -1850,11 +1850,11 @@ export function renderDeviceDetail(panel, device) {
     </div>
     <div class="detail-body">
       <div class="detail-quick-actions">
-		<button class="btn btn-sm" onclick="window.open('/api/wavecontrol/open-ui?ip=${escapeAttr(device.ip_address)}', '_blank')">Open UI</button>
-        <button class="btn btn-sm" onclick="window.refreshDevice(${device.id})">Refresh</button>
-        <button class="btn btn-sm btn-danger" onclick="window.rebootDevice(${device.id})">Reboot</button>
-        ${hasMacMismatch ? `<button class="btn btn-sm btn-warning" onclick="window.learnReplacementMAC(${device.id})">Learn replacement MAC</button>` : ''}
-        <button class="btn btn-sm btn-primary" onclick="window.showUpgradeModal(${device.id})">Upgrade</button>
+		<button class="btn btn-sm" data-wc-action="open-device-ui" data-device-id="${escapeAttr(device.id)}">Open UI</button>
+        <button class="btn btn-sm" data-wc-action="refresh-device" data-device-id="${device.id}">Refresh</button>
+        <button class="btn btn-sm btn-danger" data-wc-action="reboot-device" data-device-id="${device.id}">Reboot</button>
+        ${hasMacMismatch ? `<button class="btn btn-sm btn-warning" data-wc-action="learn-replacement-mac" data-device-id="${device.id}">Learn replacement MAC</button>` : ''}
+        <button class="btn btn-sm btn-primary" data-wc-action="show-upgrade-modal" data-device-id="${device.id}">Upgrade</button>
       </div>
       
       ${hasMacMismatch ? `
@@ -1862,8 +1862,8 @@ export function renderDeviceDetail(panel, device) {
           <div class="detail-mismatch-title">MAC mismatch detected</div>
           <div class="detail-mismatch-copy">The ${roleLabel} row expected <code>${escapeHTML(identityMismatch?.expected_mac || device.mac || '-')}</code> at <code>${escapeHTML(device.ip_address || '-')}</code>, but the device there reported <code>${escapeHTML(observedMacText)}</code>. ${escapeHTML(mismatchCopy)}</div>
           <div class="detail-mismatch-actions">
-            <button class="btn btn-sm btn-warning" onclick="window.learnReplacementMAC(${device.id})">Learn replacement MAC</button>
-            <button class="btn btn-sm" onclick="window.refreshDevice(${device.id})">Refresh</button>
+            <button class="btn btn-sm btn-warning" data-wc-action="learn-replacement-mac" data-device-id="${device.id}">Learn replacement MAC</button>
+            <button class="btn btn-sm" data-wc-action="refresh-device" data-device-id="${device.id}">Refresh</button>
           </div>
         </div>
       ` : ''}
@@ -1952,7 +1952,7 @@ export function renderDeviceDetail(panel, device) {
           <div class="detail-label">Alertable</div>
           <div class="detail-value">
             <label class="form-check inline-check">
-              <input type="checkbox" ${alertable ? 'checked' : ''} onchange="window.updateDeviceAlerting(${device.id}, { alertable: this.checked })" />
+              <input type="checkbox" ${alertable ? 'checked' : ''} data-wc-change="toggle-alertable" data-device-id="${device.id}" />
               <span>${alertable ? 'Included in alert rules' : 'Excluded from alert rules'}</span>
             </label>
           </div>
@@ -1960,16 +1960,16 @@ export function renderDeviceDetail(panel, device) {
           <div class="detail-value">${escapeHTML(alertSilenceText)}</div>
           <div class="detail-label">Actions</div>
           <div class="detail-value detail-inline-actions">
-            <button class="btn btn-sm btn-secondary" onclick="window.updateDeviceAlerting(${device.id}, { silence_seconds: 3600 })">Silence 1h</button>
-            <button class="btn btn-sm btn-secondary" onclick="window.updateDeviceAlerting(${device.id}, { silence_seconds: 86400 })">Silence 24h</button>
-            <button class="btn btn-sm btn-secondary" onclick="window.updateDeviceAlerting(${device.id}, { clear_silence: true })">Clear silence</button>
+            <button class="btn btn-sm btn-secondary" data-wc-action="silence-device" data-device-id="${device.id}" data-seconds="3600">Silence 1h</button>
+            <button class="btn btn-sm btn-secondary" data-wc-action="silence-device" data-device-id="${device.id}" data-seconds="86400">Silence 24h</button>
+            <button class="btn btn-sm btn-secondary" data-wc-action="clear-device-silence" data-device-id="${device.id}">Clear silence</button>
           </div>
           ${device.alert_notes ? `
             <div class="detail-label">Notes</div>
             <div class="detail-value">${escapeHTML(device.alert_notes)}</div>
           ` : ''}
           <div class="detail-label">Notes</div>
-          <div class="detail-value"><button class="btn btn-sm btn-secondary" onclick="window.editDeviceAlertNotes(${device.id})">Edit notes</button></div>
+          <div class="detail-value"><button class="btn btn-sm btn-secondary" data-wc-action="edit-alert-notes" data-device-id="${device.id}">Edit notes</button></div>
         </div>
       </div>
       
@@ -2004,7 +2004,7 @@ export function renderDeviceDetail(panel, device) {
                 const label = escapeHTML(parent.hostname || parent.ip_address || 'Unknown')
                 const parentRole = String(parent.role || '').toLowerCase()
                 const warn = parentRole === 'sta' ? ` <span class="detail-warning">⚠ parent is STA (possible loop)</span>` : ''
-                return `<span class="detail-link" onclick="window.selectDevice(${parent.id})">${label}</span>${warn}`
+                return `<button type="button" class="detail-link detail-link-button" data-wc-action="select-device" data-device-id="${parent.id}">${label}</button>${warn}`
               }
             }
             return device.parent_mac ? `<span class="text-muted">${escapeHTML(device.parent_mac)} (offline)</span>` : '-'
@@ -2273,8 +2273,8 @@ ${device.interfaces && device.interfaces.length > 0 ? `
       <div class="detail-section">
         <h4>Config Backups</h4>
         <div class="config-backup-actions">
-          <button class="btn btn-sm" onclick="window.backupDeviceConfig(${device.id})">Backup Now</button>
-          <button class="btn btn-sm" onclick="window.showDeviceBackups(${device.id})">View Backups</button>
+          <button class="btn btn-sm" data-wc-action="backup-device-config" data-device-id="${device.id}">Backup Now</button>
+          <button class="btn btn-sm" data-wc-action="show-device-backups" data-device-id="${device.id}">View Backups</button>
         </div>
         <div id="deviceBackupsList-${device.id}" class="device-backups-list"></div>
       </div>

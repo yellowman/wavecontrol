@@ -1,42 +1,30 @@
-// API client for waveControl
-//
-// Security notes:
-// - Token is stored in localStorage (persists across sessions)
-// - This is acceptable for internal tools; for public apps, consider:
-//   - sessionStorage (cleared on browser close)
-//   - HttpOnly cookies (prevents XSS access)
-// - All requests use Authorization header (secure)
-// - WebSocket uses query param (documented tradeoff)
+// API client for waveControl. Authentication is held exclusively in an
+// HttpOnly, SameSite cookie set by the server; JavaScript never receives or
+// stores a bearer token.
 
 const BASE = '/api/wavecontrol'
+const CSRF_HEADER = 'X-WaveControl-CSRF'
 
-// Handle auth failure - clear token and reload to show login page
+let sessionAuthenticated = false
+
+function authError(message = 'Unauthorized') {
+  const error = new Error(message)
+  error.status = 401
+  return error
+}
+
 function handleAuthFailure() {
-  console.log('Auth failure detected, redirecting to login')
-  localStorage.removeItem('wavecontrol_token')
-  // Reload page to trigger login screen
-  window.location.reload()
+  sessionAuthenticated = false
+  window.dispatchEvent(new CustomEvent('wavecontrol-auth-failure'))
 }
 
 export const auth = {
-  token() {
-    return localStorage.getItem('wavecontrol_token') || ''
-  },
-  setToken(t) {
-    if (t) localStorage.setItem('wavecontrol_token', t)
-    else localStorage.removeItem('wavecontrol_token')
-  },
-  // Check if token appears expired (client-side check only)
-  isExpired() {
-    const token = this.token()
-    if (!token) return true
-    try {
-      const payload = JSON.parse(atob(token.split('.')[1]))
-      return payload.exp && payload.exp * 1000 < Date.now()
-    } catch {
-      return true
-    }
-  }
+  isAuthenticated() { return sessionAuthenticated },
+  markAuthenticated() { sessionAuthenticated = true },
+  clear() { sessionAuthenticated = false },
+  // Expiration is enforced by the server because the JWT is intentionally
+  // inaccessible to JavaScript. Periodic /me checks provide fail-closed sync.
+  isExpired() { return false },
 }
 
 
@@ -102,36 +90,58 @@ export const sync = {
   }
 }
 
-async function request(method, path, body = null) {
-  const headers = {
-    'Content-Type': 'application/json',
+async function request(method, path, body = null, options = {}) {
+  const upperMethod = String(method || 'GET').toUpperCase()
+  const headers = { 'Accept': 'application/json' }
+  if (body !== null) headers['Content-Type'] = 'application/json'
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(upperMethod)) headers[CSRF_HEADER] = '1'
+
+  const opts = {
+    method: upperMethod,
+    headers,
+    credentials: 'same-origin',
+    cache: 'no-store',
   }
-  
-  const token = auth.token()
-  if (token) {
-    headers['Authorization'] = 'Bearer ' + token
-  }
-  
-  const opts = { method, headers }
-  if (body) {
-    opts.body = JSON.stringify(body)
-  }
-  
+  if (body !== null) opts.body = JSON.stringify(body)
+
   const resp = await fetch(BASE + path, opts)
-  
   if (resp.status === 401) {
-    handleAuthFailure()
-    throw new Error('Unauthorized')
+    auth.clear()
+    if (options.handleAuthFailure !== false) handleAuthFailure()
+    throw authError()
   }
-  
   if (!resp.ok) {
     const text = await resp.text()
-    throw new Error(text || resp.statusText)
+    const error = new Error(text || resp.statusText)
+    error.status = resp.status
+    throw error
   }
-  
+
   const data = await resp.json()
+  auth.markAuthenticated()
   sync.markHTTP()
   return data
+}
+
+async function download(path) {
+  const resp = await fetch(BASE + path, {
+    method: 'GET',
+    credentials: 'same-origin',
+    cache: 'no-store',
+  })
+  if (resp.status === 401) {
+    handleAuthFailure()
+    throw authError()
+  }
+  if (!resp.ok) {
+    const text = await resp.text()
+    const error = new Error(text || resp.statusText)
+    error.status = resp.status
+    throw error
+  }
+  auth.markAuthenticated()
+  sync.markHTTP()
+  return resp.blob()
 }
 
 export const api = {
@@ -139,22 +149,33 @@ export const api = {
   async login(username, password) {
     const resp = await fetch(BASE + '/auth/login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', [CSRF_HEADER]: '1' },
+      credentials: 'same-origin',
+      cache: 'no-store',
       body: JSON.stringify({ username, password })
     })
-    
     if (!resp.ok) {
-      throw new Error('Invalid credentials')
+      const text = await resp.text().catch(() => '')
+      const error = new Error(text || 'Invalid credentials')
+      error.status = resp.status
+      throw error
     }
-    
     const data = await resp.json()
-    auth.setToken(data.token)
+    auth.markAuthenticated()
     sync.markAuthOK()
     return data
   },
+
+  async logout() {
+    try {
+      await request('POST', '/auth/logout', {}, { handleAuthFailure: false })
+    } finally {
+      auth.clear()
+    }
+  },
   
-  async me() {
-    return request('GET', '/me')
+  async me(options = {}) {
+    return request('GET', '/me', null, { handleAuthFailure: options.handleAuthFailure !== false })
   },
   
   // Devices
@@ -229,37 +250,11 @@ export const api = {
 
 
   async downloadUltraDebugDevice(deviceId) {
-    const token = auth.token()
-    const resp = await fetch(BASE + `/ultra-debug/${deviceId}/download`, {
-      method: 'GET',
-      headers: token ? { 'Authorization': 'Bearer ' + token } : {},
-    })
-    if (resp.status === 401) {
-      handleAuthFailure()
-      throw new Error('Unauthorized')
-    }
-    if (!resp.ok) {
-      const text = await resp.text()
-      throw new Error(text || resp.statusText)
-    }
-    return resp.blob()
+    return download(`/ultra-debug/${deviceId}/download`)
   },
 
   async downloadUltraDebugHost(host) {
-    const token = auth.token()
-    const resp = await fetch(BASE + `/ultra-debug/host/${encodeURIComponent(host)}/download`, {
-      method: 'GET',
-      headers: token ? { 'Authorization': 'Bearer ' + token } : {},
-    })
-    if (resp.status === 401) {
-      handleAuthFailure()
-      throw new Error('Unauthorized')
-    }
-    if (!resp.ok) {
-      const text = await resp.text()
-      throw new Error(text || resp.statusText)
-    }
-    return resp.blob()
+    return download(`/ultra-debug/host/${encodeURIComponent(host)}/download`)
   },
   
   // Stats (real-time from memory)
@@ -291,23 +286,30 @@ export const api = {
   async uploadFirmware(file) {
     const formData = new FormData()
     formData.append('firmware', file)
-    
-    const token = auth.token()
     const resp = await fetch(BASE + '/firmware', {
       method: 'POST',
-      headers: token ? { 'Authorization': 'Bearer ' + token } : {},
+      headers: { [CSRF_HEADER]: '1' },
+      credentials: 'same-origin',
+      cache: 'no-store',
       body: formData
     })
-    
+    if (resp.status === 401) {
+      handleAuthFailure()
+      throw authError()
+    }
     if (!resp.ok) {
       const text = await resp.text()
-      throw new Error(text || resp.statusText)
+      const error = new Error(text || resp.statusText)
+      error.status = resp.status
+      throw error
     }
+    auth.markAuthenticated()
+    sync.markHTTP()
     return resp.json()
   },
   
-  async deleteFirmware(name) {
-    return request('DELETE', `/firmware/${encodeURIComponent(name)}`)
+  async deleteFirmware(reference) {
+    return request('DELETE', `/firmware/${encodeURIComponent(reference)}`)
   },
   
   async upgradeDevice(deviceId, firmwareFile, force = false) {
@@ -363,7 +365,11 @@ export const api = {
   },
   
   async updateSetting(key, value) {
-    return request('PATCH', `/settings/${key}`, { value })
+    return request('PATCH', `/settings/${encodeURIComponent(key)}`, { value })
+  },
+
+  async updateSettings(settings) {
+    return request('PATCH', '/settings', { settings })
   },
 
   // Alerts and alert rules
@@ -397,9 +403,6 @@ export const api = {
     return request('POST', `/alerts/${id}/resolve`)
   },
 
-  async sendMobileTestPush() {
-    return request('POST', '/mobile/test-push', {})
-  },
 
   async updateDeviceAlerting(id, patch) {
     return request('PATCH', `/devices/${id}/alerting`, patch)
@@ -650,14 +653,13 @@ export const ws = {
   maxReconnectAttempts: 10,
   
   connect() {
-    const token = auth.token()
-    if (!token) return
+    if (!auth.isAuthenticated()) return
     
     // Reset reconnect counter on new connection attempt
     this.reconnectAttempts = 0
     
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${protocol}//${location.host}${BASE}/ws?token=${encodeURIComponent(token)}`
+    const url = `${protocol}//${location.host}${BASE}/ws`
     
     try {
       this.socket = new WebSocket(url)
@@ -722,7 +724,7 @@ export const ws = {
     this.reconnectAttempts++
     
     setTimeout(() => {
-      if (auth.token()) {
+      if (auth.isAuthenticated()) {
         this.connect()
       }
     }, delay)

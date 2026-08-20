@@ -20,6 +20,19 @@ const (
 	waveBand60GHz
 )
 
+func (b waveBand) String() string {
+	switch b {
+	case waveBand5GHz:
+		return "5ghz"
+	case waveBand6GHz:
+		return "6ghz"
+	case waveBand60GHz:
+		return "60ghz"
+	default:
+		return ""
+	}
+}
+
 // inferWaveBand attempts to determine the radio band from a Wave statistics
 // radio object. The raw map is used for fields that don't currently land in
 // stats.RadioStats (e.g., AFC).

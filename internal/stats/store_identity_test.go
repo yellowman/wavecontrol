@@ -45,3 +45,17 @@ func TestUpdatePreservesIdentityWhenMACReplacesIPPlaceholder(t *testing.T) {
 		t.Fatalf("MAC = %q, want normalized MAC", got.MAC)
 	}
 }
+
+func TestBindIdentityByMACCanClearSiteIdentity(t *testing.T) {
+	store := NewStore()
+	store.BindIdentityByMAC("28:70:4e:e1:e8:b5", "172.20.66.7", 89, 12)
+	store.BindIdentityByMAC("28:70:4e:e1:e8:b5", "172.20.66.7", 89, 0)
+
+	got := store.GetByMAC("28:70:4e:e1:e8:b5")
+	if got == nil {
+		t.Fatal("expected stats row")
+	}
+	if got.SiteID != 0 {
+		t.Fatalf("SiteID = %d, want 0 after explicit clear", got.SiteID)
+	}
+}

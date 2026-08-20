@@ -77,7 +77,7 @@ func buildWaveParseReport(
 			hasAFC = true
 		}
 
-		inferred := string(waveInferBandFromStats(r))
+		inferred := waveInferBandFromStats(r).String()
 		if inferred == "" {
 			inferred = "unknown"
 		}
@@ -119,7 +119,7 @@ func buildWaveParseReport(
 				if rs.ID == "" {
 					continue
 				}
-				inferred := string(waveInferBandFromRadioStats(rs))
+				inferred := waveInferBandFromRadioStats(rs).String()
 				bandLabel := inferred
 				if rs.DisplayBandOverride != "" {
 					bandLabel = rs.DisplayBandOverride

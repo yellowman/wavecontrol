@@ -128,7 +128,7 @@ function detectDeviceType(device) {
 
   if (text.includes('mlo6')) return 'waveMlo6'
   if (text.includes('mlo5')) return 'waveMlo5'
-  if (text.includes('airfiber') || /af(2|3|5|11|24|24hd|5u|5x|5xhd)/.test(text) || text.includes('11fx')) return 'airfiber'
+  if (text.includes('airfiber') || /\baf(2|3|5|11|24|24hd|5u|5x|5xhd)\b/.test(text) || text.includes('11fx')) return 'airfiber'
   if (text.includes('ltu')) return 'ltu'
   if (text.includes('wave')) return 'wave60'
   if (text.includes('airmax') || /(rocket|powerbeam|nanobeam|litebeam|prism|nanostation|airgrid|loco)/.test(text) || flavor === 'xc' || flavor === 'wa') return 'airmax'
@@ -151,11 +151,11 @@ function getDeviceBands(device) {
   const model = String(device?.model || '').toLowerCase()
   const text = `${product} ${model}`
   if (set.size === 0) {
-    if (/24|24hd|airfiber 24/.test(text)) set.add('band24')
-    if (/16|airfiber 16/.test(text)) set.add('band16')
-    if (/11|11fx|airfiber 11/.test(text)) set.add('band11')
-    if (/3|3ghz|airfiber 3/.test(text)) set.add('band3')
-    if (/2|2\.4|2ghz|900/.test(text)) set.add('band2')
+    if (/\b24\b|24hd|airfiber 24/.test(text)) set.add('band24')
+    if (/\b16\b|airfiber 16/.test(text)) set.add('band16')
+    if (/\b11\b|11fx|airfiber 11/.test(text)) set.add('band11')
+    if (/\b3\b|3ghz|airfiber 3/.test(text)) set.add('band3')
+    if (/\b2\b|2\.4|2ghz|900/.test(text)) set.add('band2')
     if (/5ac|5x|5u|5ghz|5 g|rocket|powerbeam|nanobeam|litebeam|mlo5/.test(text)) set.add('band5')
     if (/wave|60ghz|60 g/.test(text) && !text.includes('mlo')) set.add('band60')
     if (/mlo6/.test(text)) set.add('band6')

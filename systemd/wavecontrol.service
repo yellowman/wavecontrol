@@ -1,17 +1,29 @@
 [Unit]
 Description=waveControl Device Management
-After=network.target postgresql.service
+After=network-online.target postgresql.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=_wavecontrol
 Group=_wavecontrol
 WorkingDirectory=/var/wavecontrol
-Environment=WAVECONTROL_DSN=postgres://wavecontrol:password@127.0.0.1/wavecontrol?sslmode=disable
-Environment=WAVECONTROL_JWT_SECRET=changeme-use-openssl-rand-base64-48-to-generate
+EnvironmentFile=/etc/wavecontrol/wavecontrol.env
 ExecStart=/usr/local/bin/wavecontrol -d
-Restart=always
+Restart=on-failure
 RestartSec=5
+
+# The daemon needs network access and write access only to its working tree.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/wavecontrol
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

@@ -38,20 +38,126 @@ function escapeAttr(str) {
     .replace(/>/g, '&gt;')
 }
 
+// Route UI actions through one delegated listener so generated markup never needs
+// inline event handlers.  This keeps the script CSP meaningful and centralizes
+// validation of data attributes before privileged actions are invoked.
+function positiveInt(value) {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+document.addEventListener('click', async (event) => {
+  const target = event.target.closest('[data-wc-action]')
+  if (!target) return
+
+  const action = target.dataset.wcAction
+  const deviceId = positiveInt(target.dataset.deviceId)
+  const listId = positiveInt(target.dataset.listId)
+  const hostId = positiveInt(target.dataset.hostId)
+
+  event.preventDefault()
+
+  switch (action) {
+    case 'close-modal': {
+      const modalId = target.dataset.modalId
+      if (modalId) document.getElementById(modalId)?.classList.add('hidden')
+      break
+    }
+    case 'delete-firmware':
+      await window.deleteFirmware?.(target.dataset.reference || '', target.dataset.displayName || '')
+      break
+    case 'select-device':
+      if (deviceId) window.selectDevice?.(deviceId)
+      break
+    case 'download-config':
+      if (target.dataset.path) window.downloadConfig?.(target.dataset.path)
+      break
+    case 'restore-config':
+      if (deviceId && target.dataset.path) await window.restoreConfig?.(deviceId, target.dataset.path)
+      break
+    case 'create-drilldown-list':
+      await window.createDrilldownList?.()
+      break
+    case 'add-drilldown-host':
+      await window.addDrilldownHost?.()
+      break
+    case 'edit-drilldown-list':
+      if (listId) await window.editDrilldownList?.(listId, target.dataset.listName || '')
+      break
+    case 'delete-drilldown-list':
+      if (listId) await window.deleteDrilldownList?.(listId)
+      break
+    case 'remove-drilldown-host':
+      if (listId && hostId) await window.removeDrilldownHost?.(listId, hostId)
+      break
+    case 'open-device-ui':
+      if (deviceId) {
+        const opened = window.open(`/api/wavecontrol/open-ui?device_id=${deviceId}`, '_blank', 'noopener')
+        if (opened) opened.opener = null
+      }
+      break
+    case 'refresh-device':
+      if (deviceId) await window.refreshDevice?.(deviceId)
+      break
+    case 'reboot-device':
+      if (deviceId) await window.rebootDevice?.(deviceId)
+      break
+    case 'learn-replacement-mac':
+      if (deviceId) await window.learnReplacementMAC?.(deviceId)
+      break
+    case 'show-upgrade-modal':
+      if (deviceId) await window.showUpgradeModal?.(deviceId)
+      break
+    case 'silence-device': {
+      const seconds = positiveInt(target.dataset.seconds)
+      if (deviceId && seconds) await window.updateDeviceAlerting?.(deviceId, { silence_seconds: seconds })
+      break
+    }
+    case 'clear-device-silence':
+      if (deviceId) await window.updateDeviceAlerting?.(deviceId, { clear_silence: true })
+      break
+    case 'edit-alert-notes':
+      if (deviceId) await window.editDeviceAlertNotes?.(deviceId)
+      break
+    case 'backup-device-config':
+      if (deviceId) await window.backupDeviceConfig?.(deviceId)
+      break
+    case 'show-device-backups':
+      if (deviceId) await window.showDeviceBackups?.(deviceId)
+      break
+  }
+})
+
+document.addEventListener('change', async (event) => {
+  const target = event.target.closest('[data-wc-change]')
+  if (!target) return
+
+  const deviceId = positiveInt(target.dataset.deviceId)
+  const listId = positiveInt(target.dataset.listId)
+  switch (target.dataset.wcChange) {
+    case 'toggle-alertable':
+      if (deviceId) await window.updateDeviceAlerting?.(deviceId, { alertable: Boolean(target.checked) })
+      break
+    case 'toggle-drilldown-list':
+      if (listId) await window.toggleDrilldownList?.(listId, Boolean(target.checked))
+      break
+  }
+})
+
 // Convert JSON password array to one-per-line for display
 function parsePasswordsForDisplay(jsonStr) {
   try {
-    const arr = JSON.parse(jsonStr || '["ubnt"]')
-    return Array.isArray(arr) ? arr.join('\n') : 'ubnt'
+    const arr = JSON.parse(jsonStr || '[]')
+    return Array.isArray(arr) ? arr.join('\n') : ''
   } catch {
-    return 'ubnt'
+    return ''
   }
 }
 
 // Convert one-per-line passwords to JSON array for storage
 function passwordsToJSON(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
-  return JSON.stringify(lines.length > 0 ? lines : ['ubnt'])
+  return JSON.stringify(lines)
 }
 
 // Parse JSON array of prefixes for display (one per line)
@@ -142,43 +248,33 @@ function updateNavVisibility() {
 
 // Resume session
 async function init() {
-  const token = auth.token()
-  if (token) {
-    try {
-      const me = await api.me()
-      const isAdmin = me?.roles?.includes('administrator')
-      const [devices, settings] = await Promise.all([
-        api.devices(),
-        isAdmin ? api.settings().catch(() => ({})) : Promise.resolve({})
-      ])
-      store.set({
-        user: me,
-        settings: settings || {},
-        devices: Array.isArray(devices) ? devices : [],
-        currentPage: 'dashboard'
-      })
-      updateNavVisibility()
-      updateCounts()
-      renderTree()
-      renderCurrentPage()
-
-      // Ultra Debug badge (if any buffers are enabled)
-      refreshUltraDebugBadge()
-      refreshAlertNavBadge()
-      
-      // Connect websocket for real-time updates
-      ws.connect()
-      ws.startPing()
-      lastFullReconcileAt = Date.now()
-      
-      // Set up callback for virtual table's WS batcher
-      setUpdateCountsCallback(updateCounts)
-    } catch (e) {
-      auth.setToken('')
-      store.set({ user: null })
-      showLoginPage()
-    }
-  } else {
+  try {
+    // The server-side HttpOnly cookie is the sole source of session truth.
+    const me = await api.me({ handleAuthFailure: false })
+    const isAdmin = me?.roles?.includes('administrator')
+    const [devices, settings] = await Promise.all([
+      api.devices(),
+      isAdmin ? api.settings().catch(() => ({})) : Promise.resolve({})
+    ])
+    store.set({
+      user: me,
+      settings: settings || {},
+      devices: Array.isArray(devices) ? devices : [],
+      currentPage: 'dashboard'
+    })
+    updateNavVisibility()
+    updateCounts()
+    renderTree()
+    renderCurrentPage()
+    refreshUltraDebugBadge()
+    refreshAlertNavBadge()
+    ws.connect()
+    ws.startPing()
+    lastFullReconcileAt = Date.now()
+    setUpdateCountsCallback(updateCounts)
+  } catch (e) {
+    auth.clear()
+    store.set({ user: null })
     showLoginPage()
   }
   updateAuthClass()
@@ -227,13 +323,16 @@ function getLastServerSyncAt() {
 
 function forceClientLogout(reason = 'Session is no longer synchronized with the server') {
   try { ws.disconnect() } catch (_) {}
-  auth.setToken('')
-  try { localStorage.removeItem('wavecontrol_token') } catch (_) {}
+  auth.clear()
   store.set({ user: null, devices: [], selectedDevice: null })
   updateAuthClass()
   showLoginPage()
   try { showToast(reason, 'warning') } catch (_) {}
 }
+
+window.addEventListener('wavecontrol-auth-failure', () => {
+  if (store.user) forceClientLogout('Session ended. Please sign in again.')
+})
 
 async function reconcileSelectedDevice(force = false) {
   if (selectedDeviceSyncInFlight || !store.user || !networkOk) return
@@ -1284,7 +1383,7 @@ function showLoginPage() {
         <div class="login-box">
           <div class="form-group">
             <label>Username</label>
-            <input type="text" id="loginUsername" placeholder="admin" autocomplete="username" />
+            <input type="text" id="loginUsername" placeholder="Username" autocomplete="username" />
           </div>
           <div class="form-group">
             <label>Password</label>
@@ -1334,8 +1433,7 @@ function showLoginPage() {
       return
     }
 	    
-	    // Login succeeded - token is now in localStorage.
-	    // Force a full re-bootstrap so *all* pages start from fresh API data and
+	    // Force a full re-bootstrap so all pages start from fresh API data and
 	    // no in-memory/UI state leaks across sessions.
 	    loginBtn.textContent = 'Loading…'
 	    location.reload()
@@ -2157,7 +2255,6 @@ const ALERT_OPERATOR_OPTIONS = [
 ]
 
 const ALERT_CHANNEL_OPTIONS = [
-  { value: 'mobile', label: 'Mobile push' },
   { value: 'email', label: 'Email' },
   { value: 'webhook', label: 'Webhook' },
   { value: 'zabbix', label: 'Zabbix' },
@@ -2168,55 +2265,55 @@ const ALERT_PRESETS = [
     key: 'host_down',
     title: 'Host down',
     description: 'Alert when an alertable AP has been unreachable for 3 minutes.',
-    rule: { name: 'AP down', metric: 'offline_duration', operator: 'gte', threshold: 180, duration_seconds: 0, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'AP down', metric: 'offline_duration', operator: 'gte', threshold: 180, duration_seconds: 0, cooldown_seconds: 900, notify_channels: [], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'weak_5ghz',
     title: 'Weak 5 GHz signal',
     description: 'Warn when an alertable STA 5 GHz link falls below -70 dBm.',
-    rule: { name: 'Weak 5 GHz signal', metric: 'signal_5ghz', operator: 'lt', threshold: -70, duration_seconds: 120, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'Weak 5 GHz signal', metric: 'signal_5ghz', operator: 'lt', threshold: -70, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'weak_60ghz',
     title: 'Weak 60 GHz signal',
     description: 'Warn when a 60 GHz link falls below -65 dBm.',
-    rule: { name: 'Weak 60 GHz signal', metric: 'signal_60ghz', operator: 'lt', threshold: -65, duration_seconds: 120, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'Weak 60 GHz signal', metric: 'signal_60ghz', operator: 'lt', threshold: -65, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'weak_ltu',
     title: 'Weak LTU signal',
     description: 'Warn when an LTU link falls below -70 dBm.',
-    rule: { name: 'Weak LTU signal', metric: 'signal_ltu', operator: 'lt', threshold: -70, duration_seconds: 120, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'Weak LTU signal', metric: 'signal_ltu', operator: 'lt', threshold: -70, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'high_cpu',
     title: 'High CPU',
     description: 'Warn when a radio reports CPU usage above 90%.',
-    rule: { name: 'High CPU', metric: 'cpu', operator: 'gt', threshold: 90, duration_seconds: 180, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'High CPU', metric: 'cpu', operator: 'gt', threshold: 90, duration_seconds: 180, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'high_temp',
     title: 'High temperature',
     description: 'Alert when a radio CPU temperature rises above 75 °C.',
-    rule: { name: 'High temperature', metric: 'temperature', operator: 'gt', threshold: 75, duration_seconds: 180, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'High temperature', metric: 'temperature', operator: 'gt', threshold: 75, duration_seconds: 180, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'low_capacity',
     title: 'Low capacity',
     description: 'Warn when combined 60 GHz capacity falls below 100 Mbps.',
-    rule: { name: 'Low 60 GHz capacity', metric: 'capacity', operator: 'lt', threshold: 100, duration_seconds: 300, cooldown_seconds: 1800, notify_channels: ['mobile'], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'Low 60 GHz capacity', metric: 'capacity', operator: 'lt', threshold: 100, duration_seconds: 300, cooldown_seconds: 1800, notify_channels: [], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'peer_count',
     title: 'Peer count dropped',
     description: 'For a selected AP/site, alert when AP peer count drops below a threshold.',
-    rule: { name: 'Peer count dropped', metric: 'peer_count', operator: 'lt', threshold: 1, duration_seconds: 120, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'ap', require_alertable: true, enabled: true, scope: 'device' },
+    rule: { name: 'Peer count dropped', metric: 'peer_count', operator: 'lt', threshold: 1, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'link_score',
     title: 'Low link score',
     description: 'Warn when a device reports link score below 50.',
-    rule: { name: 'Low link score', metric: 'link_score', operator: 'lt', threshold: 50, duration_seconds: 180, cooldown_seconds: 900, notify_channels: ['mobile'], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    rule: { name: 'Low link score', metric: 'link_score', operator: 'lt', threshold: 50, duration_seconds: 180, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
 ]
 
@@ -2241,7 +2338,7 @@ function defaultAlertRule() {
     operator: 'gte',
     threshold: 180,
     duration_seconds: 0,
-    notify_channels: ['mobile'],
+    notify_channels: [],
     notify_emails: [],
     webhook_url: '',
     cooldown_seconds: 900,
@@ -2252,7 +2349,7 @@ function normalizedAlertRule(rule = {}) {
   return {
     ...defaultAlertRule(),
     ...rule,
-    notify_channels: Array.isArray(rule.notify_channels) ? [...rule.notify_channels] : (Array.isArray(rule.NotifyChannels) ? [...rule.NotifyChannels] : ['mobile']),
+    notify_channels: Array.isArray(rule.notify_channels) ? [...rule.notify_channels] : (Array.isArray(rule.NotifyChannels) ? [...rule.NotifyChannels] : []),
     notify_emails: Array.isArray(rule.notify_emails) ? [...rule.notify_emails] : [],
     webhook_url: rule.webhook_url || '',
     scope_id: rule.scope_id === undefined ? null : rule.scope_id,
@@ -2434,7 +2531,7 @@ function renderAlertRuleForm(rule, sites, devices, canEdit) {
       <div class="alert-form-header">
         <div>
           <h4>${alertRuleEditingId ? 'Edit Alert Rule' : 'New Alert Rule'}</h4>
-          <p class="settings-note">Rules are evaluated server-side against live stats, target role, and per-device alertability. Mobile push works only when the rule includes the mobile channel and the phone has registered.</p>
+          <p class="settings-note">Rules are evaluated server-side against live stats, target role, and per-device alertability. Notification channels are optional; a rule without one still appears in the alert history.</p>
         </div>
         ${canEdit ? `<button type="button" class="btn btn-secondary" id="alertNewRule">New blank rule</button>` : ''}
       </div>
@@ -2556,7 +2653,6 @@ function renderAlertRuleForm(rule, sites, devices, canEdit) {
         <div class="settings-actions">
           <button type="submit" class="btn btn-primary">${alertRuleEditingId ? 'Save rule' : 'Create rule'}</button>
           ${alertRuleEditingId ? '<button type="button" class="btn btn-secondary" id="alertCancelEdit">Cancel edit</button>' : ''}
-          <button type="button" class="btn btn-secondary" id="alertTestMobilePush">Send mobile test push</button>
         </div>
       ` : '<p class="settings-note">View-only account. Editor or administrator role required to change alert rules.</p>'}
     </form>
@@ -2584,7 +2680,6 @@ function readAlertRuleForm() {
   const duration = Math.max(0, parseInt(get('alertDuration')?.value || '0', 10) || 0)
   const cooldown = Math.max(0, parseInt(get('alertCooldown')?.value || '0', 10) || 0)
   const channels = [...document.querySelectorAll('[data-alert-channel]:checked')].map(cb => cb.dataset.alertChannel)
-  if (channels.length === 0) throw new Error('Select at least one notification channel')
 
   const emailsRaw = get('alertEmails')?.value || ''
   const notifyEmails = emailsRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)
@@ -2645,7 +2740,7 @@ function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
       showToast('Recommended alert rules are already installed', 'success')
       return
     }
-    if (!confirm(`Install ${missing.length} recommended alert rule${missing.length === 1 ? '' : 's'}? They default to mobile push and can be edited afterward.`)) return
+    if (!confirm(`Install ${missing.length} recommended alert rule${missing.length === 1 ? '' : 's'}? They default to in-application alerts and can be edited afterward.`)) return
     const btn = container.querySelector('#alertInstallRecommended')
     btn.disabled = true
     try {
@@ -2751,18 +2846,7 @@ function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
     renderAlertsPage(container)
   })
 
-  container.querySelector('#alertTestMobilePush')?.addEventListener('click', async () => {
-    const btn = container.querySelector('#alertTestMobilePush')
-    btn.disabled = true
-    try {
-      await api.sendMobileTestPush()
-      showToast('Mobile test push queued', 'success')
-    } catch (e) {
-      showToast('Mobile test push failed: ' + e.message, 'error')
-    } finally {
-      btn.disabled = false
-    }
-  })
+
 
   container.querySelector('#alertRuleForm')?.addEventListener('submit', async e => {
     e.preventDefault()
@@ -2794,7 +2878,7 @@ async function renderAlertsPage(container) {
       <div class="alerts-header">
         <div>
           <h3>Alerts</h3>
-          <p class="settings-note">Operator rules, active alarms, and notification delivery setup. The server evaluates rules continuously; clients should reconcile here or through mobile push.</p>
+          <p class="settings-note">Operator rules, active alarms, and notification delivery setup. The server evaluates rules continuously and records state here; email, webhook, and Zabbix delivery are optional.</p>
         </div>
         <button class="btn btn-secondary" id="refreshAlerts">Refresh</button>
       </div>
@@ -3037,15 +3121,15 @@ async function renderFirmwarePage(container) {
         <tbody>
           ${firmware.map(fw => `
             <tr>
-              <td class="fw-name">${escapeHTML(fw.name)}</td>
+              <td class="fw-name">${escapeHTML(fw.relative_path || fw.name)}</td>
               <td class="fw-platform">${escapeHTML((fw.platform || '-').toUpperCase())}</td>
               <td class="fw-flavor">${escapeHTML(fw.flavor || '-')}</td>
               <td class="fw-version">${escapeHTML(fw.version || '-')}</td>
               <td class="fw-size">${formatSize(fw.size)}</td>
               <td class="fw-actions">
-                <a class="btn btn-sm btn-download" href="/api/wavecontrol/firmware/${encodeURIComponent(fw.name)}/download" download title="Download">⬇</a>
+                <a class="btn btn-sm btn-download" href="/api/wavecontrol/firmware/${encodeURIComponent(fw.id || fw.name)}/download" download title="Download">⬇</a>
                 ${canEdit ? `
-                  <button class="btn btn-sm btn-danger-subtle" onclick="deleteFirmware('${escapeHTML(fw.name)}')" title="Delete">🗑</button>
+                  <button class="btn btn-sm btn-danger-subtle" data-wc-action="delete-firmware" data-reference="${escapeAttr(fw.id || fw.relative_path || fw.name)}" data-display-name="${escapeAttr(fw.relative_path || fw.name)}" title="Delete">🗑</button>
                 ` : ''}
               </td>
             </tr>
@@ -3059,12 +3143,12 @@ async function renderFirmwarePage(container) {
 }
 
 // Delete firmware helper (global for onclick)
-window.deleteFirmware = async function(name) {
-  if (!confirm(`Delete firmware "${name}"?`)) return
+window.deleteFirmware = async function(reference, displayName = reference) {
+  if (!confirm(`Delete firmware "${displayName}"?`)) return
   
   try {
-    await api.deleteFirmware(name)
-    showToast(`Deleted ${name}`, 'success')
+    await api.deleteFirmware(reference)
+    showToast(`Deleted ${displayName}`, 'success')
     // Refresh page
     const main = document.getElementById('mainContent')
     if (main) renderFirmwarePage(main)
@@ -3102,7 +3186,7 @@ async function renderSettingsPage(container) {
             <div class="credentials-grid">
               <div class="form-group">
                 <label>Username 1</label>
-                <input type="text" id="settAPUser1" value="${settings.ap_cred1_user || 'root'}" />
+                <input type="text" id="settAPUser1" value="${settings.ap_cred1_user || ''}" />
               </div>
               <div class="form-group">
                 <label>Password 1</label>
@@ -3133,7 +3217,7 @@ async function renderSettingsPage(container) {
             <div class="credentials-grid">
               <div class="form-group">
                 <label>Username 1</label>
-                <input type="text" id="settSTAUser1" value="${settings.sta_cred1_user || 'root'}" />
+                <input type="text" id="settSTAUser1" value="${settings.sta_cred1_user || ''}" />
               </div>
               <div class="form-group">
                 <label>Password 1</label>
@@ -3365,9 +3449,7 @@ async function renderSettingsPage(container) {
           rx_mismatch_threshold_db: String(rxMismatchThreshold),
         }
         
-        for (const [key, value] of Object.entries(updates)) {
-          await api.updateSetting(key, value)
-        }
+        const settingResult = await api.updateSettings(updates)
         
 	        // Update client-side cached settings so other pages use new values without a reload
 	        const prev = (store.getState && store.getState().settings) ? store.getState().settings : {}
@@ -3377,7 +3459,12 @@ async function renderSettingsPage(container) {
         saved.classList.remove('hidden')
         setTimeout(() => saved.classList.add('hidden'), 2000)
         
-        showToast('Settings saved', 'success')
+        const restartKeys = settingResult?.restart_required || []
+        if (restartKeys.length) {
+          showToast(`Settings saved; restart waveControl to apply: ${restartKeys.join(', ')}`, 'warning')
+        } else {
+          showToast('Settings saved', 'success')
+        }
       } catch (e) {
         showToast('Failed: ' + e.message, 'error')
       } finally {
@@ -5874,9 +5961,9 @@ function renderMismatchesTab(container) {
 								const parentLabel = `#${parent.id} ${parent.name || parent.hostname || parent.ip || parent.mac || ''}`.trim()
 								return `
 								<tr>
-									<td><span class="detail-link" onclick="selectDevice(${sta.id})">${escapeHTML(staLabel)}</span></td>
+									<td><button type="button" class="detail-link detail-link-button" data-wc-action="select-device" data-device-id="${sta.id}">${escapeHTML(staLabel)}</button></td>
 									<td class="col-ip">${escapeHTML(sta.ip || '')}</td>
-									<td><span class="detail-link" onclick="selectDevice(${parent.id})">${escapeHTML(parentLabel)}</span></td>
+									<td><button type="button" class="detail-link detail-link-button" data-wc-action="select-device" data-device-id="${parent.id}">${escapeHTML(parentLabel)}</button></td>
 									<td class="col-ip">${escapeHTML(parent.ip || '')}</td>
 								</tr>
 								`
@@ -8150,8 +8237,8 @@ async function loadBackupsList() {
               <td>${new Date(b.created_at).toLocaleString()}</td>
               <td>${formatSize(b.size || 0)}</td>
               <td>
-                <button class="btn btn-sm" onclick="downloadConfig('${escapeAttr(b.path).replace(/'/g, "\\'")}')">Download</button>
-                ${b.device?.id ? `<button class="btn btn-sm" onclick="window.restoreConfig(${b.device.id}, '${escapeAttr(b.path).replace(/'/g, "\\'")}')">Restore</button>` : ''}
+                <button class="btn btn-sm" data-wc-action="download-config" data-path="${escapeAttr(b.path)}">Download</button>
+                ${b.device?.id ? `<button class="btn btn-sm" data-wc-action="restore-config" data-device-id="${b.device.id}" data-path="${escapeAttr(b.path)}">Restore</button>` : ''}
               </td>
             </tr>
           `).join('')}
@@ -8174,13 +8261,8 @@ async function loadBackupsList() {
 
 // Download config helper
 window.downloadConfig = function(path) {
-  const url = `/api/configs/download?path=${encodeURIComponent(path)}`
-  const token = auth.token()
-  
-  // Create a temporary link with auth header
-  fetch(url, {
-    headers: token ? { 'Authorization': 'Bearer ' + token } : {}
-  })
+  const url = `/api/wavecontrol/configs/download?path=${encodeURIComponent(path)}`
+  fetch(url, { credentials: 'same-origin', cache: 'no-store' })
   .then(resp => {
     if (!resp.ok) throw new Error('Download failed')
     return resp.blob()
@@ -8230,8 +8312,8 @@ window.showDeviceBackups = async function(deviceId) {
             <span class="backup-date">${new Date(c.created_at).toLocaleDateString()}</span>
             <span class="backup-size">${formatSize(c.size || 0)}</span>
             <div class="backup-actions">
-              <button class="btn btn-xs" onclick="window.downloadConfig('${escapeAttr(c.path).replace(/'/g, "\\'")}')">↓</button>
-              <button class="btn btn-xs" onclick="window.restoreConfig(${deviceId}, '${escapeAttr(c.path).replace(/'/g, "\\'")}')">Restore</button>
+              <button class="btn btn-xs" data-wc-action="download-config" data-path="${escapeAttr(c.path)}">↓</button>
+              <button class="btn btn-xs" data-wc-action="restore-config" data-device-id="${deviceId}" data-path="${escapeAttr(c.path)}">Restore</button>
             </div>
           </div>
         `).join('')}
@@ -8467,7 +8549,7 @@ function showDrilldownListsModal() {
     <div class="modal-content modal-lg">
       <div class="modal-header">
         <h4>Manage Drilldown Lists</h4>
-        <button class="modal-close" onclick="document.getElementById('drilldownListsModal').classList.add('hidden')">&times;</button>
+        <button class="modal-close" data-wc-action="close-modal" data-modal-id="drilldownListsModal">&times;</button>
       </div>
       <div class="modal-body">
         <div class="drilldown-lists-section">
@@ -8476,7 +8558,7 @@ function showDrilldownListsModal() {
           <div class="form-row" style="margin-top: 1rem; gap: 0.5rem;">
             <input type="text" id="newListName" placeholder="New list name..." class="form-input" style="flex: 2;" />
             <input type="number" id="newListInterval" placeholder="Interval (s)" value="30" min="30" class="form-input" style="width: 100px;" />
-            <button class="btn btn-primary" onclick="createDrilldownList()">Create</button>
+            <button class="btn btn-primary" data-wc-action="create-drilldown-list">Create</button>
           </div>
         </div>
         <div id="drilldownHostsSection" style="display: none; margin-top: 1.5rem;">
@@ -8484,7 +8566,7 @@ function showDrilldownListsModal() {
           <div id="drilldownHostsContainer"></div>
           <div class="form-row" style="margin-top: 1rem;">
             <input type="text" id="newHostIP" placeholder="Host IP address..." class="form-input" />
-            <button class="btn btn-primary" onclick="addDrilldownHost()">Add Host</button>
+            <button class="btn btn-primary" data-wc-action="add-drilldown-host">Add Host</button>
           </div>
         </div>
       </div>
@@ -8529,12 +8611,12 @@ async function renderDrilldownListsInModal() {
               <td>${l.host_count}</td>
               <td>${l.poll_interval}s</td>
               <td>
-                <input type="checkbox" ${l.enabled ? 'checked' : ''} 
-                       onchange="toggleDrilldownList(${l.id}, this.checked)" />
+                <input type="checkbox" ${l.enabled ? 'checked' : ''}
+                       data-wc-change="toggle-drilldown-list" data-list-id="${l.id}" />
               </td>
               <td>
-                <button class="btn btn-xs" onclick="editDrilldownList(${l.id}, '${escapeAttr(l.name)}')">Edit</button>
-                <button class="btn btn-xs btn-danger" onclick="deleteDrilldownList(${l.id})">Delete</button>
+                <button class="btn btn-xs" data-wc-action="edit-drilldown-list" data-list-id="${l.id}" data-list-name="${escapeAttr(l.name)}">Edit</button>
+                <button class="btn btn-xs btn-danger" data-wc-action="delete-drilldown-list" data-list-id="${l.id}">Delete</button>
               </td>
             </tr>
           `).join('')}
@@ -8626,7 +8708,7 @@ window.editDrilldownList = async function(listId, listName) {
               <td>${escapeHTML(h.hostname || h.model || '-')}</td>
               <td>${h.last_poll ? new Date(h.last_poll).toLocaleString() : '-'}</td>
               <td>
-                <button class="btn btn-xs btn-danger" onclick="removeDrilldownHost(${listId}, ${h.id})">Remove</button>
+                <button class="btn btn-xs btn-danger" data-wc-action="remove-drilldown-host" data-list-id="${listId}" data-host-id="${h.id}">Remove</button>
               </td>
             </tr>
           `).join('')}
@@ -9052,9 +9134,9 @@ async function loadReportsList() {
               <td>${r.device_count || 0}</td>
               <td class="report-actions">
                 <button class="btn btn-sm btn-view-report" data-id="${r.id}" data-type="${r.type}" title="View Report">View</button>
-                <a class="btn btn-sm btn-json-dl" href="/api/reports/${r.id}/download" download title="Download JSON">JSON</a>
+                <a class="btn btn-sm btn-json-dl" href="/api/wavecontrol/reports/${r.id}/download" download title="Download JSON">JSON</a>
                 ${r.type === 'inventory' || r.type === 'performance' || r.type === 'chain' || r.type === 'rx_mismatch' ? `
-                  <a class="btn btn-sm btn-csv-dl" href="/api/reports/${r.id}/download?format=csv" download title="Download CSV">CSV</a>
+                  <a class="btn btn-sm btn-csv-dl" href="/api/wavecontrol/reports/${r.id}/download?format=csv" download title="Download CSV">CSV</a>
                 ` : ''}
                 <button class="btn btn-sm btn-delete-report btn-danger-subtle" data-id="${r.id}" title="Delete Report">🗑</button>
               </td>
@@ -9458,90 +9540,121 @@ async function loadThroughputChart() {
       return
     }
     
-    // Render chart using D3
+    // Render chart without a third-party runtime dependency
     renderThroughputChart(container, samples)
   } catch (e) {
     container.innerHTML = `<div class="chart-error">Failed to load chart: ${escapeHTML(e.message)}</div>`
   }
 }
 
-// Render throughput chart with D3
+// Render throughput history without a third-party chart runtime.
 function renderThroughputChart(container, samples) {
+  const ns = 'http://www.w3.org/2000/svg'
+  const createSVG = (name, attrs = {}, text = '') => {
+    const node = document.createElementNS(ns, name)
+    for (const [key, value] of Object.entries(attrs)) {
+      node.setAttribute(key, String(value))
+    }
+    if (text) node.textContent = text
+    return node
+  }
+
+  const data = samples
+    .map(sample => ({
+      time: new Date(sample.timestamp),
+      tx: Number.isFinite(Number(sample.tx_rate)) ? Math.max(0, Number(sample.tx_rate)) : 0,
+      rx: Number.isFinite(Number(sample.rx_rate)) ? Math.max(0, Number(sample.rx_rate)) : 0
+    }))
+    .filter(sample => Number.isFinite(sample.time.getTime()))
+    .sort((a, b) => a.time - b.time)
+
+  if (data.length < 2) {
+    container.innerHTML = '<div class="chart-empty">Not enough valid data to draw the chart.</div>'
+    return
+  }
+
   const margin = { top: 20, right: 80, bottom: 30, left: 60 }
-  const width = container.clientWidth - margin.left - margin.right
-  const height = 200 - margin.top - margin.bottom
-  
-  // Clear container
-  container.innerHTML = ''
-  
-  const svg = d3.select(container)
-    .append('svg')
-    .attr('width', width + margin.left + margin.right)
-    .attr('height', height + margin.top + margin.bottom)
-    .append('g')
-    .attr('transform', `translate(${margin.left},${margin.top})`)
-  
-  // Parse data
-  const data = samples.map(s => ({
-    time: new Date(s.timestamp),
-    tx: s.tx_rate || 0,
-    rx: s.rx_rate || 0
+  const outerWidth = Math.max(container.clientWidth || 720, 360)
+  const outerHeight = 200
+  const width = Math.max(outerWidth - margin.left - margin.right, 180)
+  const height = outerHeight - margin.top - margin.bottom
+  const startTime = data[0].time.getTime()
+  const endTime = data[data.length - 1].time.getTime()
+  const timeSpan = Math.max(endTime - startTime, 1)
+  const maxRate = Math.max(1, ...data.flatMap(sample => [sample.tx, sample.rx])) * 1.1
+  const x = time => ((time.getTime() - startTime) / timeSpan) * width
+  const y = rate => height - (rate / maxRate) * height
+
+  container.replaceChildren()
+  const svg = createSVG('svg', {
+    width: outerWidth,
+    height: outerHeight,
+    viewBox: `0 0 ${outerWidth} ${outerHeight}`,
+    role: 'img',
+    'aria-label': 'Transmit and receive throughput history'
+  })
+  const plot = createSVG('g', { transform: `translate(${margin.left},${margin.top})` })
+  svg.appendChild(plot)
+  container.appendChild(svg)
+
+  const axis = createSVG('g', { class: 'chart-axis' })
+  axis.appendChild(createSVG('line', { x1: 0, y1: height, x2: width, y2: height }))
+  axis.appendChild(createSVG('line', { x1: 0, y1: 0, x2: 0, y2: height }))
+
+  const xTicks = Math.min(6, data.length)
+  for (let index = 0; index < xTicks; index += 1) {
+    const fraction = xTicks === 1 ? 0 : index / (xTicks - 1)
+    const tickX = fraction * width
+    const tickTime = new Date(startTime + fraction * timeSpan)
+    axis.appendChild(createSVG('line', { x1: tickX, y1: height, x2: tickX, y2: height + 5 }))
+    axis.appendChild(createSVG('text', {
+      x: tickX,
+      y: height + 18,
+      'text-anchor': index === 0 ? 'start' : index === xTicks - 1 ? 'end' : 'middle'
+    }, tickTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })))
+  }
+
+  const yTicks = 5
+  for (let index = 0; index <= yTicks; index += 1) {
+    const fraction = index / yTicks
+    const tickY = height - fraction * height
+    const rate = fraction * maxRate
+    axis.appendChild(createSVG('line', { x1: -5, y1: tickY, x2: 0, y2: tickY }))
+    axis.appendChild(createSVG('text', {
+      x: -9,
+      y: tickY + 4,
+      'text-anchor': 'end'
+    }, formatRateShort(rate)))
+  }
+  plot.appendChild(axis)
+
+  const linePath = key => data
+    .map((sample, index) => `${index === 0 ? 'M' : 'L'}${x(sample.time).toFixed(2)},${y(sample[key]).toFixed(2)}`)
+    .join(' ')
+
+  plot.appendChild(createSVG('path', {
+    d: linePath('tx'),
+    fill: 'none',
+    stroke: 'var(--cyan)',
+    'stroke-width': 2,
+    'vector-effect': 'non-scaling-stroke'
   }))
-  
-  // Scales
-  const x = d3.scaleTime()
-    .domain(d3.extent(data, d => d.time))
-    .range([0, width])
-  
-  const maxRate = Math.max(d3.max(data, d => d.tx), d3.max(data, d => d.rx)) || 1
-  const y = d3.scaleLinear()
-    .domain([0, maxRate * 1.1])
-    .range([height, 0])
-  
-  // Axes
-  svg.append('g')
-    .attr('transform', `translate(0,${height})`)
-    .call(d3.axisBottom(x).ticks(6).tickFormat(d3.timeFormat('%H:%M')))
-    .attr('class', 'chart-axis')
-  
-  svg.append('g')
-    .call(d3.axisLeft(y).ticks(5).tickFormat(d => formatRateShort(d)))
-    .attr('class', 'chart-axis')
-  
-  // Lines
-  const txLine = d3.line()
-    .x(d => x(d.time))
-    .y(d => y(d.tx))
-    .curve(d3.curveMonotoneX)
-  
-  const rxLine = d3.line()
-    .x(d => x(d.time))
-    .y(d => y(d.rx))
-    .curve(d3.curveMonotoneX)
-  
-  svg.append('path')
-    .datum(data)
-    .attr('fill', 'none')
-    .attr('stroke', 'var(--cyan)')
-    .attr('stroke-width', 2)
-    .attr('d', txLine)
-  
-  svg.append('path')
-    .datum(data)
-    .attr('fill', 'none')
-    .attr('stroke', 'var(--green)')
-    .attr('stroke-width', 2)
-    .attr('d', rxLine)
-  
-  // Legend
-  const legend = svg.append('g')
-    .attr('transform', `translate(${width - 60}, 0)`)
-  
-  legend.append('line').attr('x1', 0).attr('x2', 20).attr('y1', 0).attr('y2', 0).attr('stroke', 'var(--cyan)').attr('stroke-width', 2)
-  legend.append('text').attr('x', 25).attr('y', 4).text('TX').attr('fill', 'var(--text-2)').attr('font-size', '12px')
-  
-  legend.append('line').attr('x1', 0).attr('x2', 20).attr('y1', 15).attr('y2', 15).attr('stroke', 'var(--green)').attr('stroke-width', 2)
-  legend.append('text').attr('x', 25).attr('y', 19).text('RX').attr('fill', 'var(--text-2)').attr('font-size', '12px')
+  plot.appendChild(createSVG('path', {
+    d: linePath('rx'),
+    fill: 'none',
+    stroke: 'var(--green)',
+    'stroke-width': 2,
+    'vector-effect': 'non-scaling-stroke'
+  }))
+
+  const legend = createSVG('g', { transform: `translate(${Math.max(width - 60, 0)},0)` })
+  const addLegendEntry = (offset, label, stroke) => {
+    legend.appendChild(createSVG('line', { x1: 0, x2: 20, y1: offset, y2: offset, stroke, 'stroke-width': 2 }))
+    legend.appendChild(createSVG('text', { x: 25, y: offset + 4, fill: 'var(--text-2)', 'font-size': 12 }, label))
+  }
+  addLegendEntry(0, 'TX', 'var(--cyan)')
+  addLegendEntry(15, 'RX', 'var(--green)')
+  plot.appendChild(legend)
 }
 
 function formatRateShort(bps) {
@@ -10479,13 +10592,11 @@ document.querySelectorAll('.sidebar-link[data-page]').forEach(link => {
 document.getElementById('logoutBtn')?.addEventListener('click', async () => {
   ws.disconnect()
   
-  // Call server to clear HttpOnly cookie (JS can't clear it)
   try {
-    await fetch('/api/wavecontrol/auth/logout', { method: 'POST' })
+    await api.logout()
   } catch (e) {
-    // Ignore errors - we're logging out anyway
+    // Clear local state even if the server is temporarily unreachable.
   }
-  
   forceClientLogout('Signed out')
 })
 
@@ -11768,7 +11879,7 @@ contextMenu?.querySelectorAll('.context-item').forEach(item => {
         
       case 'open-ui':
         if (device.ip_address) {
-			window.open(`/api/wavecontrol/open-ui?ip=${encodeURIComponent(device.ip_address)}`, '_blank')
+			window.open(`/api/wavecontrol/open-ui?device_id=${encodeURIComponent(device.id)}`, '_blank')
         }
         break
 
@@ -12404,7 +12515,7 @@ function showScheduleJobModal() {
       <div class="modal-content">
         <div class="modal-header">
           <h3>Schedule Job</h3>
-          <button class="modal-close" onclick="document.getElementById('scheduleJobModal').classList.add('hidden')">&times;</button>
+          <button class="modal-close" data-wc-action="close-modal" data-modal-id="scheduleJobModal">&times;</button>
         </div>
         <div class="modal-body">
           <div class="form-group">
@@ -12444,7 +12555,7 @@ function showScheduleJobModal() {
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="document.getElementById('scheduleJobModal').classList.add('hidden')">Cancel</button>
+          <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="scheduleJobModal">Cancel</button>
           <button class="btn btn-primary" id="confirmScheduleJob">Schedule</button>
         </div>
       </div>
@@ -12579,7 +12690,7 @@ function showMaintenanceWindowModal(editData = null) {
       <div class="modal-content">
         <div class="modal-header">
           <h3>${editData ? 'Edit' : 'Add'} Maintenance Window</h3>
-          <button class="modal-close" onclick="document.getElementById('maintenanceModal').classList.add('hidden')">&times;</button>
+          <button class="modal-close" data-wc-action="close-modal" data-modal-id="maintenanceModal">&times;</button>
         </div>
         <div class="modal-body">
           <div class="form-group">
@@ -12648,7 +12759,7 @@ function showMaintenanceWindowModal(editData = null) {
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="document.getElementById('maintenanceModal').classList.add('hidden')">Cancel</button>
+          <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="maintenanceModal">Cancel</button>
           <button class="btn btn-primary" id="saveMaintenance">Save</button>
         </div>
       </div>

@@ -4,17 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,8 +34,8 @@ import (
 	"github.com/yellowman/wavecontrol/internal/firmware"
 	"github.com/yellowman/wavecontrol/internal/jobs"
 	"github.com/yellowman/wavecontrol/internal/poller"
-	"github.com/yellowman/wavecontrol/internal/push"
 	"github.com/yellowman/wavecontrol/internal/scheduler"
+	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
 	"github.com/yellowman/wavecontrol/internal/tlsutil"
 	"github.com/yellowman/wavecontrol/internal/udebug"
@@ -130,8 +133,13 @@ func main() {
 	}
 
 	jwtSecret := os.Getenv("WAVECONTROL_JWT_SECRET")
-	if jwtSecret == "" {
-		logFatal("WAVECONTROL_JWT_SECRET is required")
+	if len(jwtSecret) < 32 {
+		logFatal("WAVECONTROL_JWT_SECRET must be at least 32 characters")
+	}
+
+	secretStore, err := secrets.New(os.Getenv("WAVECONTROL_DATA_KEY"))
+	if err != nil {
+		logFatal("data encryption key: %v", err)
 	}
 
 	// Open database
@@ -152,14 +160,17 @@ func main() {
 		logFatal("%v", err)
 	}
 
-	// Ensure newer optional columns exist (safe idempotent schema tweak)
-	ensureDeviceStatusReasonColumn(db)
-	ensureDeviceAntennaColumns(db)
-	ensureDeviceSectorPlanningColumns(db)
-	ensureSiteTowerHeightColumn(db)
-	ensureDeviceIdentityMismatchSchema(db)
-	ensureMobilePushSchema(db)
-	ensureAlertTargetPolicySchema(db)
+	// Bring older installations to the required schema. Never continue with a
+	// partially migrated database.
+	if err := ensureRuntimeSchema(db); err != nil {
+		logFatal("schema migration: %v", err)
+	}
+	if err := validateRuntimeSchema(db); err != nil {
+		logFatal("schema validation: %v", err)
+	}
+	if err := ensureBootstrapAdmin(db); err != nil {
+		logFatal("administrator bootstrap: %v", err)
+	}
 
 	// Database pool sized for 2000 APs with 50 workers
 	// Each worker may have 2-3 concurrent queries
@@ -167,8 +178,14 @@ func main() {
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Initialize settings with defaults if not present
-	initSettings(db)
+	// Initialize non-secret settings, then migrate any legacy plaintext
+	// operational credentials to AES-256-GCM before services read them.
+	if err := initSettings(db); err != nil {
+		logFatal("settings initialization: %v", err)
+	}
+	if err := secretStore.MigrateDatabase(context.Background(), db); err != nil {
+		logFatal("credential encryption migration: %v", err)
+	}
 
 	// Load listen address from settings
 	addr := "127.0.0.1:8080"
@@ -194,14 +211,17 @@ func main() {
 	ultraDebug := udebug.NewManager(udebug.DefaultMaxBytes)
 
 	// Create firmware service
-	fwService := firmware.NewService(db, tlsManager, ultraDebug)
+	fwService, err := firmware.NewService(db, tlsManager, ultraDebug, secretStore)
+	if err != nil {
+		logFatal("firmware configuration: %v", err)
+	}
 
 	// Rebuild device hierarchy from parent_mac if parent_id is NULL
 	// This handles cases where wavecontrol restarted and parent devices changed IDs
 	rebuildDeviceHierarchy(db)
 
 	// Load poller config from settings
-	pollerCfg := loadPollerConfig(db, debugMode, tlsManager, ultraDebug)
+	pollerCfg := loadPollerConfig(db, debugMode, tlsManager, ultraDebug, secretStore)
 
 	// Create and start poller (with websocket hub)
 	devicePoller := poller.NewPoller(db, statsStore, wsHub, pollerCfg)
@@ -216,16 +236,14 @@ func main() {
 	// Create bulk operations controller
 	bulkOps := bulkops.NewController(db)
 
-	// Create durable mobile push service for Android/iOS notifications
-	pushService, err := push.NewService(db, []byte(jwtSecret))
+	// Create alerting manager. Alert rules, state, and notification settings are
+	// required runtime data; fail startup rather than running with an inert or
+	// partially initialized alert engine.
+	alertManager, err := alerting.NewManager(db, statsStore, secretStore)
 	if err != nil {
-		logFatal("mobile push service: %v", err)
+		logFatal("alerting configuration: %v", err)
 	}
-	go pushService.Start(ctx)
-
-	// Create alerting manager
-	alertManager := alerting.NewManager(db, statsStore)
-	alertManager.SetMobileNotifier(mobilePushAdapter{svc: pushService})
+	alertManager.Start(ctx)
 
 	// Start alert evaluation loop
 	go func() {
@@ -247,7 +265,7 @@ func main() {
 	if _, err := os.Stat(filepath.Join(*flagWebRoot, "index.html")); err != nil {
 		log.Printf("WARNING: index.html not found at %s/index.html", *flagWebRoot)
 	}
-	r := buildRouter(db, []byte(jwtSecret), statsStore, fwService, devicePoller, wsHub, jobScheduler, jobRunner, ultraDebug, tlsManager, bulkOps, alertManager, pushService, *flagWebRoot, debugMode)
+	r := buildRouter(db, []byte(jwtSecret), statsStore, fwService, devicePoller, wsHub, jobScheduler, jobRunner, ultraDebug, tlsManager, bulkOps, alertManager, secretStore, *flagWebRoot, debugMode)
 
 	// Create server
 	srv := &http.Server{
@@ -316,29 +334,118 @@ func main() {
 	}
 }
 
-func initSettings(db *sql.DB) {
-	// Paths are relative to the working directory (user's home dir or chroot)
-	defaults := map[string]string{
-		"poll_interval":        "30",
-		"default_username":     "ubnt",
-		"default_passwords":    `["ubnt"]`,
-		"firmware_path":        "firmware",
-		"backup_dir":           "backups",
-		"listen_addr":          "127.0.0.1:8080",
-		"zabbix_enabled":       "false",
-		"zabbix_listen":        "127.0.0.1:10050",
-		"cors_origins":         "", // Empty = same-origin only; "*" = allow all; or JSON array of origins
-		"csp_img_sources":      "", // Additional img-src domains for map tiles (space-separated)
-		"csp_connect_sources":  "", // Additional connect-src domains for map APIs (space-separated)
-		"wave_peer_fallback":   "false",
-		"wave_mlo_multi_radio": "false",
+func ensureBootstrapAdmin(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+		return fmt.Errorf("count users: %w", err)
+	}
+	if count > 0 {
+		return nil
 	}
 
-	for key, value := range defaults {
-		if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, key, value); err != nil {
-			log.Printf("Failed to set default %s: %v", key, err)
+	username := strings.TrimSpace(os.Getenv("WAVECONTROL_BOOTSTRAP_USERNAME"))
+	password := os.Getenv("WAVECONTROL_BOOTSTRAP_PASSWORD")
+	if username == "" || password == "" {
+		return errors.New("database has no users; set WAVECONTROL_BOOTSTRAP_USERNAME and WAVECONTROL_BOOTSTRAP_PASSWORD for the first startup")
+	}
+	if len(username) > 64 {
+		return errors.New("WAVECONTROL_BOOTSTRAP_USERNAME exceeds 64 characters")
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return fmt.Errorf("bootstrap password: %w", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id int64
+	if err := tx.QueryRow(`
+		INSERT INTO users (username, password, status, auth_version)
+		VALUES ($1, $2, 1, 1) RETURNING id
+	`, username, hash).Scan(&id); err != nil {
+		return fmt.Errorf("create bootstrap user: %w", err)
+	}
+	result, err := tx.Exec(`
+		INSERT INTO user_roles ("user", role)
+		SELECT $1, id FROM roles WHERE name='administrator'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("assign bootstrap role: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return errors.New("administrator role is missing from the database")
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("Created initial administrator account %q from bootstrap environment", username)
+	return nil
+}
+
+func initSettings(db *sql.DB) error {
+	// Paths are relative to the working directory (user's home dir or chroot).
+	defaults := map[string]string{
+		"ap_cred1_user":                 "",
+		"ap_cred1_pass":                 "",
+		"ap_cred2_user":                 "",
+		"ap_cred2_pass":                 "",
+		"ap_cred3_user":                 "",
+		"ap_cred3_pass":                 "",
+		"poll_interval":                 "30",
+		"poller_workers":                "50",
+		"firmware_path":                 "firmware",
+		"backup_dir":                    "backups",
+		"listen_addr":                   "127.0.0.1:8080",
+		"zabbix_enabled":                "false",
+		"zabbix_listen":                 "127.0.0.1:10050",
+		"zabbix_allowed_hosts":          "",
+		"zabbix_server":                 "",
+		"zabbix_sender_host":            "wavecontrol",
+		"smtp_host":                     "",
+		"smtp_port":                     "25",
+		"smtp_username":                 "",
+		"smtp_password":                 "",
+		"sta_cred1_user":                "",
+		"sta_cred1_pass":                "",
+		"sta_cred2_user":                "",
+		"sta_cred2_pass":                "",
+		"sta_cred3_user":                "",
+		"sta_cred3_pass":                "",
+		"smtp_from":                     "",
+		"scheduler_max_concurrent":      "5",
+		"scheduler_check_interval":      "10",
+		"scheduler_respect_maintenance": "true",
+		"management_prefixes":           "[]",
+		"interference_warning_pct":      "10",
+		"interference_critical_pct":     "25",
+		"chain_imbalance_threshold_db":  "5",
+		"rx_mismatch_threshold_db":      "8",
+		"cors_origins":                  "", // Empty = same-origin only; JSON array of origins is also accepted.
+		"csp_img_sources":               "", // Additional img-src domains for map tiles (space-separated).
+		"csp_connect_sources":           "", // Additional connect-src domains for map APIs (space-separated).
+		"wave_peer_fallback":            "false",
+		"wave_mlo_multi_radio":          "false",
+	}
+
+	keys := make([]string, 0, len(defaults))
+	for key := range defaults {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, key := range keys {
+		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, key, defaults[key]); err != nil {
+			return fmt.Errorf("set default %s: %w", key, err)
 		}
 	}
+	return tx.Commit()
 }
 
 // rebuildDeviceHierarchy re-associates STAs with their parent APs using parent_mac
@@ -380,15 +487,16 @@ func rebuildDeviceHierarchy(db *sql.DB) {
 	}
 }
 
-func loadPollerConfig(db *sql.DB, debug bool, tlsMgr *tlsutil.Manager, udbg *udebug.Manager) poller.Config {
+func loadPollerConfig(db *sql.DB, debug bool, tlsMgr *tlsutil.Manager, udbg *udebug.Manager, secretStore *secrets.Manager) poller.Config {
 	cfg := poller.Config{
 		Interval:    30 * time.Second,
-		APCreds:     []poller.Credential{{Username: "ubnt", Password: "ubnt"}},
-		STACreds:    []poller.Credential{{Username: "ubnt", Password: "ubnt"}},
+		APCreds:     nil,
+		STACreds:    nil,
 		WorkerCount: 50, // Default for large deployments (2000 APs)
 		Debug:       debug,
 		TLSManager:  tlsMgr,
 		UltraDebug:  udbg,
+		SecretStore: secretStore,
 	}
 
 	var intervalStr string
@@ -420,83 +528,9 @@ func loadPollerConfig(db *sql.DB, debug bool, tlsMgr *tlsutil.Manager, udbg *ude
 		}
 	}
 
-	// Load AP credentials (up to 3 pairs)
-	var apCreds []poller.Credential
-	for i := 1; i <= 3; i++ {
-		var user, pass string
-		userKey := fmt.Sprintf("ap_cred%d_user", i)
-		passKey := fmt.Sprintf("ap_cred%d_pass", i)
-		db.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user)
-		db.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&pass)
-		if user != "" && pass != "" {
-			apCreds = append(apCreds, poller.Credential{Username: user, Password: pass})
-		}
-	}
-	// Fallback to legacy format if no new credentials
-	if len(apCreds) == 0 {
-		var apUser, apPassJSON string
-		if db.QueryRow(`SELECT value FROM settings WHERE key = 'ap_username'`).Scan(&apUser) == nil && apUser != "" {
-			if db.QueryRow(`SELECT value FROM settings WHERE key = 'ap_passwords'`).Scan(&apPassJSON) == nil {
-				var passes []string
-				if json.Unmarshal([]byte(apPassJSON), &passes) == nil {
-					for _, pass := range passes {
-						apCreds = append(apCreds, poller.Credential{Username: apUser, Password: pass})
-					}
-				}
-			}
-		}
-	}
-	// Final fallback
-	if len(apCreds) == 0 {
-		var defUser, defPassJSON string
-		db.QueryRow(`SELECT value FROM settings WHERE key = 'default_username'`).Scan(&defUser)
-		db.QueryRow(`SELECT value FROM settings WHERE key = 'default_passwords'`).Scan(&defPassJSON)
-		if defUser == "" {
-			defUser = "ubnt"
-		}
-		var passes []string
-		if json.Unmarshal([]byte(defPassJSON), &passes) == nil && len(passes) > 0 {
-			for _, pass := range passes {
-				apCreds = append(apCreds, poller.Credential{Username: defUser, Password: pass})
-			}
-		}
-	}
-	if len(apCreds) > 0 {
-		cfg.APCreds = apCreds
-	}
-
-	// Load STA credentials (up to 3 pairs)
-	var staCreds []poller.Credential
-	for i := 1; i <= 3; i++ {
-		var user, pass string
-		userKey := fmt.Sprintf("sta_cred%d_user", i)
-		passKey := fmt.Sprintf("sta_cred%d_pass", i)
-		db.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user)
-		db.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&pass)
-		if user != "" && pass != "" {
-			staCreds = append(staCreds, poller.Credential{Username: user, Password: pass})
-		}
-	}
-	// Fallback to legacy format if no new credentials
-	if len(staCreds) == 0 {
-		var staUser, staPassJSON string
-		if db.QueryRow(`SELECT value FROM settings WHERE key = 'sta_username'`).Scan(&staUser) == nil && staUser != "" {
-			if db.QueryRow(`SELECT value FROM settings WHERE key = 'sta_passwords'`).Scan(&staPassJSON) == nil {
-				var passes []string
-				if json.Unmarshal([]byte(staPassJSON), &passes) == nil {
-					for _, pass := range passes {
-						staCreds = append(staCreds, poller.Credential{Username: staUser, Password: pass})
-					}
-				}
-			}
-		}
-	}
-	// Final fallback to AP credentials
-	if len(staCreds) > 0 {
-		cfg.STACreds = staCreds
-	} else {
-		cfg.STACreds = cfg.APCreds
-	}
+	// Credentials are loaded by Poller.ReloadSettings immediately before the
+	// first poll. Keeping one loader prevents encrypted values from ever being
+	// copied into the runtime configuration as ciphertext.
 
 	// Allow overriding worker count from settings
 	var workerCountStr string
@@ -509,12 +543,224 @@ func loadPollerConfig(db *sql.DB, debug bool, tlsMgr *tlsutil.Manager, udbg *ude
 	return cfg
 }
 
-func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwService *firmware.Service, devicePoller *poller.Poller, wsHub *websocket.Hub, jobScheduler *scheduler.Scheduler, jobRunner *jobs.Runner, ultraDebug *udebug.Manager, tlsManager *tlsutil.Manager, bulkOps *bulkops.Controller, alertManager *alerting.Manager, pushService *push.Service, webRoot string, verbose bool) *chi.Mux {
+func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(part); err == nil {
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(part)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not an IP address or CIDR", part)
+		}
+		bits := 128
+		if addr.Is4() {
+			bits = 32
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, bits))
+	}
+	return prefixes, nil
+}
+
+func requestRemoteIP(r *http.Request) (netip.Addr, bool) {
+	raw := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		raw = host
+	}
+	raw = strings.Trim(raw, "[]")
+	addr, err := netip.ParseAddr(raw)
+	return addr, err == nil
+}
+
+func isTrustedProxy(addr netip.Addr, prefixes []netip.Prefix) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripProxyHeaders(h http.Header) {
+	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Port", "X-Forwarded-Proto", "X-Real-IP"} {
+		h.Del(name)
+	}
+}
+
+// trustedProxyMiddleware accepts forwarding headers only from explicitly
+// configured reverse proxies. The effective client address is selected by
+// walking X-Forwarded-For from the trusted edge toward the first untrusted hop.
+func trustedProxyMiddleware(prefixes []netip.Prefix) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			peer, ok := requestRemoteIP(r)
+			if !ok || !isTrustedProxy(peer, prefixes) {
+				stripProxyHeaders(r.Header)
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			effective := peer
+			if raw := r.Header.Get("X-Forwarded-For"); raw != "" {
+				parts := strings.Split(raw, ",")
+				for i := len(parts) - 1; i >= 0 && isTrustedProxy(effective, prefixes); i-- {
+					candidate, err := netip.ParseAddr(strings.TrimSpace(strings.Trim(parts[i], "[]")))
+					if err != nil {
+						break
+					}
+					effective = candidate
+				}
+			} else if raw := strings.TrimSpace(r.Header.Get("X-Real-IP")); raw != "" {
+				if candidate, err := netip.ParseAddr(strings.Trim(raw, "[]")); err == nil {
+					effective = candidate
+				}
+			}
+			r.RemoteAddr = effective.String()
+
+			// Use only the value appended by the nearest trusted proxy. Taking the
+			// first element would let a client-supplied prefix influence Secure-cookie
+			// and same-origin decisions when a proxy appends rather than replaces XFP.
+			proto := ""
+			if values := strings.Split(r.Header.Get("X-Forwarded-Proto"), ","); len(values) > 0 {
+				candidate := strings.ToLower(strings.TrimSpace(values[len(values)-1]))
+				if candidate == "http" || candidate == "https" {
+					proto = candidate
+				}
+			}
+			stripProxyHeaders(r.Header)
+			if proto != "" {
+				r.Header.Set("X-Forwarded-Proto", proto)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func clientIPFromRequest(r *http.Request) string {
+	if addr, ok := requestRemoteIP(r); ok {
+		return addr.String()
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func normalizeOrigin(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid origin %q", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("origin must not contain a path: %q", raw)
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
+}
+
+func loadAllowedOrigins(db *sql.DB) []string {
+	var raw string
+	if err := db.QueryRow(`SELECT value FROM settings WHERE key = 'cors_origins'`).Scan(&raw); err != nil || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var values []string
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "*" {
+		logError("cors_origins wildcard is not supported with cookie authentication; using same-origin only")
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal([]byte(trimmed), &values); err != nil {
+			logError("invalid cors_origins JSON: %v", err)
+			return nil
+		}
+	} else {
+		values = []string{trimmed}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		origin, err := normalizeOrigin(value)
+		if err != nil {
+			logError("ignoring %v", err)
+			continue
+		}
+		if _, ok := seen[origin]; ok {
+			continue
+		}
+		seen[origin] = struct{}{}
+		out = append(out, origin)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func originGuard(allowedOrigins []string) func(http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		allowed[strings.ToLower(origin)] = struct{}{}
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet, http.MethodHead, http.MethodOptions:
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Cookie-authenticated state changes require a non-simple custom header.
+			// Cross-site forms cannot set it, and cross-origin scripts must first pass
+			// the explicit CORS policy. Bearer API clients are not cookie-CSRF prone.
+			_, cookieErr := r.Cookie(sessionCookieName)
+			hasSessionCookie := cookieErr == nil
+			hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
+			if hasSessionCookie && !hasBearer && r.Header.Get("X-WaveControl-CSRF") != "1" {
+				http.Error(w, "CSRF validation failed", http.StatusForbidden)
+				return
+			}
+
+			rawOrigin := strings.TrimSpace(r.Header.Get("Origin"))
+			if rawOrigin == "" {
+				// Non-browser clients do not generally send Origin. Their credentials
+				// are still protected by authentication and role checks.
+				next.ServeHTTP(w, r)
+				return
+			}
+			origin, err := normalizeOrigin(rawOrigin)
+			if err != nil {
+				http.Error(w, "invalid origin", http.StatusForbidden)
+				return
+			}
+			scheme := "http"
+			if requestIsHTTPS(r) {
+				scheme = "https"
+			}
+			sameOrigin := scheme + "://" + strings.ToLower(r.Host)
+			if strings.EqualFold(origin, sameOrigin) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if _, ok := allowed[strings.ToLower(origin)]; ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		})
+	}
+}
+
+func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwService *firmware.Service, devicePoller *poller.Poller, wsHub *websocket.Hub, jobScheduler *scheduler.Scheduler, jobRunner *jobs.Runner, ultraDebug *udebug.Manager, tlsManager *tlsutil.Manager, bulkOps *bulkops.Controller, alertManager *alerting.Manager, secretStore *secrets.Manager, webRoot string, verbose bool) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Middleware (applied globally)
 	r.Use(chimw.RequestID)
-	r.Use(chimw.RealIP)
+	trustedProxies, err := parseTrustedProxies(os.Getenv("WAVECONTROL_TRUSTED_PROXIES"))
+	if err != nil {
+		logError("invalid WAVECONTROL_TRUSTED_PROXIES: %v; proxy headers will not be trusted", err)
+		trustedProxies = nil
+	}
+	r.Use(trustedProxyMiddleware(trustedProxies))
 	if verbose {
 		r.Use(chimw.Logger)
 	}
@@ -527,39 +773,25 @@ func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwServic
 	r.Use(securityHeadersWithCSP(cspHeader))
 	r.Use(rateLimiter(300, time.Minute))
 
-	// CORS configuration
-	// Default: same-origin only (empty = no CORS headers)
-	// Set cors_origins to "*" for development or JSON array for production: ["https://app.example.com"]
-	corsOrigins := []string{}
-	var corsOriginsStr string
-	if db.QueryRow(`SELECT value FROM settings WHERE key = 'cors_origins'`).Scan(&corsOriginsStr) == nil && corsOriginsStr != "" {
-		if corsOriginsStr == "*" {
-			corsOrigins = []string{"*"}
-		} else if strings.HasPrefix(corsOriginsStr, "[") {
-			// Parse as JSON array
-			if err := json.Unmarshal([]byte(corsOriginsStr), &corsOrigins); err != nil {
-				logError("Invalid cors_origins JSON: %v", err)
-			}
-		} else {
-			// Single origin string
-			corsOrigins = []string{corsOriginsStr}
-		}
-	}
-
+	// Cross-origin cookie authentication is allowed only for explicit HTTPS/HTTP
+	// origins. Wildcards are intentionally rejected because credentialed CORS
+	// and wildcard origins are an unsafe combination.
+	corsOrigins := loadAllowedOrigins(db)
 	if len(corsOrigins) > 0 {
 		r.Use(cors.Handler(cors.Options{
 			AllowedOrigins:   corsOrigins,
-			AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
-			AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-			AllowCredentials: false, // Bearer tokens don't need credentials mode
+			AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+			AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-WaveControl-CSRF"},
+			AllowCredentials: true,
 			MaxAge:           300,
 		}))
 		logDebug("CORS enabled for origins: %v", corsOrigins)
 	} else {
 		logDebug("CORS disabled (same-origin only)")
 	}
+	r.Use(originGuard(corsOrigins))
 
-	// Configure WebSocket origin validation to match CORS policy
+	// Configure WebSocket origin validation to match CORS policy.
 	wsHub.SetAllowedOrigins(corsOrigins)
 
 	// Health check
@@ -616,7 +848,7 @@ func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwServic
 	})
 
 	// API
-	api := NewAPI(db, jwtSecret, statsStore, fwService, devicePoller, wsHub, jobScheduler, jobRunner, ultraDebug, tlsManager, bulkOps, alertManager, pushService)
+	api := NewAPI(db, jwtSecret, statsStore, fwService, devicePoller, wsHub, jobScheduler, jobRunner, ultraDebug, tlsManager, bulkOps, alertManager, secretStore)
 	r.Route("/api/wavecontrol", func(apiR chi.Router) {
 		// Public endpoints (60s timeout)
 		apiR.Group(func(pub chi.Router) {
@@ -759,17 +991,8 @@ func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwServic
 
 			// Settings
 			priv.Get("/settings", api.ListSettings)
+			priv.Patch("/settings", api.UpdateSettings)
 			priv.Patch("/settings/{key}", api.UpdateSetting)
-
-			// Native mobile push clients
-			priv.Post("/mobile/register", api.RegisterMobileDevice)
-			priv.Delete("/mobile/register", api.UnregisterMobileDevice)
-			priv.Get("/mobile/devices", api.ListMobileDevices)
-			priv.Get("/mobile/preferences", api.GetMobilePreferences)
-			priv.Patch("/mobile/preferences", api.UpdateMobilePreferences)
-			priv.Get("/mobile/bootstrap", api.MobileBootstrap)
-			priv.Get("/mobile/alerts", api.MobileAlerts)
-			priv.Post("/mobile/test-push", api.SendMobileTestPush)
 
 			// Sites
 			priv.Get("/sites", api.ListSites)
@@ -838,33 +1061,79 @@ func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwServic
 	return r
 }
 
+func normalizeCSPSource(raw string, allowedSchemes map[string]struct{}) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, " \t\r\n;'\"") {
+		return "", fmt.Errorf("invalid CSP source %q", raw)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid CSP source %q", raw)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if _, ok := allowedSchemes[scheme]; !ok {
+		return "", fmt.Errorf("unsupported CSP source scheme in %q", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("CSP source must be an origin: %q", raw)
+	}
+	return scheme + "://" + strings.ToLower(u.Host), nil
+}
+
+func loadCSPSources(db *sql.DB, key string, allowedSchemes map[string]struct{}) []string {
+	var raw string
+	if err := db.QueryRow(`SELECT value FROM settings WHERE key = $1`, key).Scan(&raw); err != nil || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var candidates []string
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal([]byte(trimmed), &candidates); err != nil {
+			logError("ignoring invalid %s JSON: %v", key, err)
+			return nil
+		}
+	} else {
+		candidates = strings.Fields(trimmed)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		source, err := normalizeCSPSource(candidate, allowedSchemes)
+		if err != nil {
+			logError("ignoring %v from %s", err, key)
+			continue
+		}
+		if _, ok := seen[source]; ok {
+			continue
+		}
+		seen[source] = struct{}{}
+		out = append(out, source)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func buildCSP(db *sql.DB) string {
-	// Base CSP - safe defaults
-	imgSrc := "'self' data: https://*.tile.openstreetmap.org https://*.basemaps.cartocdn.com"
-	connectSrc := "'self' wss:"
+	imgSrc := []string{"'self'", "data:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://unpkg.com"}
+	connectSrc := []string{"'self'", "ws:", "wss:"}
+	imgSrc = append(imgSrc, loadCSPSources(db, "csp_img_sources", map[string]struct{}{"http": {}, "https": {}})...)
+	connectSrc = append(connectSrc, loadCSPSources(db, "csp_connect_sources", map[string]struct{}{"http": {}, "https": {}, "ws": {}, "wss": {}})...)
 
-	// Load additional sources from settings
-	var extraImg, extraConnect string
-	db.QueryRow(`SELECT value FROM settings WHERE key = 'csp_img_sources'`).Scan(&extraImg)
-	db.QueryRow(`SELECT value FROM settings WHERE key = 'csp_connect_sources'`).Scan(&extraConnect)
-
-	// Append extra sources (space-separated domains)
-	if extraImg = strings.TrimSpace(extraImg); extraImg != "" {
-		imgSrc += " " + extraImg
-	}
-	if extraConnect = strings.TrimSpace(extraConnect); extraConnect != "" {
-		connectSrc += " " + extraConnect
-	}
-
-	// Build full CSP
 	return fmt.Sprintf(
 		"default-src 'self'; "+
-			"script-src 'self' 'unsafe-inline' https://unpkg.com https://d3js.org; "+
-			"style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; "+
-			"font-src 'self' https://fonts.gstatic.com; "+
+			"base-uri 'self'; "+
+			"object-src 'none'; "+
+			"frame-ancestors 'none'; "+
+			"form-action 'self'; "+
+			"script-src 'self' https://unpkg.com; "+
+			"script-src-attr 'none'; "+
+			"style-src 'self' 'unsafe-inline' https://unpkg.com; "+
+			"font-src 'self' data:; "+
 			"img-src %s; "+
 			"connect-src %s",
-		imgSrc, connectSrc)
+		strings.Join(imgSrc, " "), strings.Join(connectSrc, " "))
 }
 
 func securityHeadersWithCSP(csp string) func(http.Handler) http.Handler {
@@ -912,14 +1181,7 @@ func rateLimiter(limit int, window time.Duration) func(http.Handler) http.Handle
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := r.RemoteAddr
-			if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-				ip = strings.Split(fwd, ",")[0]
-			}
-			ip = strings.TrimSpace(ip)
-			if host, _, err := net.SplitHostPort(ip); err == nil {
-				ip = host
-			}
+			ip := clientIPFromRequest(r)
 
 			mu.Lock()
 			// Prevent unbounded growth - if at max, reject new IPs
@@ -970,45 +1232,29 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// checkSchema verifies that the database schema has been loaded
+// checkSchema verifies that the base database schema has been loaded before
+// idempotent runtime migrations are attempted.
 func checkSchema(db *sql.DB) error {
-	// Check for essential tables
-	tables := []string{"users", "devices", "settings"}
-	missing := []string{}
-
-	for _, table := range tables {
+	required := []string{
+		"roles", "users", "user_roles", "settings", "regions", "sites", "devices",
+		"firmware_jobs", "scheduled_jobs", "changelog", "device_certs", "alert_rules",
+		"alerts", "alert_states", "reports", "job_runs", "job_events",
+		"maintenance_windows", "drilldown_lists", "drilldown_hosts",
+	}
+	missing := make([]string, 0)
+	for _, table := range required {
 		var exists bool
-		err := db.QueryRow(`
-			SELECT EXISTS (
-				SELECT FROM information_schema.tables 
-				WHERE table_schema = 'public' AND table_name = $1
-			)`, table).Scan(&exists)
-		if err != nil || !exists {
+		if err := db.QueryRow(`
+			SELECT to_regclass('public.' || $1) IS NOT NULL
+		`, table).Scan(&exists); err != nil {
+			return fmt.Errorf("validate table %s: %w", table, err)
+		}
+		if !exists {
 			missing = append(missing, table)
 		}
 	}
-
-	if len(missing) > 0 {
-		return fmt.Errorf("database schema not loaded (missing tables: %s). Run: psql -U wavecontrol wavecontrol < schema.sql",
-			strings.Join(missing, ", "))
+	if len(missing) != 0 {
+		return fmt.Errorf("database schema not loaded or incomplete (missing tables: %s); import schema.sql before starting waveControl", strings.Join(missing, ", "))
 	}
-
-	// Check for required columns added after the initial schema.
-	// We fail fast with a clear message so runtime queries don't explode with
-	// "column does not exist" errors.
-	var hasManaged bool
-	err := db.QueryRow(`
-		SELECT EXISTS (
-			SELECT FROM information_schema.columns
-			WHERE table_schema='public' AND table_name='devices' AND column_name='managed'
-		)`).Scan(&hasManaged)
-	if err != nil {
-		return fmt.Errorf("failed to validate database schema: %w", err)
-	}
-	if !hasManaged {
-		return fmt.Errorf(
-			"database schema is out of date (missing devices.managed column). Apply migrations/014_managed_devices.sql or re-import schema.sql")
-	}
-
 	return nil
 }

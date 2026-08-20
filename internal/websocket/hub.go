@@ -117,30 +117,27 @@ func (h *Hub) checkOrigin(r *http.Request) bool {
 
 	origin := r.Header.Get("Origin")
 
-	// No origin header = same-origin request (browser doesn't send Origin for same-origin)
+	// Non-browser clients may omit Origin. They still pass the authenticated
+	// WebSocket route and current-role/session-version validation.
 	if origin == "" {
 		return true
 	}
 
-	// If no allowed origins configured, only allow same-origin
-	if len(allowed) == 0 {
-		// Compare origin to Host header
-		originURL, err := url.Parse(origin)
-		if err != nil {
-			return false
-		}
-		// Same-origin: origin host matches request host
-		return originURL.Host == r.Host
+	originURL, err := url.Parse(origin)
+	if err != nil || (originURL.Scheme != "http" && originURL.Scheme != "https") || originURL.Host == "" {
+		return false
+	}
+	expectedScheme := "http"
+	if r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		expectedScheme = "https"
+	}
+	expectedOrigin := expectedScheme + "://" + strings.ToLower(r.Host)
+	if strings.EqualFold(strings.TrimSuffix(origin, "/"), expectedOrigin) {
+		return true
 	}
 
-	// Check for wildcard
-	for _, a := range allowed {
-		if a == "*" {
-			return true
-		}
-	}
-
-	// Check against explicit list
+	// Check against explicit cross-origin allowlist. Wildcards are intentionally
+	// unsupported for credentialed WebSockets.
 	for _, a := range allowed {
 		if strings.EqualFold(origin, a) {
 			return true
@@ -173,8 +170,9 @@ func (h *Hub) Run(ctx context.Context) {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			count := len(h.clients)
 			h.mu.Unlock()
-			log.Printf("WebSocket client connected, total: %d", len(h.clients))
+			log.Printf("WebSocket client connected, total: %d", count)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -182,8 +180,9 @@ func (h *Hub) Run(ctx context.Context) {
 				delete(h.clients, client)
 				close(client.send)
 			}
+			count := len(h.clients)
 			h.mu.Unlock()
-			log.Printf("WebSocket client disconnected, total: %d", len(h.clients))
+			log.Printf("WebSocket client disconnected, total: %d", count)
 
 		case message := <-h.broadcast:
 			h.mu.RLock()

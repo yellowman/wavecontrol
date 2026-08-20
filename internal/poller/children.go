@@ -12,18 +12,52 @@ import (
 	"github.com/yellowman/wavecontrol/internal/websocket"
 )
 
-// updateChildrenStatus updates status of all STAs associated with an AP
-// When an AP has issues, its children should inherit the same status
+// updateChildrenStatus updates status of all STAs associated with an AP.
+// Database, in-memory stats, and WebSocket state are updated from the same
+// RETURNING rows so the application cannot present contradictory child status.
 func (p *Poller) updateChildrenStatus(apID int64, status string) {
-	// Update all devices that have this AP as their parent
-	result, err := dbExecCtx(p.db, dbCtxForDevice(apID, "update_children_status"), `UPDATE devices SET status = $1 WHERE parent_id = $2`, status, apID)
+	reason := ""
+	if status != string(stats.StatusOnline) {
+		reason = "parent_" + status
+	}
+	rows, err := p.db.Query(`
+		UPDATE devices
+		SET status = $1,
+		    status_reason = NULLIF($2, '')
+		WHERE parent_id = $3
+		  AND role = 'sta'
+		  AND (status IS DISTINCT FROM $1 OR status_reason IS DISTINCT FROM NULLIF($2, ''))
+		RETURNING id, COALESCE(lower(mac), ''), COALESCE(host(ip_address), ''), COALESCE(site_id, 0)
+	`, status, reason, apID)
 	if err != nil {
 		p.logDebug("updateChildrenStatus: failed to update children of AP %d: %v", apID, err)
 		return
 	}
+	defer rows.Close()
 
-	if rows, _ := result.RowsAffected(); rows > 0 {
-		p.logDebug("updateChildrenStatus: updated %d children of AP %d to status '%s'", rows, apID, status)
+	count := 0
+	for rows.Next() {
+		var id int64
+		var mac, ip string
+		var siteID int
+		if err := rows.Scan(&id, &mac, &ip, &siteID); err != nil {
+			p.logDebug("updateChildrenStatus: scan child of AP %d: %v", apID, err)
+			continue
+		}
+		p.store.BindIdentityByMAC(mac, ip, int(id), siteID)
+		p.store.SetStatusByMAC(mac, ip, stats.DeviceStatus(status), reason, "", false)
+		if p.wsHub != nil {
+			p.wsHub.BroadcastDeviceUpdate(int(id), ip, map[string]any{
+				"id": id, "status": status, "db_status": status, "status_reason": reason,
+			})
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		p.logDebug("updateChildrenStatus: iterate children of AP %d: %v", apID, err)
+	}
+	if count > 0 {
+		p.logDebug("updateChildrenStatus: updated %d children of AP %d to status '%s'", count, apID, status)
 	}
 }
 func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges map[string]string) {
@@ -142,6 +176,11 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 			// directly polled).
 			existingRoleNorm := stats.NormalizeRole(existingRole.String)
 			if existingRole.Valid && existingRoleNorm == "ap" {
+				siteID := 0
+				if existingSiteID.Valid {
+					siteID = int(existingSiteID.Int64)
+				}
+				p.store.BindIdentityByMAC(peerMAC, existingIP.String, int(existingID.Int64), siteID)
 				// Defensive cleanup: APs should never have a parent relationship.
 				if existingParentID.Valid || (existingParentMAC.Valid && existingParentMAC.String != "") {
 					dbExecIgnoreCtx(p.db, dbCtxForMAC(peerMAC, peer.IP, "ap_peer_clear_parent", existingID.Int64), `
@@ -197,10 +236,12 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 			}
 			ssid = truncateForDB("ssid", staHost, existingID.Int64, ssid, 64)
 
+			var updateErr error
+			effectiveSiteID := 0
 			if shouldClearSite {
 				// Clear site on role/SSID change - device was repurposed
 				if ipChanged {
-					dbExecIgnoreCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_clear_site", existingID.Int64), `
+					_, updateErr = dbExecCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_clear_site", existingID.Int64), `
 						UPDATE devices SET
 							ip_address = $1,
 							hostname = COALESCE(NULLIF($2, ''), hostname),
@@ -219,7 +260,7 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 						WHERE lower(mac) = $10
 					`, newIP, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, peerMAC)
 				} else {
-					dbExecIgnoreCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_clear_site", existingID.Int64), `
+					_, updateErr = dbExecCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_clear_site", existingID.Int64), `
 						UPDATE devices SET
 							hostname = COALESCE(NULLIF($1, ''), hostname),
 							model = COALESCE(NULLIF($2, ''), model),
@@ -243,8 +284,11 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 				if !existingSiteID.Valid && apSiteID.Valid {
 					newSiteID = apSiteID // Inherit from AP
 				}
+				if newSiteID.Valid {
+					effectiveSiteID = int(newSiteID.Int64)
+				}
 				if ipChanged {
-					dbExecIgnoreCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_normal", existingID.Int64), `
+					_, updateErr = dbExecCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_normal", existingID.Int64), `
 						UPDATE devices SET
 							ip_address = $1,
 							hostname = COALESCE(NULLIF($2, ''), hostname),
@@ -263,7 +307,7 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 						WHERE lower(mac) = $11
 					`, newIP, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, newSiteID, peerMAC)
 				} else {
-					dbExecIgnoreCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_normal", existingID.Int64), `
+					_, updateErr = dbExecCtx(p.db, dbCtxForMAC(peerMAC, staHost, "sta_update_normal", existingID.Int64), `
 						UPDATE devices SET
 							hostname = COALESCE(NULLIF($1, ''), hostname),
 							model = COALESCE(NULLIF($2, ''), model),
@@ -281,6 +325,13 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 						WHERE lower(mac) = $10
 					`, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, newSiteID, peerMAC)
 				}
+			}
+
+			if updateErr == nil {
+				p.store.BindIdentityByMAC(peerMAC, staHost, int(existingID.Int64), effectiveSiteID)
+				p.store.SetStatusByMAC(peerMAC, staHost, stats.StatusOnline, "", "", true)
+			} else {
+				p.logDebug("Failed to update discovered STA %s: %v", peerMAC, updateErr)
 			}
 
 			// Broadcast AP change via WebSocket so UI updates hierarchy
@@ -389,6 +440,12 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 			}
 
 			p.logDebug("STA %s upserted with ID %d (inserted=%v)", peerMAC, newID, inserted)
+			effectiveSiteID := 0
+			if apSiteID.Valid {
+				effectiveSiteID = int(apSiteID.Int64)
+			}
+			p.store.BindIdentityByMAC(peerMAC, staHost, int(newID), effectiveSiteID)
+			p.store.SetStatusByMAC(peerMAC, staHost, stats.StatusOnline, "", "", true)
 
 			// Only broadcast new-device events. Existing STA rows are updated frequently and
 			// should not trigger expensive full client refreshes.
@@ -427,19 +484,41 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 }
 
 func (p *Poller) markMissingSTAsOffline(apID int64, associatedMACs []string) {
-	ctx := dbCtxForDevice(apID, "mark_missing_stas_offline")
-
 	// Use a case-insensitive match for safety when legacy rows have uppercase MACs.
-	// If associatedMACs is empty, this will mark all child STAs as offline which is
-	// correct when an AP reports no peers.
-	_, err := dbExecCtx(p.db, ctx, `
+	// An empty list reaches this function only after the empty-snapshot debounce has
+	// confirmed two consecutive authoritative empty AP responses.
+	rows, err := p.db.Query(`
 		UPDATE devices
 		SET status = 'offline',
 		    status_reason = 'not_associated'
 		WHERE parent_id = $1
 		  AND role = 'sta'
 		  AND NOT (lower(mac) = ANY($2::text[]))
-		  AND status <> 'offline'
+		  AND (status IS DISTINCT FROM 'offline' OR status_reason IS DISTINCT FROM 'not_associated')
+		RETURNING id, COALESCE(lower(mac), ''), COALESCE(host(ip_address), ''), COALESCE(site_id, 0)
 	`, apID, pq.Array(associatedMACs))
-	_ = err // dbExecCtx already logs errors with full query + args + context.
+	if err != nil {
+		logDBExecError(dbCtxForDevice(apID, "mark_missing_stas_offline"), err, "UPDATE devices ... RETURNING", []any{apID, associatedMACs}, nil)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var mac, ip string
+		var siteID int
+		if err := rows.Scan(&id, &mac, &ip, &siteID); err != nil {
+			p.logDebug("markMissingSTAsOffline: scan child of AP %d: %v", apID, err)
+			continue
+		}
+		p.store.BindIdentityByMAC(mac, ip, int(id), siteID)
+		p.store.SetStatusByMAC(mac, ip, stats.StatusOffline, "not_associated", "", false)
+		if p.wsHub != nil {
+			p.wsHub.BroadcastDeviceUpdate(int(id), ip, map[string]any{
+				"id": id, "status": "offline", "db_status": "offline", "status_reason": "not_associated",
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		p.logDebug("markMissingSTAsOffline: iterate children of AP %d: %v", apID, err)
+	}
 }

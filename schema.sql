@@ -1,9 +1,6 @@
 -- waveControl Database Schema
 -- PostgreSQL 14+
 
--- Enable required extensions
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 -- Roles table (fixed set)
 CREATE TABLE IF NOT EXISTS roles (
     id SERIAL PRIMARY KEY,
@@ -19,8 +16,9 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(64) UNIQUE NOT NULL,
     password VARCHAR(256) NOT NULL,  -- bcrypt hash
-    status INTEGER DEFAULT 1,  -- 1=active, 0=disabled
-    created_at TIMESTAMP DEFAULT NOW()
+    status INTEGER NOT NULL DEFAULT 1,  -- 1=active, 0=disabled
+    auth_version BIGINT NOT NULL DEFAULT 1, -- increment to revoke active sessions
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- User-Role mapping
@@ -40,14 +38,15 @@ CREATE TABLE IF NOT EXISTS settings (
 -- Default settings
 INSERT INTO settings (key, value) VALUES 
     ('poll_interval', '30'),
-    ('ap_cred1_user', 'ubnt'),
-    ('ap_cred1_pass', 'ubnt'),
+    ('poller_workers', '50'),
+    ('ap_cred1_user', ''),
+    ('ap_cred1_pass', ''),
     ('ap_cred2_user', ''),
     ('ap_cred2_pass', ''),
     ('ap_cred3_user', ''),
     ('ap_cred3_pass', ''),
-    ('sta_cred1_user', 'ubnt'),
-    ('sta_cred1_pass', 'ubnt'),
+    ('sta_cred1_user', ''),
+    ('sta_cred1_pass', ''),
     ('sta_cred2_user', ''),
     ('sta_cred2_pass', ''),
     ('sta_cred3_user', ''),
@@ -57,7 +56,20 @@ INSERT INTO settings (key, value) VALUES
     ('zabbix_enabled', 'false'),
     ('zabbix_listen', '127.0.0.1:10050'),
     ('zabbix_allowed_hosts', ''),
+    ('zabbix_server', ''),
+    ('zabbix_sender_host', 'wavecontrol'),
+    ('smtp_host', ''),
+    ('smtp_port', '25'),
+    ('smtp_username', ''),
+    ('smtp_password', ''),
+    ('smtp_from', ''),
+    ('backup_dir', 'backups'),
+    ('cors_origins', ''),
+    ('csp_img_sources', ''),
+    ('csp_connect_sources', ''),
     ('management_prefixes', '[]'),
+    ('wave_peer_fallback', 'false'),
+    ('wave_mlo_multi_radio', 'false'),
     -- Quality thresholds (percent)
     ('interference_warning_pct', '10'),
     ('interference_critical_pct', '25')
@@ -100,7 +112,7 @@ CREATE TABLE IF NOT EXISTS devices (
     platform VARCHAR(16),     -- "wave", "ltu", "airmax"
     flavor VARCHAR(16),       -- "GMC", "GMP", "MGMP", "AFLTUROCKET", "Rocket"
     role VARCHAR(8),          -- "ap", "sta"
-	    managed BOOLEAN NOT NULL DEFAULT FALSE, -- true when device was explicitly added via Add IP / Add Bulk
+    managed BOOLEAN NOT NULL DEFAULT FALSE, -- true when device was explicitly added via Add IP / Add Bulk
 
     -- Alert policy
     alertable BOOLEAN NOT NULL DEFAULT TRUE,
@@ -151,7 +163,7 @@ CREATE TABLE IF NOT EXISTS devices (
     
     -- Credentials (for this device, overrides defaults)
     username VARCHAR(64),
-    password VARCHAR(128),
+    password TEXT,
     
     -- Status tracking (basic, real-time stats in memory)
     status VARCHAR(16) DEFAULT 'unknown',  -- online, offline, upgrading, unknown
@@ -166,6 +178,7 @@ CREATE INDEX IF NOT EXISTS idx_devices_parent ON devices(parent_id);
 CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
 CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip_address);
 CREATE INDEX IF NOT EXISTS idx_devices_platform ON devices(platform);
+CREATE INDEX IF NOT EXISTS idx_devices_managed ON devices(managed);
 CREATE INDEX IF NOT EXISTS idx_devices_alertable ON devices(alertable);
 CREATE INDEX IF NOT EXISTS idx_devices_role_alertable ON devices(role, alertable);
 CREATE INDEX IF NOT EXISTS idx_devices_alert_silenced_until ON devices(alert_silenced_until);
@@ -211,6 +224,10 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     last_run TIMESTAMP,
     next_run TIMESTAMP,
     status VARCHAR(16) DEFAULT 'pending', -- pending, running, completed, failed, cancelled
+    progress INTEGER DEFAULT 0,
+    total_devices INTEGER DEFAULT 0,
+    completed_devices INTEGER DEFAULT 0,
+    error_message TEXT,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT NOW()
 );
@@ -229,17 +246,9 @@ CREATE TABLE IF NOT EXISTS changelog (
 CREATE INDEX IF NOT EXISTS idx_changelog_time ON changelog(change_time DESC);
 CREATE INDEX IF NOT EXISTS idx_changelog_mac ON changelog(device_mac);
 
--- Create default admin user (password: admin)
--- bcrypt hash with cost 10
-INSERT INTO users (username, password, status) 
-VALUES ('admin', '$2b$10$Q0ReFRsQ9Pvbt.7oYvBAieKwTekyDR.lhzluAPT3amPLsP4ob1rlG', 1)
-ON CONFLICT (username) DO NOTHING;
-
--- Assign admin role to admin user
-INSERT INTO user_roles ("user", role)
-SELECT u.id, r.id FROM users u, roles r 
-WHERE u.username = 'admin' AND r.name = 'administrator'
-ON CONFLICT DO NOTHING;
+-- No default user is created. On an empty database, start waveControl once with
+-- WAVECONTROL_BOOTSTRAP_USERNAME and WAVECONTROL_BOOTSTRAP_PASSWORD to create
+-- the first administrator. Remove both variables after the account is created.
 
 -- Helper function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -264,9 +273,9 @@ CREATE TRIGGER settings_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
 
--- Device configuration backups (DEPRECATED - now using filesystem storage)
--- This table is no longer used but kept for backward compatibility
--- Old data can be exported using: SELECT config_data FROM device_configs WHERE device_id = X
+-- Device configuration backups are stored on the filesystem. The obsolete
+-- device_configs table is intentionally not created by the current schema.
+-- Export legacy rows before dropping that table on an upgraded installation.
 -- CREATE TABLE IF NOT EXISTS device_configs (
 --     id SERIAL PRIMARY KEY,
 --     device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -275,7 +284,7 @@ CREATE TRIGGER settings_updated_at
 --     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
 -- );
 
--- CREATE INDEX idx_device_configs_device ON device_configs(device_id);
+-- CREATE INDEX IF NOT EXISTS idx_device_configs_device ON device_configs(device_id);
 
 -- Device TLS certificates (for trust-on-first-use)
 CREATE TABLE IF NOT EXISTS device_certs (
@@ -296,8 +305,8 @@ CREATE TABLE IF NOT EXISTS device_certs (
     UNIQUE(device_id)
 );
 
-CREATE INDEX idx_device_certs_device ON device_certs(device_id);
-CREATE INDEX idx_device_certs_fingerprint ON device_certs(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_device_certs_device ON device_certs(device_id);
+CREATE INDEX IF NOT EXISTS idx_device_certs_fingerprint ON device_certs(fingerprint);
 
 -- Alert rules (thresholds)
 CREATE TABLE IF NOT EXISTS alert_rules (
@@ -306,8 +315,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     enabled BOOLEAN DEFAULT true,
     
     -- Target scope
-    scope VARCHAR(20) DEFAULT 'all',     -- 'all', 'site', 'group', 'device'
-    scope_id INTEGER,                    -- site_id, group_id, or device_id
+    scope VARCHAR(20) DEFAULT 'all',     -- 'all', 'site', 'device'
+    scope_id INTEGER,                    -- site_id or device_id
     target_role VARCHAR(16) NOT NULL DEFAULT 'all', -- 'all', 'ap', 'sta'
     require_alertable BOOLEAN NOT NULL DEFAULT TRUE, -- honor devices.alertable/silence gates
     
@@ -318,7 +327,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     duration_seconds INTEGER DEFAULT 0,  -- How long condition must persist (0 = immediate)
     
     -- Notification
-    notify_channels TEXT[],              -- ['email', 'webhook', 'zabbix', 'mobile']
+    notify_channels TEXT[],              -- ['email', 'webhook', 'zabbix']
     notify_emails TEXT[],                -- Email addresses
     webhook_url TEXT,                    -- Webhook URL
     cooldown_seconds INTEGER DEFAULT 300, -- Minimum time between repeat alerts
@@ -329,8 +338,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_alert_rules_enabled ON alert_rules(enabled);
-CREATE INDEX idx_alert_rules_metric ON alert_rules(metric);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_metric ON alert_rules(metric);
 CREATE INDEX IF NOT EXISTS idx_alert_rules_target_role ON alert_rules(target_role);
 CREATE INDEX IF NOT EXISTS idx_alert_rules_require_alertable ON alert_rules(require_alertable);
 
@@ -359,10 +368,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     notify_error TEXT
 );
 
-CREATE INDEX idx_alerts_status ON alerts(status);
-CREATE INDEX idx_alerts_device ON alerts(device_id);
-CREATE INDEX idx_alerts_triggered ON alerts(triggered_at DESC);
-CREATE INDEX idx_alerts_rule ON alerts(rule_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts(device_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_triggered ON alerts(triggered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_rule ON alerts(rule_id);
 
 -- Alert state tracking (for duration-based alerts)
 CREATE TABLE IF NOT EXISTS alert_states (
@@ -377,64 +386,25 @@ CREATE TABLE IF NOT EXISTS alert_states (
 );
 
 
--- Native mobile clients and durable push outbox
-CREATE TABLE IF NOT EXISTS mobile_devices (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    platform VARCHAR(16) NOT NULL CHECK (platform IN ('android', 'ios')),
-    provider VARCHAR(16) NOT NULL CHECK (provider IN ('fcm', 'apns')),
-    token_hash CHAR(64) NOT NULL,
-    token_encrypted TEXT NOT NULL,
-    device_name VARCHAR(128),
-    app_version VARCHAR(64),
-    os_version VARCHAR(64),
-    enabled BOOLEAN NOT NULL DEFAULT true,
-    last_seen_at TIMESTAMPTZ DEFAULT NOW(),
-    last_error TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id, platform, provider, token_hash)
-);
-
-CREATE TABLE IF NOT EXISTS mobile_push_preferences (
-    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    push_enabled BOOLEAN NOT NULL DEFAULT true,
-    notify_critical BOOLEAN NOT NULL DEFAULT true,
-    notify_warning BOOLEAN NOT NULL DEFAULT true,
-    notify_info BOOLEAN NOT NULL DEFAULT false,
-    quiet_hours_start TIME,
-    quiet_hours_end TIME,
-    timezone VARCHAR(64) NOT NULL DEFAULT 'UTC',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS notification_outbox (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    seq BIGSERIAL UNIQUE,
-    alert_id INTEGER REFERENCES alerts(id) ON DELETE CASCADE,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    mobile_device_id UUID REFERENCES mobile_devices(id) ON DELETE CASCADE,
-    event_type VARCHAR(64) NOT NULL,
-    severity VARCHAR(20) NOT NULL,
-    dedupe_key TEXT NOT NULL,
-    collapse_key TEXT,
+-- Durable alert notification delivery (email, webhook, or Zabbix)
+CREATE TABLE IF NOT EXISTS alert_notification_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    alert_id INTEGER NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+    channel VARCHAR(16) NOT NULL CHECK (channel IN ('email', 'webhook', 'zabbix')),
     payload JSONB NOT NULL,
-    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    status VARCHAR(16) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'sending', 'failed', 'sent', 'dead')),
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TIMESTAMPTZ DEFAULT NOW(),
-    provider_message_id TEXT,
-    error TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     sent_at TIMESTAMPTZ,
-    UNIQUE(dedupe_key, mobile_device_id)
+    UNIQUE(alert_id, channel)
 );
 
-CREATE INDEX IF NOT EXISTS idx_mobile_devices_user ON mobile_devices(user_id);
-CREATE INDEX IF NOT EXISTS idx_mobile_devices_enabled ON mobile_devices(enabled);
-CREATE INDEX IF NOT EXISTS idx_notification_outbox_due ON notification_outbox(status, next_attempt_at, created_at);
-CREATE INDEX IF NOT EXISTS idx_notification_outbox_user ON notification_outbox(user_id, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_notification_outbox_due
+    ON alert_notification_outbox(status, next_attempt_at, id);
 
 -- Reports
 CREATE TABLE IF NOT EXISTS reports (
@@ -446,8 +416,8 @@ CREATE TABLE IF NOT EXISTS reports (
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 
-CREATE INDEX idx_reports_type ON reports(type);
-CREATE INDEX idx_reports_created ON reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
 
 -- Job runs (execution instances of any job type)
 -- This unifies firmware_jobs, scheduled_jobs, and ad-hoc operations
@@ -477,10 +447,10 @@ CREATE TABLE IF NOT EXISTS job_runs (
     scheduled_job_id INTEGER REFERENCES scheduled_jobs(id) ON DELETE SET NULL  -- Link to scheduler if triggered by schedule
 );
 
-CREATE INDEX idx_job_runs_status ON job_runs(status);
-CREATE INDEX idx_job_runs_type ON job_runs(job_type);
-CREATE INDEX idx_job_runs_created ON job_runs(created_at DESC);
-CREATE INDEX idx_job_runs_user ON job_runs(created_by);
+CREATE INDEX IF NOT EXISTS idx_job_runs_status ON job_runs(status);
+CREATE INDEX IF NOT EXISTS idx_job_runs_type ON job_runs(job_type);
+CREATE INDEX IF NOT EXISTS idx_job_runs_created ON job_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_job_runs_user ON job_runs(created_by);
 
 -- Job events (progress log for a job run)
 CREATE TABLE IF NOT EXISTS job_events (
@@ -493,8 +463,8 @@ CREATE TABLE IF NOT EXISTS job_events (
     data JSONB                             -- Additional event data
 );
 
-CREATE INDEX idx_job_events_job ON job_events(job_id);
-CREATE INDEX idx_job_events_time ON job_events(event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_events_time ON job_events(event_time DESC);
 
 -- Maintenance windows (per region/site)
 CREATE TABLE IF NOT EXISTS maintenance_windows (
@@ -523,9 +493,9 @@ CREATE TABLE IF NOT EXISTS maintenance_windows (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_maintenance_windows_enabled ON maintenance_windows(enabled);
-CREATE INDEX idx_maintenance_windows_region ON maintenance_windows(region_id);
-CREATE INDEX idx_maintenance_windows_site ON maintenance_windows(site_id);
+CREATE INDEX IF NOT EXISTS idx_maintenance_windows_enabled ON maintenance_windows(enabled);
+CREATE INDEX IF NOT EXISTS idx_maintenance_windows_region ON maintenance_windows(region_id);
+CREATE INDEX IF NOT EXISTS idx_maintenance_windows_site ON maintenance_windows(site_id);
 
 -- Add scheduler settings
 INSERT INTO settings (key, value) VALUES 
@@ -533,18 +503,6 @@ INSERT INTO settings (key, value) VALUES
     ('scheduler_check_interval', '10'),
     ('scheduler_respect_maintenance', 'true')
 ON CONFLICT (key) DO NOTHING;
-
--- Add progress columns to scheduled_jobs if not exist
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                   WHERE table_name = 'scheduled_jobs' AND column_name = 'progress') THEN
-        ALTER TABLE scheduled_jobs ADD COLUMN progress INTEGER DEFAULT 0;
-        ALTER TABLE scheduled_jobs ADD COLUMN total_devices INTEGER DEFAULT 0;
-        ALTER TABLE scheduled_jobs ADD COLUMN completed_devices INTEGER DEFAULT 0;
-        ALTER TABLE scheduled_jobs ADD COLUMN error_message TEXT;
-    END IF;
-END $$;
 
 -- Custom drilldown lists for targeted device polling
 CREATE TABLE IF NOT EXISTS drilldown_lists (
@@ -562,7 +520,7 @@ CREATE TABLE IF NOT EXISTS drilldown_hosts (
     list_id INTEGER REFERENCES drilldown_lists(id) ON DELETE CASCADE,
     host VARCHAR(64) NOT NULL,           -- IP address or hostname
     username VARCHAR(64),                -- Override credentials
-    password VARCHAR(128),
+    password TEXT,
     device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,  -- Linked device if known
     last_poll TIMESTAMP,
     last_error TEXT,
@@ -572,16 +530,3 @@ CREATE TABLE IF NOT EXISTS drilldown_hosts (
 
 INSERT INTO settings (key, value) VALUES ('chain_imbalance_threshold_db', '5') ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('rx_mismatch_threshold_db', '8') ON CONFLICT (key) DO NOTHING;
-
-INSERT INTO settings (key, value) VALUES
-    ('mobile_push_enabled', 'true'),
-    ('fcm_enabled', 'false'),
-    ('fcm_project_id', ''),
-    ('fcm_service_account_json', ''),
-    ('apns_enabled', 'false'),
-    ('apns_team_id', ''),
-    ('apns_key_id', ''),
-    ('apns_bundle_id', ''),
-    ('apns_private_key_p8', ''),
-    ('apns_production', 'false')
-ON CONFLICT (key) DO NOTHING;

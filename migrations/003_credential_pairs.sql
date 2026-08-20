@@ -11,6 +11,7 @@ DECLARE
     ap_user TEXT;
     ap_pass_json TEXT;
     passes TEXT[];
+    pass_count INT := 0;
     i INT;
 BEGIN
     -- Get legacy ap_username (or default_username fallback)
@@ -19,7 +20,7 @@ BEGIN
         SELECT value INTO ap_user FROM settings WHERE key = 'default_username';
     END IF;
     IF ap_user IS NULL THEN
-        ap_user := 'ubnt';
+        ap_user := '';
     END IF;
     
     -- Get legacy ap_passwords JSON array
@@ -32,24 +33,30 @@ BEGIN
     IF ap_pass_json IS NOT NULL AND ap_pass_json != '' AND ap_pass_json != '[]' THEN
         SELECT ARRAY(SELECT json_array_elements_text(ap_pass_json::json)) INTO passes;
     ELSE
-        passes := ARRAY['ubnt'];
+        passes := ARRAY[]::TEXT[];
     END IF;
     
-    -- Insert credential pairs (up to 3)
-    FOR i IN 1..LEAST(3, array_length(passes, 1)) LOOP
-        INSERT INTO settings (key, value) VALUES 
-            ('ap_cred' || i || '_user', ap_user),
-            ('ap_cred' || i || '_pass', passes[i])
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-    END LOOP;
-    
+    pass_count := LEAST(3, COALESCE(array_length(passes, 1), 0));
+    -- PostgreSQL integer FOR loops count downward when the lower bound is
+    -- greater than the upper bound, so guard empty ranges explicitly.
+    IF pass_count > 0 THEN
+        FOR i IN 1..pass_count LOOP
+            INSERT INTO settings (key, value) VALUES
+                ('ap_cred' || i || '_user', ap_user),
+                ('ap_cred' || i || '_pass', passes[i])
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+        END LOOP;
+    END IF;
+
     -- Ensure empty slots exist
-    FOR i IN (LEAST(3, COALESCE(array_length(passes, 1), 0)) + 1)..3 LOOP
-        INSERT INTO settings (key, value) VALUES 
-            ('ap_cred' || i || '_user', ''),
-            ('ap_cred' || i || '_pass', '')
-        ON CONFLICT (key) DO NOTHING;
-    END LOOP;
+    IF pass_count < 3 THEN
+        FOR i IN (pass_count + 1)..3 LOOP
+            INSERT INTO settings (key, value) VALUES
+                ('ap_cred' || i || '_user', ''),
+                ('ap_cred' || i || '_pass', '')
+            ON CONFLICT (key) DO NOTHING;
+        END LOOP;
+    END IF;
 END $$;
 
 -- Step 3: Migrate STA credentials
@@ -59,6 +66,7 @@ DECLARE
     sta_pass_json TEXT;
     ap_user TEXT;
     passes TEXT[];
+    pass_count INT := 0;
     i INT;
 BEGIN
     -- Get legacy sta_username (or fall back to ap_username)
@@ -70,7 +78,7 @@ BEGIN
         SELECT value INTO sta_user FROM settings WHERE key = 'default_username';
     END IF;
     IF sta_user IS NULL THEN
-        sta_user := 'ubnt';
+        sta_user := '';
     END IF;
     
     -- Get legacy sta_passwords JSON array
@@ -87,24 +95,28 @@ BEGIN
     IF sta_pass_json IS NOT NULL AND sta_pass_json != '' AND sta_pass_json != '[]' THEN
         SELECT ARRAY(SELECT json_array_elements_text(sta_pass_json::json)) INTO passes;
     ELSE
-        passes := ARRAY['ubnt'];
+        passes := ARRAY[]::TEXT[];
     END IF;
     
-    -- Insert credential pairs (up to 3)
-    FOR i IN 1..LEAST(3, array_length(passes, 1)) LOOP
-        INSERT INTO settings (key, value) VALUES 
-            ('sta_cred' || i || '_user', sta_user),
-            ('sta_cred' || i || '_pass', passes[i])
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-    END LOOP;
-    
+    pass_count := LEAST(3, COALESCE(array_length(passes, 1), 0));
+    IF pass_count > 0 THEN
+        FOR i IN 1..pass_count LOOP
+            INSERT INTO settings (key, value) VALUES
+                ('sta_cred' || i || '_user', sta_user),
+                ('sta_cred' || i || '_pass', passes[i])
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+        END LOOP;
+    END IF;
+
     -- Ensure empty slots exist
-    FOR i IN (LEAST(3, COALESCE(array_length(passes, 1), 0)) + 1)..3 LOOP
-        INSERT INTO settings (key, value) VALUES 
-            ('sta_cred' || i || '_user', ''),
-            ('sta_cred' || i || '_pass', '')
-        ON CONFLICT (key) DO NOTHING;
-    END LOOP;
+    IF pass_count < 3 THEN
+        FOR i IN (pass_count + 1)..3 LOOP
+            INSERT INTO settings (key, value) VALUES
+                ('sta_cred' || i || '_user', ''),
+                ('sta_cred' || i || '_pass', '')
+            ON CONFLICT (key) DO NOTHING;
+        END LOOP;
+    END IF;
 END $$;
 
 -- Step 4: Verify migration

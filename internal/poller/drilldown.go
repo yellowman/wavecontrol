@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -92,7 +93,7 @@ func (p *Poller) pollDrilldownLists(lastPoll map[int]time.Time) {
 
 		// Get hosts for this list
 		hostRows, err := p.db.Query(`
-			SELECT dh.id, dh.host, dh.device_id, d.username, d.password
+			SELECT dh.id, dh.host, dh.device_id, COALESCE(dh.username, d.username), COALESCE(dh.password, d.password)
 			FROM drilldown_hosts dh
 			LEFT JOIN devices d ON dh.device_id = d.id
 			WHERE dh.list_id = $1
@@ -126,13 +127,27 @@ func (p *Poller) pollDrilldownLists(lastPoll map[int]time.Time) {
 
 // pollDrilldownHost polls a single host from a drilldown list
 func (p *Poller) pollDrilldownHost(listID, hostID int, host, username, password string, deviceID int64) {
-	// Use STA credentials if no override provided
-	cfg := p.cfgSnapshot()
-	if username == "" && len(cfg.staCreds) > 0 {
-		username = cfg.staCreds[0].Username
+	if password != "" {
+		plain, err := p.decryptSecret(password)
+		if err != nil {
+			p.updateDrilldownStatus(hostID, host, fmt.Errorf("decrypt credential: %w", err))
+			return
+		}
+		password = plain
 	}
-	if password == "" && len(cfg.staCreds) > 0 {
-		password = cfg.staCreds[0].Password
+	if (username == "") != (password == "") {
+		username, password = "", ""
+	}
+	if username == "" {
+		cfg := p.cfgSnapshot()
+		if len(cfg.staCreds) > 0 {
+			username = cfg.staCreds[0].Username
+			password = cfg.staCreds[0].Password
+		}
+	}
+	if username == "" || password == "" {
+		p.updateDrilldownStatus(hostID, host, fmt.Errorf("no device credentials configured"))
+		return
 	}
 
 	// Create HTTP client (use insecure transport for drilldown hosts)
@@ -241,4 +256,17 @@ func (p *Poller) pollDrilldownHost(listID, hostID int, host, username, password 
 	} else {
 		dbExecIgnoreCtx(p.db, dbCtx{Op: "drilldown_host_update", Host: host}, `UPDATE drilldown_hosts SET last_poll = NOW(), last_error = $2 WHERE id = $1`, hostID, lastError)
 	}
+}
+
+// updateDrilldownStatus records early failures that occur before a device API
+// request can be made. Keeping this in the same path as normal completion
+// prevents undecryptable or missing credentials from appearing as never polled.
+func (p *Poller) updateDrilldownStatus(hostID int, host string, pollErr error) {
+	if pollErr == nil {
+		dbExecIgnoreCtx(p.db, dbCtx{Op: "drilldown_host_update", Host: host},
+			`UPDATE drilldown_hosts SET last_poll = NOW(), last_error = NULL WHERE id = $1`, hostID)
+		return
+	}
+	dbExecIgnoreCtx(p.db, dbCtx{Op: "drilldown_host_update", Host: host},
+		`UPDATE drilldown_hosts SET last_poll = NOW(), last_error = $2 WHERE id = $1`, hostID, pollErr.Error())
 }

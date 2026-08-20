@@ -2,33 +2,34 @@
 #
 # $OpenBSD$
 
+# waveControl reads persistent secrets from a root-owned environment file.
+# Never generate the JWT or data-encryption key at service start: doing so
+# invalidates sessions and makes encrypted device credentials unreadable.
 daemon="/usr/local/bin/wavecontrol"
-
-# Run as root - daemon handles privilege separation
-daemon_user="root"
+daemon_user="root" # the daemon performs its own privilege separation
+wavecontrol_env_file="/etc/wavecontrol/wavecontrol.env"
+pexp="/usr/local/bin/wavecontrol.*"
 
 . /etc/rc.d/rc.subr
-
-# Generate random JWT secret on each start (logins invalidated on restart)
-_jwt_secret=$(openssl rand -base64 48)
-
-# For persistent logins across restarts, uncomment and set a static secret:
-#_jwt_secret="changeme-use-openssl-rand-base64-48-to-generate"
-
-# Environment variables
-# Drops to _wavecontrol user automatically (or www, nobody)
-#
-# NOTE: Use IP address (not hostname) - no DNS after privilege drop
-wavecontrol_env="WAVECONTROL_DSN=postgres://wavecontrol:password@127.0.0.1/wavecontrol?sslmode=disable \
-WAVECONTROL_JWT_SECRET=${_jwt_secret}"
-
-# Use pexp to match the process (daemon backgrounds itself)
-pexp="/usr/local/bin/wavecontrol.*"
 
 rc_reload=NO
 
 rc_start() {
-	rc_exec "env ${wavecontrol_env} ${daemon} ${daemon_flags}"
+	if [[ ! -r "${wavecontrol_env_file}" ]]; then
+		echo "${wavecontrol_env_file} is required and must contain persistent waveControl secrets" >&2
+		return 1
+	fi
+
+	set -a
+	. "${wavecontrol_env_file}" || return 1
+	set +a
+
+	if [[ -z "${WAVECONTROL_DSN}" || -z "${WAVECONTROL_JWT_SECRET}" || -z "${WAVECONTROL_DATA_KEY}" ]]; then
+		echo "WAVECONTROL_DSN, WAVECONTROL_JWT_SECRET, and WAVECONTROL_DATA_KEY are required" >&2
+		return 1
+	fi
+
+	rc_exec "${daemon} ${daemon_flags}"
 }
 
 rc_cmd $1

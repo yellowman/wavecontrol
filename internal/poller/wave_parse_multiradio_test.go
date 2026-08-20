@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseStats_MLO6RadioBandMapping(t *testing.T) {
-	p := &Poller{}
+	p := &Poller{waveMLOMultiRadio: true}
 
 	raw := []any{
 		map[string]any{
@@ -43,7 +43,7 @@ func TestParseStats_MLO6RadioBandMapping(t *testing.T) {
 	}
 
 	ds, _ := p.parseStats(b, "wave")
-	if ds == nil || ds.Wireless == nil {
+	if ds == nil {
 		t.Fatalf("expected wireless stats to be present")
 	}
 	if ds.Wireless.Radio5GHz == nil {
@@ -52,11 +52,11 @@ func TestParseStats_MLO6RadioBandMapping(t *testing.T) {
 	if ds.Wireless.Radio6GHz == nil {
 		t.Fatalf("expected Radio6GHz to be set")
 	}
-	if ds.Wireless.Radio5GHz.DisplayBandOverride != "5ghz" {
-		t.Fatalf("expected Radio5GHz override '5ghz', got %q", ds.Wireless.Radio5GHz.DisplayBandOverride)
+	if ds.Wireless.Radio5GHz.DisplayBandOverride != "" {
+		t.Fatalf("true 5GHz radio should not require a display override, got %q", ds.Wireless.Radio5GHz.DisplayBandOverride)
 	}
-	if ds.Wireless.Radio6GHz.DisplayBandOverride != "6ghz" {
-		t.Fatalf("expected Radio6GHz override '6ghz', got %q", ds.Wireless.Radio6GHz.DisplayBandOverride)
+	if ds.Wireless.Radio6GHz.DisplayBandOverride != "" {
+		t.Fatalf("true 6GHz radio should not require a display override, got %q", ds.Wireless.Radio6GHz.DisplayBandOverride)
 	}
 	if ds.Wireless.Radio6GHz.AFC == nil {
 		t.Fatalf("expected Radio6GHz to include AFC info")
@@ -67,7 +67,7 @@ func TestParseStats_MLO6RadioBandMapping(t *testing.T) {
 }
 
 func TestParseStats_MLO5Two5GHzRadiosUsesSecondSlot(t *testing.T) {
-	p := &Poller{}
+	p := &Poller{waveMLOMultiRadio: true}
 
 	raw := []any{
 		map[string]any{
@@ -95,7 +95,7 @@ func TestParseStats_MLO5Two5GHzRadiosUsesSecondSlot(t *testing.T) {
 	}
 
 	ds, _ := p.parseStats(b, "wave")
-	if ds == nil || ds.Wireless == nil {
+	if ds == nil {
 		t.Fatalf("expected wireless stats to be present")
 	}
 	if ds.Wireless.Radio5GHz == nil {
@@ -104,8 +104,8 @@ func TestParseStats_MLO5Two5GHzRadiosUsesSecondSlot(t *testing.T) {
 	if ds.Wireless.Radio6GHz == nil {
 		t.Fatalf("expected second 5GHz radio to occupy the secondary slot (Radio6GHz)")
 	}
-	if ds.Wireless.Radio6GHz.DisplayBandOverride != "5ghz#2" {
-		t.Fatalf("expected secondary slot override '5ghz#2', got %q", ds.Wireless.Radio6GHz.DisplayBandOverride)
+	if ds.Wireless.Radio6GHz.DisplayBandOverride != "5 GHz #2" {
+		t.Fatalf("expected secondary slot override '5 GHz #2', got %q", ds.Wireless.Radio6GHz.DisplayBandOverride)
 	}
 	// The secondary slot is a 2nd 5GHz radio for MLO5; it must not be misclassified as 6GHz.
 	if ds.Wireless.Radio6GHz.Frequency >= 5945 {

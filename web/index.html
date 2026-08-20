@@ -5,10 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>waveControl</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous" />
   <link rel="stylesheet" href="css/styles.css?v=57"/>
 </head>
 <body class="not-authed">
@@ -100,7 +98,7 @@
         </div>
         <div class="form-group">
           <label>Username <small>(optional)</small></label>
-          <input type="text" id="addDeviceUser" placeholder="ubnt" />
+          <input type="text" id="addDeviceUser" placeholder="Device username" />
         </div>
         <div class="form-group">
           <label>Password <small>(optional)</small></label>
@@ -129,7 +127,7 @@
         <div class="form-row">
           <div class="form-group">
             <label>Username</label>
-            <input type="text" id="bulkAddUser" placeholder="ubnt" />
+            <input type="text" id="bulkAddUser" placeholder="Device username" />
           </div>
           <div class="form-group">
             <label>Password</label>
@@ -189,7 +187,7 @@
         <div id="authRetryDevices" class="auth-retry-list"></div>
         <div class="form-group">
           <label>Username</label>
-          <input type="text" id="authRetryUser" placeholder="ubnt" />
+          <input type="text" id="authRetryUser" placeholder="Device username" />
         </div>
         <div class="form-group">
           <label>Password</label>
@@ -213,7 +211,7 @@
     <div class="modal-content modal-wide">
       <div class="modal-header">
         <h3>Batch Configuration</h3>
-        <button class="modal-close" onclick="document.getElementById('batchConfigModal').classList.add('hidden')">&times;</button>
+        <button class="modal-close" data-wc-action="close-modal" data-modal-id="batchConfigModal">&times;</button>
       </div>
       <div class="modal-body">
         <div class="form-group">
@@ -245,7 +243,7 @@
         <div id="batchConfigResults" class="batch-results"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="document.getElementById('batchConfigModal').classList.add('hidden')">Cancel</button>
+        <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="batchConfigModal">Cancel</button>
         <button class="btn btn-primary" id="confirmBatchConfig">Apply Changes</button>
       </div>
     </div>
@@ -313,7 +311,7 @@
         <div id="jobEventsList" class="job-events-list"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="document.getElementById('jobEventsModal').classList.add('hidden')">Close</button>
+        <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="jobEventsModal">Close</button>
       </div>
     </div>
   </div>
@@ -403,9 +401,9 @@
     <button class="btn btn-secondary" id="bulkCancel">Cancel</button>
   </div>
   
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
   <script src="js/jszip.min.js"></script>
-    <script type="module" src="js/app.js?v=118"></script>
+  <script type="module" src="js/app.js?v=119"></script>
 </body>
 </html>

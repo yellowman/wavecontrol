@@ -264,7 +264,7 @@ func (a *API) requireAdmin(w, r) bool  // 403 if not administrator
 | `editor` | DeleteDevice, Upgrade*, Backup*, Job*, Site*, Region*, Alert* |
 | `admin` | User*, Setting*, TLS mode, BulkOps config |
 
-**Sensitive setting filtering:** Non-admins cannot see `default_passwords`, `default_username`, `jwt_secret`, `cors_origins`, `csp_img_sources`, `csp_connect_sources`, `firmware_path`, `zabbix_listen`.
+**Sensitive settings:** The settings API is administrator-only. Secret setting values are returned as a fixed mask and remain unchanged when that mask is submitted; clearing a secret requires an explicit `clear` request.
 
 ### Request Timeout Architecture
 
@@ -365,9 +365,10 @@ CSP is configurable via settings to allow different map tile providers:
 
 **Base CSP (always applied):**
 - `default-src 'self'`
-- `script-src 'self' 'unsafe-inline' https://unpkg.com https://d3js.org`
-- `style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com`
-- `font-src 'self' https://fonts.gstatic.com`
+- `script-src 'self' https://unpkg.com`
+- `script-src-attr 'none'`
+- `style-src 'self' 'unsafe-inline' https://unpkg.com`
+- `font-src 'self' data:`
 - `img-src 'self' data: https://*.tile.openstreetmap.org https://*.basemaps.cartocdn.com` + extra
 - `connect-src 'self' wss:` + extra
 
@@ -542,8 +543,10 @@ settings:
   
 -- Example settings:
 --   poll_interval: 30
---   default_username: ubnt
---   default_passwords: ["ubnt", "admin"]
+--   ap_cred1_user: ""       -- credential slots are explicitly configured
+--   ap_cred1_pass: ""       -- secret value is encrypted at rest
+--   sta_cred1_user: ""
+--   sta_cred1_pass: ""
 --   firmware_path: firmware
 --   backup_dir: backups
 --   zabbix_enabled: true
@@ -1533,28 +1536,27 @@ work_mem = 8MB
 
 ```
 GET  /api/wavecontrol/settings
-     Returns all settings
+     Returns all settings. Secret values are masked.
+
+PATCH /api/wavecontrol/settings
+     Atomically update a settings snapshot
+     Body: { "settings": {"key":"value"}, "clear": ["secret_key"] }
 
 PATCH /api/wavecontrol/settings/{key}
-     Update a setting
-     Body: { "value": "..." }
+     Update one setting
+     Body: { "value": "..." } or { "clear": true }
 
 # Settings keys:
 # - poll_interval (seconds, default: 30)
 # - poller_workers (number of workers, default: 50)
-# - ap_username (default: "ubnt") - Username for AP devices
-# - ap_passwords (JSON array, default: ["ubnt"]) - Passwords to try for APs
-# - sta_username (default: same as ap_username) - Username for STA devices
-# - sta_passwords (JSON array, default: same as ap_passwords) - Passwords to try for STAs
+# - ap_cred1_user/ap_cred1_pass through ap_cred3_user/ap_cred3_pass
+# - sta_cred1_user/sta_cred1_pass through sta_cred3_user/sta_cred3_pass
+#   Credential slots default empty and each username/password pair is atomic.
 # - firmware_path (default: "firmware", relative to working dir)
 # - backup_dir (default: "backups", relative to working dir)
 # - zabbix_enabled (default: false)
 # - zabbix_listen (default: "127.0.0.1:10050")
 # - management_prefixes (JSON array) - CIDR prefixes to filter learned IPs
-#
-# Legacy settings (still supported for backward compatibility):
-# - default_username (fallback if ap_username not set)
-# - default_passwords (fallback if ap_passwords not set)
 ```
 
 ### Device Management
@@ -1571,8 +1573,8 @@ POST /api/wavecontrol/devices
      Add AP(s) - triggers auto-discovery
      Body: { 
        "ips": ["192.168.1.1", "192.168.1.2"],
-       "username": "ubnt",        // optional, uses default
-       "password": "password",    // optional, uses default
+       "username": "device-user",    // optional only when a configured credential pair applies
+       "password": "device-password",
        "discover_stas": true      // optional, default true
      }
 
@@ -1605,8 +1607,8 @@ GET  /api/wavecontrol/stats/{ip}
      Returns full DeviceStats object
 
 # WebSocket for live updates
-WS   /api/wavecontrol/ws?token={jwt}
-     Stream stats updates in real-time
+WS   /api/wavecontrol/ws
+     Stream stats updates using the authenticated HttpOnly session cookie
      Messages: {"type":"stats","device_id":123,"data":{...}}
 ```
 
@@ -1617,8 +1619,8 @@ POST /api/wavecontrol/devices/bulk-add
      Add multiple APs at once
      Body: { 
        "ips": ["10.0.0.1", "10.0.0.2", ...],
-       "username": "ubnt",
-       "password": "password",
+       "username": "device-user",
+       "password": "device-password",
        "site_id": 1  // optional
      }
 
@@ -1662,11 +1664,10 @@ POST /api/wavecontrol/devices/{id}/restore
 **Credential lookup order for backup/upgrade operations:**
 
 1. Device-specific credentials (`devices.username`, `devices.password`)
-2. Global AP credential pairs (`ap_cred1_user`/`ap_cred1_pass`, etc.)
-3. Global STA credential pairs (`sta_cred1_user`/`sta_cred1_pass`, etc.)
-4. Default fallback: `ubnt`/`ubnt`
+2. Global AP credential pairs (`ap_cred1_user`/`ap_cred1_pass`, etc.) for AP operations
+3. Global STA credential pairs (`sta_cred1_user`/`sta_cred1_pass`, etc.) for STA operations
 
-Each credential pair (username + password) is tried as a unit. Different usernames across pairs are supported.
+Each configured username/password pair is tried as a unit. Different usernames across pairs are supported. There is no compiled-in device credential fallback.
 
 **Device-level backup endpoints:**
 
@@ -1931,7 +1932,7 @@ A Zabbix template will be provided with:
 1. User logs in (first user created via CLI or bootstrap)
 2. Navigate to Settings -> Configuration
 3. Configure:
-   - Default username/passwords for devices
+   - Up to three explicit AP and STA username/password pairs; no built-in defaults
    - Poll interval
    - Firmware directory path
    - Zabbix settings (if needed)
@@ -1997,20 +1998,27 @@ A Zabbix template will be provided with:
 
 ## Environment Variables
 
-Only two required:
+Three persistent variables are required:
 
 ```bash
-# Database connection (required)
-WAVECONTROL_DSN="postgres://user:pass@localhost/wavecontrol"
+# Database connection
+WAVECONTROL_DSN="postgres://user:pass@127.0.0.1/wavecontrol"
 
-# JWT secret for auth tokens (required)
-WAVECONTROL_JWT_SECRET="your-32-char-minimum-secret"
+# Session-signing secret; generate once and retain across restarts
+WAVECONTROL_JWT_SECRET="base64-random-secret"
+
+# 32-byte AES key, base64 encoded; generate once and retain permanently
+WAVECONTROL_DATA_KEY="base64-32-byte-key"
+
+# Required only while creating the first administrator in an empty database
+WAVECONTROL_BOOTSTRAP_USERNAME="wavecontrol-admin"
+WAVECONTROL_BOOTSTRAP_PASSWORD="strong-one-time-bootstrap-password"
 
 # Optional: Listen address (default: 127.0.0.1:8080)
 WAVECONTROL_ADDR="0.0.0.0:8080"
 ```
 
-Everything else is configured via the web UI Settings page.
+Remove the bootstrap variables after first startup. Rotating `WAVECONTROL_DATA_KEY` without an explicit re-encryption procedure makes stored operational credentials unreadable.
 
 ---
 
@@ -2778,8 +2786,9 @@ func (s *StatsStore) List() []*DeviceStats {
 | Settings                                                    |
 +-------------------------------------------------------------+
 | Device Discovery                                            |
-|   Default Username: [ubnt        ]                          |
-|   Default Passwords: [ubnt, admin, ...]    [Add Password]   |
+|   AP Credential 1: [username] [password]                   |
+|   AP Credential 2: [username] [password]                   |
+|   STA Credential 1: [username] [password]                  |
 |   Poll Interval: [30] seconds                               |
 +-------------------------------------------------------------+
 | Firmware                                                    |
@@ -3004,7 +3013,7 @@ Slide-out panel showing:
 
 ### Settings Page (Admin only)
 - Poll interval
-- Default credentials
+- Explicit AP and STA credential pairs
 - Firmware directory path
 - Server listen address
 - Zabbix enable/disable and listen address
@@ -3021,11 +3030,10 @@ Slide-out panel showing:
 WaveControl's UI is a single-page app (SPA), so *in-memory* state can survive navigation. To avoid
 stale or misleading information after a logout/login cycle:
 
-- The UI stores the auth token in `localStorage` (`token`) and uses it for HTTP API calls and the
-  WebSocket connection.
-- On **successful login**, the UI performs a **full page reload** to guarantee a clean app state.
-  After reload, the normal bootstrap path runs (`api.me()`, `api.devices()`, then WebSocket connect).
-- On logout, the UI disconnects WebSocket, clears the token, and returns to the login screen.
+- Login establishes an `HttpOnly`, `SameSite=Strict` session cookie; JavaScript never receives or stores the signed token.
+- On successful login, the UI performs a full page reload. The normal bootstrap path runs (`api.me()`, `api.devices()`, then WebSocket connect) using the cookie.
+- State-changing cookie requests require same-origin validation plus `X-WaveControl-CSRF: 1`.
+- Logout disconnects WebSocket, increments the user's server-side `auth_version`, clears the cookie, and returns to the login screen.
 
 Rationale: This guarantees that *all pages* start from fresh server data and no stale page-level
 cache (Quality aggregates, job lists, etc.) survives across sessions.
@@ -3036,8 +3044,8 @@ waveControl uses WebSocket for real-time stats updates instead of polling.
 
 ### Connection
 ```javascript
-// Connect with token in query string (required for auth)
-const url = `ws://host/api/wavecontrol/ws?token=${jwt}`
+// The browser automatically includes the HttpOnly cookie during the same-origin upgrade.
+const url = `ws://host/api/wavecontrol/ws`
 const ws = new WebSocket(url)
 ```
 
@@ -4052,7 +4060,7 @@ Notes:
 **Throughput History (in-memory):**
 - Ring buffer stores last 60 samples (30 min at 30s intervals)
 - Records total TX/RX and online/offline counts per sample
-- Rendered as D3 line chart in Performance reports
+- Rendered as a native SVG line chart in Performance reports
 - Data resets on server restart
 
 **API Endpoints:**
@@ -4069,16 +4077,9 @@ GET  /api/wavecontrol/stats/stability          - Get stability stats
 
 ### Database Schema Additions
 
-```sql
--- Config backups
-CREATE TABLE device_configs (
-    id SERIAL PRIMARY KEY,
-    device_id INTEGER REFERENCES devices(id),
-    config_data BYTEA,
-    created_at TIMESTAMPTZ,
-    created_by INTEGER REFERENCES users(id)
-);
+Configuration backups are stored as permission-restricted files beneath the configured backup directory; metadata is derived from the filesystem rather than a `device_configs` table.
 
+```sql
 -- Reports
 CREATE TABLE reports (
     id SERIAL PRIMARY KEY,
@@ -4144,7 +4145,7 @@ Step 1: Establish session via login.cgi
 GET /login.cgi                    # Establish session cookie
 POST /login.cgi                   # Submit credentials
 Content-Type: application/x-www-form-urlencoded
-Body: username=ubnt&password=ubnt
+Body: username=${DEVICE_USER}&password=${DEVICE_PASSWORD}
 
 Response sets: Cookie: AIROS_{MAC}={session_id}
 
@@ -4152,7 +4153,7 @@ Step 2: Get CSRF token (required for AirOS 8/LTU write operations)
 POST /api/auth
 Content-Type: application/json
 Cookie: AIROS_{MAC}={session_id}  # Use session from step 1
-Body: {"username":"ubnt","password":"ubnt"}
+Body: {"username":"device-user","password":"device-password"}
 
 Response header: X-CSRF-ID: {csrf_token}
 ```
@@ -4243,7 +4244,7 @@ LTU uses a **hybrid approach** - Wave JSON API for upload, airMAX CGI for flash 
 Step 1: Login via Wave API
 POST /api/v1.0/user/login
 Content-Type: application/json
-Body: {"username":"ubnt","password":"ubnt"}
+Body: {"username":"device-user","password":"device-password"}
 
 Response header: x-auth-token: {token}
 
@@ -4624,13 +4625,12 @@ Efficient incremental DOM updates:
 
 **Connection:**
 ```javascript
-ws://host/api/wavecontrol/ws?token=<JWT>
+ws://host/api/wavecontrol/ws  # authenticated by the session cookie
 ```
 
 **Message Types:**
 | Type | Direction | Description |
 |------|-----------|-------------|
-| `auth` | Client->Server | Send JWT token |
 | `stats_update` | Server->Client | Device stats changed |
 | `device_add` | Server->Client | New device discovered |
 | `device_remove` | Server->Client | Device removed |
@@ -4780,12 +4780,15 @@ Headers required: `X-CSRF-ID` (AirOS 8/LTU), `X-Requested-With: XMLHttpRequest` 
 
 ### Environment Variables
 
-Only two environment variables are required:
+Three persistent environment variables are required:
 
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `WAVECONTROL_DSN` | PostgreSQL connection string | Yes |
-| `WAVECONTROL_JWT_SECRET` | JWT signing secret | Yes |
+| `WAVECONTROL_JWT_SECRET` | Session-signing secret | Yes |
+| `WAVECONTROL_DATA_KEY` | Base64-encoded 32-byte data-encryption key | Yes |
+| `WAVECONTROL_BOOTSTRAP_USERNAME` | Initial administrator username | Empty database only |
+| `WAVECONTROL_BOOTSTRAP_PASSWORD` | Initial administrator password | Empty database only |
 
 All other configuration is stored in the `settings` table and configurable via the web UI.
 
@@ -4794,8 +4797,8 @@ All other configuration is stored in the `settings` table and configurable via t
 | Key | Default | Description |
 |-----|---------|-------------|
 | `poll_interval` | 30 | Seconds between poll cycles |
-| `default_username` | ubnt | Default device username |
-| `default_passwords` | ["ubnt"] | JSON array of passwords to try |
+| `ap_cred1_user` … `ap_cred3_pass` | empty | Three explicit AP credential pairs |
+| `sta_cred1_user` … `sta_cred3_pass` | empty | Three explicit STA credential pairs |
 | `firmware_path` | firmware | Firmware file directory (relative to working dir) |
 | `backup_dir` | backups | Config backup directory (relative to working dir) |
 | `aps_per_worker` | 30 | APs per poller thread |
@@ -5460,7 +5463,7 @@ When a device successfully responds to a different protocol than expected, the p
 
 Alert evaluation is server-authoritative and uses two layers:
 
-1. Alert rule targeting: `scope` narrows by inventory group, `target_role` narrows by role (`all`, `ap`, `sta`), and `require_alertable` controls whether per-device alert policy is honored.
+1. Alert rule targeting: `scope` narrows by inventory scope (`all`, `site`, or `device`), `target_role` narrows by role (`all`, `ap`, `sta`), and `require_alertable` controls whether per-device alert policy is honored.
 2. Device alert policy: `devices.alertable`, `devices.alert_silenced_until`, and `devices.alert_notes` define operator intent for each inventory row.
 
 Evaluation order is: enabled rule, scope match, role match, alertable/silence gate, metric existence, threshold condition, duration, cooldown, notification.

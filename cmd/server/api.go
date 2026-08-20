@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,12 +28,13 @@ import (
 
 	"github.com/yellowman/wavecontrol/internal/alerting"
 	"github.com/yellowman/wavecontrol/internal/bulkops"
+	"github.com/yellowman/wavecontrol/internal/configbackup"
 	"github.com/yellowman/wavecontrol/internal/firmware"
 	"github.com/yellowman/wavecontrol/internal/jobs"
 	"github.com/yellowman/wavecontrol/internal/netutil"
 	"github.com/yellowman/wavecontrol/internal/poller"
-	"github.com/yellowman/wavecontrol/internal/push"
 	"github.com/yellowman/wavecontrol/internal/scheduler"
+	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
 	"github.com/yellowman/wavecontrol/internal/tlsutil"
 	"github.com/yellowman/wavecontrol/internal/udebug"
@@ -48,13 +54,14 @@ type API struct {
 	UltraDebug *udebug.Manager
 	BulkOps    *bulkops.Controller
 	Alerts     *alerting.Manager
-	Push       *push.Service
+	Secrets    *secrets.Manager
 }
 
 type Claims struct {
-	UserID   int64    `json:"user_id"`
-	Username string   `json:"username"`
-	Roles    []string `json:"roles"`
+	UserID      int64    `json:"user_id"`
+	Username    string   `json:"username"`
+	Roles       []string `json:"roles"`
+	AuthVersion int64    `json:"auth_version"`
 	jwt.RegisteredClaims
 }
 
@@ -62,7 +69,7 @@ type contextKey string
 
 const claimsKey contextKey = "claims"
 
-func NewAPI(db *sql.DB, secret []byte, statsStore *stats.Store, fwService *firmware.Service, devicePoller *poller.Poller, wsHub *websocket.Hub, jobScheduler *scheduler.Scheduler, jobRunner *jobs.Runner, ultraDebug *udebug.Manager, tlsManager *tlsutil.Manager, bulkOps *bulkops.Controller, alertManager *alerting.Manager, pushService *push.Service) *API {
+func NewAPI(db *sql.DB, secret []byte, statsStore *stats.Store, fwService *firmware.Service, devicePoller *poller.Poller, wsHub *websocket.Hub, jobScheduler *scheduler.Scheduler, jobRunner *jobs.Runner, ultraDebug *udebug.Manager, tlsManager *tlsutil.Manager, bulkOps *bulkops.Controller, alertManager *alerting.Manager, secretStore *secrets.Manager) *API {
 	return &API{
 		DB:         db,
 		JWTSecret:  secret,
@@ -76,46 +83,97 @@ func NewAPI(db *sql.DB, secret []byte, statsStore *stats.Store, fwService *firmw
 		UltraDebug: ultraDebug,
 		BulkOps:    bulkOps,
 		Alerts:     alertManager,
-		Push:       pushService,
+		Secrets:    secretStore,
 	}
+}
+
+const sessionCookieName = "wavecontrol_session"
+
+func tokenFromRequest(r *http.Request) string {
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		return strings.TrimSpace(cookie.Value)
+	}
+	return ""
+}
+
+func (a *API) parseToken(tokenStr string) (*Claims, error) {
+	if tokenStr == "" {
+		return nil, errors.New("missing token")
+	}
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+		if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+			return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
+		}
+		return a.JWTSecret, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithIssuer("wavecontrol"), jwt.WithAudience("wavecontrol-web"))
+	if err != nil || token == nil || !token.Valid || claims.ExpiresAt == nil {
+		return nil, errors.New("invalid token")
+	}
+	return claims, nil
+}
+
+func recognizedRoles(roles []string) []string {
+	seen := make(map[string]struct{}, len(roles))
+	out := make([]string, 0, len(roles))
+	for _, role := range roles {
+		role = strings.ToLower(strings.TrimSpace(role))
+		switch role {
+		case RoleViewer, RoleCreator, RoleEditor, RoleAdmin:
+			if _, ok := seen[role]; !ok {
+				seen[role] = struct{}{}
+				out = append(out, role)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (a *API) currentIdentity(ctx context.Context, userID int64) (string, int64, []string, error) {
+	var username string
+	var status int
+	var authVersion int64
+	var roles pq.StringArray
+	err := a.DB.QueryRowContext(ctx, `
+		SELECT u.username, u.status, u.auth_version,
+		       COALESCE(array_agg(r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), '{}')
+		FROM users u
+		LEFT JOIN user_roles ur ON ur."user" = u.id
+		LEFT JOIN roles r ON r.id = ur.role
+		WHERE u.id = $1
+		GROUP BY u.id, u.username, u.status, u.auth_version
+	`, userID).Scan(&username, &status, &authVersion, &roles)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if status != 1 {
+		return "", 0, nil, errors.New("account disabled")
+	}
+	validRoles := recognizedRoles([]string(roles))
+	if len(validRoles) == 0 {
+		return "", 0, nil, errors.New("account has no application role")
+	}
+	return username, authVersion, validRoles, nil
 }
 
 func (a *API) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var tokenStr string
-
-		// Check Authorization header first (preferred for API calls)
-		auth := r.Header.Get("Authorization")
-		if strings.HasPrefix(auth, "Bearer ") {
-			tokenStr = strings.TrimPrefix(auth, "Bearer ")
-		} else if cookie, err := r.Cookie("token"); err == nil && cookie.Value != "" {
-			// Check cookie (for browser navigation like file downloads)
-			tokenStr = cookie.Value
-		} else if t := r.URL.Query().Get("token"); t != "" {
-			// Query-param tokens ONLY allowed for WebSocket upgrades
-			// This limits exposure since URLs can appear in logs/history
-			if r.Header.Get("Upgrade") != "websocket" {
-				http.Error(w, "query-param tokens only allowed for WebSocket", 401)
-				return
-			}
-			tokenStr = t
-		} else {
-			http.Error(w, "unauthorized", 401)
+		claims, err := a.parseToken(tokenFromRequest(r))
+		if err != nil || claims.UserID <= 0 || claims.AuthVersion <= 0 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-			// Verify signing method to prevent algorithm substitution attacks
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
-			return a.JWTSecret, nil
-		})
-		if err != nil || !token.Valid {
-			http.Error(w, "unauthorized", 401)
+		username, authVersion, roles, err := a.currentIdentity(r.Context(), claims.UserID)
+		if err != nil || authVersion != claims.AuthVersion || username != claims.Username {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		claims.Username = username
+		claims.Roles = roles
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), claimsKey, claims)))
 	})
 }
@@ -258,96 +316,85 @@ func (a *API) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+func requestIsHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookieName, Value: value, Path: "/", MaxAge: maxAge,
+		HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteStrictMode,
+	})
+}
+
 func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	if req.Username == "" || len(req.Username) > 64 || req.Password == "" || len([]byte(req.Password)) > 72 {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	// Get client IP for logging
-	clientIP := r.RemoteAddr
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		clientIP = strings.Split(fwd, ",")[0]
-	}
-
+	clientIP := clientIPFromRequest(r)
 	var id int64
 	var storedHash string
 	var status int
-	err := a.DB.QueryRow(`SELECT id, password, status FROM users WHERE username = $1`, req.Username).Scan(&id, &storedHash, &status)
+	var authVersion int64
+	err := a.DB.QueryRow(`SELECT id, password, status, auth_version FROM users WHERE username = $1`, req.Username).
+		Scan(&id, &storedHash, &status, &authVersion)
+	if err != nil || status != 1 || !verifyPassword(req.Password, storedHash) {
+		logError("LOGIN FAILED: username=%q ip=%s", req.Username, clientIP)
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	username, currentVersion, roles, err := a.currentIdentity(r.Context(), id)
+	if err != nil || currentVersion != authVersion {
+		logError("LOGIN FAILED: role/status lookup username=%q ip=%s: %v", req.Username, clientIP, err)
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
 
-	// Check each condition separately for logging, but return same error to user
+	now := time.Now()
+	claims := &Claims{
+		UserID: id, Username: username, Roles: roles, AuthVersion: authVersion,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer: "wavecontrol", Subject: strconv.FormatInt(id, 10), Audience: jwt.ClaimStrings{"wavecontrol-web"},
+			ExpiresAt: jwt.NewNumericDate(now.Add(24 * time.Hour)), IssuedAt: jwt.NewNumericDate(now), NotBefore: jwt.NewNumericDate(now.Add(-time.Minute)),
+		},
+	}
+	tokenStr, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(a.JWTSecret)
 	if err != nil {
-		logError("LOGIN FAILED: user not found username=%q ip=%s", req.Username, clientIP)
-		http.Error(w, "invalid credentials", 401)
+		logError("Login: JWT signing failed: %v", err)
+		http.Error(w, "authentication error", http.StatusInternalServerError)
 		return
 	}
-	if status != 1 {
-		logError("LOGIN FAILED: account disabled username=%q ip=%s", req.Username, clientIP)
-		http.Error(w, "invalid credentials", 401)
-		return
-	}
-	if !verifyPassword(req.Password, storedHash) {
-		logError("LOGIN FAILED: wrong password username=%q ip=%s", req.Username, clientIP)
-		http.Error(w, "invalid credentials", 401)
-		return
-	}
-
+	setSessionCookie(w, r, tokenStr, 86400)
 	logError("LOGIN SUCCESS: username=%q ip=%s", req.Username, clientIP)
-
-	rows, err := a.DB.Query(`SELECT r.name FROM roles r JOIN user_roles ur ON ur.role = r.id WHERE ur."user" = $1`, id)
-	var roles []string
-	if err != nil {
-		// Log but continue - user can still authenticate without roles
-		logError("query roles: %v", err)
-	} else {
-		defer rows.Close()
-		for rows.Next() {
-			var role string
-			rows.Scan(&role)
-			roles = append(roles, role)
-		}
-	}
-
-	claims := &Claims{UserID: id, Username: req.Username, Roles: roles,
-		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)), IssuedAt: jwt.NewNumericDate(time.Now())}}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenStr, err := token.SignedString(a.JWTSecret)
-	if err != nil {
-		log.Printf("Login: JWT signing failed: %v", err)
-		http.Error(w, "Authentication error", http.StatusInternalServerError)
-		return
-	}
-
-	// Set cookie for browser navigation (e.g., file downloads via <a href>)
-	// JS fetch calls use Authorization header from JSON response
-	http.SetCookie(w, &http.Cookie{
-		Name:     "token",
-		Value:    tokenStr,
-		Path:     "/",
-		MaxAge:   86400, // 24 hours
-		HttpOnly: true,  // Not accessible to JS (they use JSON response)
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	writeJSON(w, map[string]any{"token": tokenStr, "username": req.Username, "roles": roles})
+	writeJSON(w, map[string]any{"username": username, "roles": roles})
 }
 
 func (a *API) Logout(w http.ResponseWriter, r *http.Request) {
-	// Clear the HttpOnly cookie by setting it with Max-Age=0
-	http.SetCookie(w, &http.Cookie{
-		Name:     "token",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1, // Delete immediately
-		HttpOnly: true,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
-		SameSite: http.SameSiteLaxMode,
-	})
+	claims, err := a.parseToken(tokenFromRequest(r))
+	if err == nil && claims.UserID > 0 {
+		if _, err := a.DB.ExecContext(r.Context(), `UPDATE users SET auth_version = auth_version + 1 WHERE id = $1`, claims.UserID); err != nil {
+			// Clear this browser's cookie, but do not claim that all copies of the
+			// session were revoked when the durable version bump failed.
+			setSessionCookie(w, r, "", -1)
+			logError("logout token revocation failed for user %d: %v", claims.UserID, err)
+			http.Error(w, "logout revocation failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	setSessionCookie(w, r, "", -1)
 	writeJSON(w, map[string]any{"status": "ok"})
 }
 
@@ -1045,7 +1092,13 @@ func (a *API) upsertDiscoveredDevice(device *DeviceInfo, ip, username, password 
 	firmware := truncateWithWarning(&warnings, ctx, "firmware", device.Firmware, 128)
 	firmwareVersion := truncateWithWarning(&warnings, ctx, "firmware_version", device.FirmwareVersion, 32)
 	username = truncateWithWarning(&warnings, ctx, "username", username, 64)
-	password = truncateWithWarning(&warnings, ctx, "password", password, 128)
+	if len(password) > 4096 {
+		return nil, fmt.Errorf("device password exceeds 4096 bytes")
+	}
+	storedPassword, err := a.Secrets.Encrypt(password)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt device password: %w", err)
+	}
 
 	var id int64
 	switch {
@@ -1070,7 +1123,7 @@ func (a *API) upsertDiscoveredDevice(device *DeviceInfo, ip, username, password 
 				password = $13
 			WHERE id = $1
 			RETURNING id
-		`, existingID, mac, ip, hostname, product, model, platform, flavor, firmware, firmwareVersion, siteID, username, password).Scan(&id)
+		`, existingID, mac, ip, hostname, product, model, platform, flavor, firmware, firmwareVersion, siteID, username, storedPassword).Scan(&id)
 		if err != nil {
 			return nil, err
 		}
@@ -1079,7 +1132,7 @@ func (a *API) upsertDiscoveredDevice(device *DeviceInfo, ip, username, password 
 			INSERT INTO devices (mac, ip_address, hostname, product, model, platform, flavor, firmware, firmware_version, site_id, managed, alertable, status, last_seen, username, password)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, TRUE, 'online', NOW(), $11, $12)
 			RETURNING id
-		`, mac, ip, hostname, product, model, platform, flavor, firmware, firmwareVersion, siteID, username, password).Scan(&id)
+		`, mac, ip, hostname, product, model, platform, flavor, firmware, firmwareVersion, siteID, username, storedPassword).Scan(&id)
 		if err != nil {
 			return nil, err
 		}
@@ -1310,69 +1363,42 @@ type Credential struct {
 
 // loadCredentials loads AP and STA credentials from settings
 func (a *API) loadCredentials() (apCreds, staCreds []Credential) {
-	// Load AP credentials (up to 3 pairs)
-	for i := 1; i <= 3; i++ {
-		var user, pass string
-		userKey := fmt.Sprintf("ap_cred%d_user", i)
-		passKey := fmt.Sprintf("ap_cred%d_pass", i)
-		a.DB.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user)
-		a.DB.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&pass)
-		if user != "" && pass != "" {
-			apCreds = append(apCreds, Credential{Username: user, Password: pass})
-		}
-	}
-	// Fallback to legacy format
-	if len(apCreds) == 0 {
-		var apUser, apPassJSON string
-		a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'ap_username'`).Scan(&apUser)
-		if apUser == "" {
-			a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'default_username'`).Scan(&apUser)
-		}
-		if apUser == "" {
-			apUser = "ubnt"
-		}
-		if a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'ap_passwords'`).Scan(&apPassJSON) == nil {
-			var passes []string
-			json.Unmarshal([]byte(apPassJSON), &passes)
-			for _, pass := range passes {
-				apCreds = append(apCreds, Credential{Username: apUser, Password: pass})
+	loadPairs := func(prefix string) []Credential {
+		pairs := make([]Credential, 0, 3)
+		for i := 1; i <= 3; i++ {
+			var username, stored string
+			userKey := fmt.Sprintf("%s_cred%d_user", prefix, i)
+			passKey := fmt.Sprintf("%s_cred%d_pass", prefix, i)
+			if err := a.DB.QueryRow(`SELECT value FROM settings WHERE key=$1`, userKey).Scan(&username); err != nil && err != sql.ErrNoRows {
+				logError("load credential %s: %v", userKey, err)
+				continue
+			}
+			if err := a.DB.QueryRow(`SELECT value FROM settings WHERE key=$1`, passKey).Scan(&stored); err != nil && err != sql.ErrNoRows {
+				logError("load credential %s: %v", passKey, err)
+				continue
+			}
+			username = strings.TrimSpace(username)
+			if username == "" || stored == "" {
+				continue
+			}
+			password, err := a.Secrets.Decrypt(stored)
+			if err != nil {
+				logError("decrypt credential %s: %v", passKey, err)
+				continue
+			}
+			if password != "" {
+				pairs = append(pairs, Credential{Username: username, Password: password})
 			}
 		}
-	}
-	if len(apCreds) == 0 {
-		apCreds = []Credential{{Username: "ubnt", Password: "ubnt"}}
+		return pairs
 	}
 
-	// Load STA credentials (up to 3 pairs)
-	for i := 1; i <= 3; i++ {
-		var user, pass string
-		userKey := fmt.Sprintf("sta_cred%d_user", i)
-		passKey := fmt.Sprintf("sta_cred%d_pass", i)
-		a.DB.QueryRow(`SELECT value FROM settings WHERE key = $1`, userKey).Scan(&user)
-		a.DB.QueryRow(`SELECT value FROM settings WHERE key = $1`, passKey).Scan(&pass)
-		if user != "" && pass != "" {
-			staCreds = append(staCreds, Credential{Username: user, Password: pass})
-		}
-	}
-	// Fallback to legacy format
+	apCreds = loadPairs("ap")
+	staCreds = loadPairs("sta")
 	if len(staCreds) == 0 {
-		var staUser, staPassJSON string
-		a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'sta_username'`).Scan(&staUser)
-		if staUser != "" {
-			if a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'sta_passwords'`).Scan(&staPassJSON) == nil {
-				var passes []string
-				json.Unmarshal([]byte(staPassJSON), &passes)
-				for _, pass := range passes {
-					staCreds = append(staCreds, Credential{Username: staUser, Password: pass})
-				}
-			}
-		}
+		staCreds = append([]Credential(nil), apCreds...)
 	}
-	if len(staCreds) == 0 {
-		staCreds = apCreds // Default to AP credentials
-	}
-
-	return
+	return apCreds, staCreds
 }
 
 func (a *API) GetDevice(w http.ResponseWriter, r *http.Request) {
@@ -1481,11 +1507,31 @@ type deviceAlertingRequest struct {
 }
 
 func parseAlertSilenceUntil(req deviceAlertingRequest) (*time.Time, bool, error) {
+	selectors := 0
+	if req.ClearSilence {
+		selectors++
+	}
+	if req.SilenceSeconds != nil {
+		selectors++
+	}
+	if req.AlertSilencedUntil != nil {
+		selectors++
+	}
+	if selectors > 1 {
+		return nil, false, fmt.Errorf("specify only one silence option")
+	}
+	if req.AlertNotes != nil && len([]rune(*req.AlertNotes)) > 2000 {
+		return nil, false, fmt.Errorf("alert_notes must be at most 2000 characters")
+	}
 	if req.ClearSilence {
 		return nil, true, nil
 	}
 	if req.SilenceSeconds != nil {
-		if *req.SilenceSeconds <= 0 {
+		const maxSilenceSeconds = 31 * 24 * 60 * 60
+		if *req.SilenceSeconds < 0 || *req.SilenceSeconds > maxSilenceSeconds {
+			return nil, false, fmt.Errorf("silence_seconds must be between 0 and %d", maxSilenceSeconds)
+		}
+		if *req.SilenceSeconds == 0 {
 			return nil, true, nil
 		}
 		t := time.Now().Add(time.Duration(*req.SilenceSeconds) * time.Second)
@@ -1505,64 +1551,76 @@ func parseAlertSilenceUntil(req deviceAlertingRequest) (*time.Time, bool, error)
 	return nil, false, nil
 }
 
-func (a *API) updateDeviceAlertPolicy(deviceID int64, req deviceAlertingRequest, userID int64) (map[string]any, error) {
+func (a *API) updateDeviceAlertPolicy(ctx context.Context, deviceID int64, req deviceAlertingRequest, userID int64) (map[string]any, error) {
+	if deviceID <= 0 {
+		return nil, fmt.Errorf("invalid device id")
+	}
+	until, setSilence, err := parseAlertSilenceUntil(req)
+	if err != nil {
+		return nil, err
+	}
+
 	sets := []string{"updated_at = NOW()"}
 	args := []any{}
 	arg := func(v any) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
-
 	if req.Alertable != nil {
 		sets = append(sets, "alertable = "+arg(*req.Alertable))
 	}
 	if req.AlertNotes != nil {
-		sets = append(sets, "alert_notes = "+arg(*req.AlertNotes))
+		sets = append(sets, "alert_notes = "+arg(strings.TrimSpace(*req.AlertNotes)))
 	}
-	if until, setSilence, err := parseAlertSilenceUntil(req); err != nil {
-		return nil, err
-	} else if setSilence {
+	if setSilence {
 		if until == nil {
 			sets = append(sets, "alert_silenced_until = NULL")
 		} else {
 			sets = append(sets, "alert_silenced_until = "+arg(*until))
 		}
 	}
-
 	idRef := arg(deviceID)
-	query := fmt.Sprintf(`UPDATE devices SET %s WHERE id = %s`, strings.Join(sets, ", "), idRef)
-	res, err := a.DB.Exec(query, args...)
+	query := fmt.Sprintf(`UPDATE devices SET %s WHERE id = %s
+		RETURNING lower(mac), COALESCE(alertable, false), alert_silenced_until, alert_notes`, strings.Join(sets, ", "), idRef)
+
+	tx, err := a.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return nil, sql.ErrNoRows
-	}
-
+	defer tx.Rollback()
 	var mac sql.NullString
 	var alertable bool
 	var silenced sql.NullTime
 	var notes sql.NullString
-	if err := a.DB.QueryRow(`
-		SELECT lower(mac), COALESCE(alertable, true), alert_silenced_until, alert_notes
-		FROM devices WHERE id = $1
-	`, deviceID).Scan(&mac, &alertable, &silenced, &notes); err != nil {
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&mac, &alertable, &silenced, &notes); err != nil {
 		return nil, err
 	}
 
-	shouldResolve := false
-	if req.Alertable != nil && !*req.Alertable {
-		shouldResolve = true
-	}
-	if silenced.Valid && time.Now().Before(silenced.Time) {
-		shouldResolve = true
-	}
+	shouldResolve := !alertable || (silenced.Valid && time.Now().Before(silenced.Time))
 	if shouldResolve {
-		_, _ = a.DB.Exec(`
-			UPDATE alerts SET status = 'resolved', resolved_at = NOW()
-			WHERE device_id = $1 AND status IN ('active', 'acknowledged')
-		`, deviceID)
-		_, _ = a.DB.Exec(`DELETE FROM alert_states WHERE device_id = $1`, deviceID)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE alert_notification_outbox o
+			SET status='dead', last_error='notification canceled because device alerting was disabled or silenced', updated_at=NOW()
+			FROM alerts alert
+			WHERE o.alert_id=alert.id AND alert.device_id=$1 AND o.status IN ('pending','failed')
+		`, deviceID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE alerts SET status='resolved', resolved_at=NOW()
+			WHERE device_id=$1 AND status IN ('active','acknowledged')
+		`, deviceID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM alert_states WHERE device_id=$1`, deviceID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if shouldResolve && a.Alerts != nil {
+		a.Alerts.ClearDeviceState(int(deviceID))
 	}
 
 	changeParts := []string{}
@@ -1571,7 +1629,7 @@ func (a *API) updateDeviceAlertPolicy(deviceID int64, req deviceAlertingRequest,
 	}
 	if silenced.Valid {
 		changeParts = append(changeParts, "silenced_until="+silenced.Time.Format(time.RFC3339))
-	} else if req.ClearSilence || req.SilenceSeconds != nil || req.AlertSilencedUntil != nil {
+	} else if setSilence {
 		changeParts = append(changeParts, "silence=cleared")
 	}
 	if req.AlertNotes != nil {
@@ -1581,11 +1639,7 @@ func (a *API) updateDeviceAlertPolicy(deviceID int64, req deviceAlertingRequest,
 		a.logChangelogDevice(mac.String, "alert policy: "+strings.Join(changeParts, ", "), userID)
 	}
 
-	patch := map[string]any{
-		"id":          deviceID,
-		"alertable":   alertable,
-		"alert_notes": notes.String,
-	}
+	patch := map[string]any{"id": deviceID, "alertable": alertable, "alert_notes": notes.String}
 	if silenced.Valid {
 		patch["alert_silenced_until"] = silenced.Time
 	} else {
@@ -1608,11 +1662,13 @@ func (a *API) UpdateDeviceAlerting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req deviceAlertingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		http.Error(w, "invalid json", 400)
 		return
 	}
-	patch, err := a.updateDeviceAlertPolicy(deviceID, req, claims.UserID)
+	patch, err := a.updateDeviceAlertPolicy(r.Context(), deviceID, req, claims.UserID)
 	if err == sql.ErrNoRows {
 		http.Error(w, "not found", 404)
 		return
@@ -1637,7 +1693,9 @@ func (a *API) BulkUpdateDeviceAlerting(w http.ResponseWriter, r *http.Request) {
 		SilenceSeconds     *int    `json:"silence_seconds"`
 		ClearSilence       bool    `json:"clear_silence"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		http.Error(w, "invalid json", 400)
 		return
 	}
@@ -1659,7 +1717,7 @@ func (a *API) BulkUpdateDeviceAlerting(w http.ResponseWriter, r *http.Request) {
 
 	results := []map[string]any{}
 	for _, id := range req.DeviceIDs {
-		patch, err := a.updateDeviceAlertPolicy(id, policyReq, claims.UserID)
+		patch, err := a.updateDeviceAlertPolicy(r.Context(), id, policyReq, claims.UserID)
 		if err != nil {
 			results = append(results, map[string]any{"device_id": id, "ok": false, "error": err.Error()})
 			continue
@@ -1674,47 +1732,40 @@ func (a *API) BulkUpdateDeviceAlerting(w http.ResponseWriter, r *http.Request) {
 // This keeps scheme selection in one place instead of scattering hardcoded http/https across
 // the frontend.
 func (a *API) OpenDeviceUI(w http.ResponseWriter, r *http.Request) {
-	// Convenience endpoint for opening a device UI in a new tab.
-	//
-	// We intentionally only allow literal IPs here (no hostnames) to avoid turning this
-	// into an open-redirect to arbitrary domains.
-	ip := strings.TrimSpace(r.URL.Query().Get("ip"))
-	if ip == "" {
-		http.Error(w, "missing ip", http.StatusBadRequest)
+	if !a.requireView(w, r) {
+		return
+	}
+	// Resolve the destination strictly from inventory. Accepting a caller-supplied
+	// IP here would turn the server into an authenticated internal-network probe.
+	deviceID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("device_id")), 10, 64)
+	if err != nil || deviceID <= 0 {
+		http.Error(w, "valid device_id required", http.StatusBadRequest)
+		return
+	}
+	var ip string
+	var platformNS sql.NullString
+	if err := a.DB.QueryRowContext(r.Context(), `
+		SELECT host(ip_address), platform
+		FROM devices
+		WHERE id = $1 AND ip_address IS NOT NULL
+	`, deviceID).Scan(&ip, &platformNS); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "device not found or has no management IP", http.StatusNotFound)
+		} else {
+			http.Error(w, "database error", http.StatusInternalServerError)
+		}
 		return
 	}
 	if net.ParseIP(ip) == nil {
-		http.Error(w, "invalid ip", http.StatusBadRequest)
+		http.Error(w, "device has invalid management IP", http.StatusInternalServerError)
 		return
 	}
-
-	// Platform improves scheme guessing (some platforms default to https).
-	// NOTE: platform may be NULL for newly-added or not-yet-polled devices.
-	var platformNS sql.NullString
-	if err := a.DB.QueryRow(
-		`SELECT platform FROM devices WHERE deleted_at IS NULL AND host(ip_address) = $1 LIMIT 1`,
-		ip,
-	).Scan(&platformNS); err != nil && err != sql.ErrNoRows {
-		// Don't fail hard – this endpoint is best-effort.
-		log.Printf("open-ui: platform lookup failed for %s: %v", ip, err)
-	}
-
-	platform := "unknown"
-	if platformNS.Valid {
-		p := strings.ToLower(strings.TrimSpace(platformNS.String))
-		if p != "" {
-			platform = p
-		}
-	}
-
+	platform := strings.ToLower(strings.TrimSpace(platformNS.String))
 	scheme := netutil.ResolveScheme(ip, netutil.SchemeHint{Platform: platform})
 	if scheme == "" {
-		// Very defensive fallback – ResolveScheme should always return a value.
 		scheme = "https"
 	}
-	// NOTE: Keep target strictly to "scheme://ip/" (no path passthrough).
-	target := fmt.Sprintf("%s://%s/", scheme, ip)
-	http.Redirect(w, r, target, http.StatusFound)
+	http.Redirect(w, r, fmt.Sprintf("%s://%s/", scheme, ip), http.StatusFound)
 }
 
 func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
@@ -2023,7 +2074,10 @@ func (a *API) UpdateDeviceAntenna(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) RefreshDevice(w http.ResponseWriter, r *http.Request) {
-	// RefreshDevice is read-like operation, allow for viewers
+	// Refresh only polls the device and does not change its configuration.
+	if !a.requireView(w, r) {
+		return
+	}
 	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	logDebug("RefreshDevice API: id=%d", id)
 	if err := a.Poller.RefreshDeviceByID(id); err != nil {
@@ -2111,7 +2165,7 @@ func (a *API) UploadFirmware(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
 
 	// Parse multipart form
-	if err := r.ParseMultipartForm(1 << 30); err != nil {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "file too large or invalid form", 400)
 		return
 	}
@@ -2134,6 +2188,9 @@ func (a *API) UploadFirmware(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Absolute server paths are internal implementation details. Firmware is
+	// subsequently addressed through its stable ID/relative path.
+	fw.Path = ""
 	writeJSON(w, fw)
 }
 
@@ -2149,7 +2206,11 @@ func (a *API) DeleteFirmware(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.Firmware.DeleteFirmware(name); err != nil {
-		http.Error(w, err.Error(), 400)
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			http.Error(w, "firmware not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -2157,25 +2218,26 @@ func (a *API) DeleteFirmware(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) DownloadFirmware(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
-	if name == "" {
-		http.Error(w, "missing firmware name", 400)
+	if !a.requireView(w, r) {
 		return
 	}
-
-	path, err := a.Firmware.GetFirmwareFilePath(name)
+	reference := chi.URLParam(r, "name")
+	if reference == "" {
+		http.Error(w, "missing firmware reference", http.StatusBadRequest)
+		return
+	}
+	fw, err := a.Firmware.GetFirmwareInfo(reference)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			http.Error(w, err.Error(), 404)
-			return
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			http.Error(w, "firmware not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 		}
-		http.Error(w, err.Error(), 400)
 		return
 	}
-
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fw.Name))
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeFile(w, r, path)
+	http.ServeFile(w, r, fw.Path)
 }
 
 func (a *API) UpgradeDevice(w http.ResponseWriter, r *http.Request) {
@@ -2191,9 +2253,26 @@ func (a *API) UpgradeDevice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", 400)
 		return
 	}
+	if id <= 0 || strings.TrimSpace(req.Firmware) == "" {
+		http.Error(w, "valid device id and firmware are required", http.StatusBadRequest)
+		return
+	}
 	result, err := a.Firmware.UpgradeDevice(r.Context(), id, req.Firmware, req.Force)
 	if err != nil {
-		logError("Upgrade error: %v", err)
+		logError("Upgrade error for device %d: %v", id, err)
+		status := http.StatusBadGateway
+		switch {
+		case errors.Is(err, sql.ErrNoRows), strings.Contains(strings.ToLower(err.Error()), "device not found"), strings.Contains(strings.ToLower(err.Error()), "firmware not found"):
+			status = http.StatusNotFound
+		case strings.Contains(strings.ToLower(err.Error()), "invalid"):
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	if result == nil {
+		http.Error(w, "firmware service returned no result", http.StatusInternalServerError)
+		return
 	}
 	if claims := getClaims(r); claims != nil {
 		a.logChangelogDeviceByUsername(result.DeviceMAC, fmt.Sprintf("upgrade: %s", result.Status), claims.Username)
@@ -2220,7 +2299,9 @@ func (a *API) UpgradeFanout(w http.ResponseWriter, r *http.Request) {
 	}
 	if claims := getClaims(r); claims != nil {
 		for _, result := range results {
-			a.logChangelogDeviceByUsername(result.DeviceMAC, fmt.Sprintf("fanout: %s", result.Status), claims.Username)
+			if result != nil {
+				a.logChangelogDeviceByUsername(result.DeviceMAC, fmt.Sprintf("fanout: %s", result.Status), claims.Username)
+			}
 		}
 	}
 	writeJSON(w, map[string]any{"results": results})
@@ -2267,7 +2348,9 @@ func (a *API) RetryUpgradeWithCredentials(w http.ResponseWriter, r *http.Request
 	results := a.Firmware.RetryUpgradeWithCredentials(r.Context(), req.DeviceIDs, req.Username, req.Password, req.Force)
 	if claims := getClaims(r); claims != nil {
 		for _, result := range results {
-			a.logChangelogDeviceByUsername(result.DeviceMAC, fmt.Sprintf("retry upgrade: %s", result.Status), claims.Username)
+			if result != nil {
+				a.logChangelogDeviceByUsername(result.DeviceMAC, fmt.Sprintf("retry upgrade: %s", result.Status), claims.Username)
+			}
 		}
 	}
 	writeJSON(w, map[string]any{"results": results})
@@ -2351,16 +2434,11 @@ func (a *API) ListUsers(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		var username string
 		var status int
-		var roles string
+		var roles pq.StringArray
 		if err := rows.Scan(&id, &username, &status, &roles); err != nil {
 			continue
 		}
-		roleList := []string{}
-		roles = strings.Trim(roles, "{}")
-		if roles != "" {
-			roleList = strings.Split(roles, ",")
-		}
-		users = append(users, map[string]any{"id": id, "username": username, "status": status, "roles": roleList})
+		users = append(users, map[string]any{"id": id, "username": username, "status": status, "roles": []string(roles)})
 	}
 	if users == nil {
 		users = []map[string]any{}
@@ -2373,84 +2451,220 @@ func (a *API) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Username, Password string
-		Roles              []string
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Roles    []string `json:"roles"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if req.Username == "" || req.Password == "" {
-		http.Error(w, "username and password required", 400)
+	req.Username = strings.TrimSpace(req.Username)
+	if req.Username == "" || len(req.Username) > 64 {
+		http.Error(w, "username must be between 1 and 64 characters", http.StatusBadRequest)
 		return
 	}
-	var id int64
-	err := a.DB.QueryRow(`INSERT INTO users (username, password, status) VALUES ($1, $2, 1) RETURNING id`, req.Username, hashPassword(req.Password)).Scan(&id)
+	passwordHash, err := hashPassword(req.Password)
 	if err != nil {
-		logError("CreateUser insert error: %v", err)
-		http.Error(w, "create user failed", 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	for _, role := range req.Roles {
-		var rid int64
-		if a.DB.QueryRow(`SELECT id FROM roles WHERE name = $1`, role).Scan(&rid) == nil {
-			if _, err := a.DB.Exec(`INSERT INTO user_roles ("user", role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, id, rid); err != nil {
-				log.Printf("Failed to add role %s for new user %d: %v", role, id, err)
-			}
-		}
+	roles, err := validateRequestedRoles(req.Roles)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	writeJSON(w, map[string]any{"id": id, "username": req.Username})
-}
 
-func (a *API) UpdateUser(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	claims := getClaims(r)
-	isSelf := claims != nil && claims.UserID == id
-	isAdm := a.isAdmin(r)
-	if !isAdm && !isSelf {
-		http.Error(w, "forbidden", 403)
+	tx, err := a.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
-	var req struct {
-		Password string
-		Status   *int
-		Roles    []string
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", 400)
+	defer tx.Rollback()
+
+	var id int64
+	if err := tx.QueryRowContext(r.Context(), `
+		INSERT INTO users (username, password, status, auth_version)
+		VALUES ($1, $2, 1, 1) RETURNING id
+	`, req.Username, passwordHash).Scan(&id); err != nil {
+		logError("CreateUser insert error: %v", err)
+		http.Error(w, "create user failed", http.StatusConflict)
 		return
 	}
-	if req.Password != "" {
-		if _, err := a.DB.Exec(`UPDATE users SET password = $1 WHERE id = $2`, hashPassword(req.Password), id); err != nil {
-			log.Printf("Failed to update password for user %d: %v", id, err)
-			http.Error(w, "database error", 500)
+	for _, role := range roles {
+		result, err := tx.ExecContext(r.Context(), `
+			INSERT INTO user_roles ("user", role)
+			SELECT $1, id FROM roles WHERE name = $2
+		`, id, role)
+		if err != nil {
+			http.Error(w, "create user failed", http.StatusInternalServerError)
+			return
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			http.Error(w, "unknown role", http.StatusBadRequest)
 			return
 		}
 	}
-	if isAdm {
-		if req.Status != nil {
-			if _, err := a.DB.Exec(`UPDATE users SET status = $1 WHERE id = $2`, *req.Status, id); err != nil {
-				log.Printf("Failed to update status for user %d: %v", id, err)
-				http.Error(w, "database error", 500)
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "create user failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"id": id, "username": req.Username, "roles": roles})
+}
+
+func (a *API) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	claims := getClaims(r)
+	isSelf := claims != nil && claims.UserID == id
+	isAdmin := a.isAdmin(r)
+	if !isAdmin && !isSelf {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		Password string   `json:"password"`
+		Status   *int     `json:"status"`
+		Roles    []string `json:"roles"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if !isAdmin && (req.Status != nil || req.Roles != nil) {
+		http.Error(w, "only administrators may change status or roles", http.StatusForbidden)
+		return
+	}
+	if isSelf && (req.Status != nil || req.Roles != nil) {
+		http.Error(w, "cannot change your own status or roles", http.StatusBadRequest)
+		return
+	}
+	if req.Status != nil && *req.Status != 0 && *req.Status != 1 {
+		http.Error(w, "status must be 0 or 1", http.StatusBadRequest)
+		return
+	}
+
+	var passwordHash string
+	if req.Password != "" {
+		passwordHash, err = hashPassword(req.Password)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	var roles []string
+	if req.Roles != nil {
+		roles, err = validateRequestedRoles(req.Roles)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	tx, err := a.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(r.Context(), `SELECT pg_advisory_xact_lock(924701)`); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	var currentStatus int
+	var currentAdmin bool
+	if err := tx.QueryRowContext(r.Context(), `
+		SELECT u.status,
+		       EXISTS (
+		           SELECT 1
+		             FROM user_roles ur
+		             JOIN roles role ON role.id = ur.role
+		            WHERE ur."user" = u.id AND role.name = $2
+		       )
+		  FROM users u
+		 WHERE u.id = $1
+		 FOR UPDATE
+	`, id, RoleAdmin).Scan(&currentStatus, &currentAdmin); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "database error", http.StatusInternalServerError)
+		}
+		return
+	}
+	removesActiveAdministrator := currentStatus == 1 && currentAdmin &&
+		((req.Status != nil && *req.Status == 0) || (req.Roles != nil && !slices.Contains(roles, RoleAdmin)))
+	if removesActiveAdministrator {
+		var otherActiveAdministrators int
+		if err := tx.QueryRowContext(r.Context(), `
+			SELECT COUNT(DISTINCT u.id)
+			  FROM users u
+			  JOIN user_roles ur ON ur."user" = u.id
+			  JOIN roles role ON role.id = ur.role
+			 WHERE u.status = 1 AND role.name = $1 AND u.id <> $2
+		`, RoleAdmin, id).Scan(&otherActiveAdministrators); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		if otherActiveAdministrators == 0 {
+			http.Error(w, "cannot disable or demote the last active administrator", http.StatusConflict)
+			return
+		}
+	}
+
+	changed := false
+	if passwordHash != "" {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE users SET password=$1 WHERE id=$2`, passwordHash, id); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		changed = true
+	}
+	if req.Status != nil {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE users SET status=$1 WHERE id=$2`, *req.Status, id); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		changed = true
+	}
+	if req.Roles != nil {
+		if _, err := tx.ExecContext(r.Context(), `DELETE FROM user_roles WHERE "user"=$1`, id); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		for _, role := range roles {
+			result, err := tx.ExecContext(r.Context(), `
+				INSERT INTO user_roles ("user", role)
+				SELECT $1, id FROM roles WHERE name=$2
+			`, id, role)
+			if err != nil {
+				http.Error(w, "database error", http.StatusInternalServerError)
+				return
+			}
+			if rows, _ := result.RowsAffected(); rows != 1 {
+				http.Error(w, "unknown role", http.StatusBadRequest)
 				return
 			}
 		}
-		if req.Roles != nil {
-			if _, err := a.DB.Exec(`DELETE FROM user_roles WHERE "user" = $1`, id); err != nil {
-				log.Printf("Failed to delete roles for user %d: %v", id, err)
-				http.Error(w, "database error", 500)
-				return
-			}
-			for _, role := range req.Roles {
-				var rid int64
-				if a.DB.QueryRow(`SELECT id FROM roles WHERE name = $1`, role).Scan(&rid) == nil {
-					if _, err := a.DB.Exec(`INSERT INTO user_roles ("user", role) VALUES ($1, $2)`, id, rid); err != nil {
-						log.Printf("Failed to add role %s for user %d: %v", role, id, err)
-						// Continue - partial success is acceptable for roles
-					}
-				}
-			}
+		changed = true
+	}
+	if changed {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE users SET auth_version=auth_version+1 WHERE id=$1`, id); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
 	}
 	writeJSON(w, map[string]any{"status": "ok"})
 }
@@ -2460,60 +2674,76 @@ func (a *API) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil || id == 0 {
-		http.Error(w, "invalid user id", 400)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	if claims := getClaims(r); claims != nil && claims.UserID == id {
+		http.Error(w, "cannot delete yourself", http.StatusBadRequest)
 		return
 	}
 
-	// Check if trying to delete self
-	claims := getClaims(r)
-	if claims != nil {
-		var selfID int64
-		a.DB.QueryRow(`SELECT id FROM users WHERE username = $1`, claims.Username).Scan(&selfID)
-		if selfID == id {
-			http.Error(w, "cannot delete yourself", 400)
+	tx, err := a.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(r.Context(), `SELECT pg_advisory_xact_lock(924701)`); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	var currentStatus int
+	var currentAdmin bool
+	if err := tx.QueryRowContext(r.Context(), `
+		SELECT u.status,
+		       EXISTS (
+		           SELECT 1
+		             FROM user_roles ur
+		             JOIN roles role ON role.id = ur.role
+		            WHERE ur."user" = u.id AND role.name = $2
+		       )
+		  FROM users u
+		 WHERE u.id = $1
+		 FOR UPDATE
+	`, id, RoleAdmin).Scan(&currentStatus, &currentAdmin); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "database error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if currentStatus == 1 && currentAdmin {
+		var otherActiveAdministrators int
+		if err := tx.QueryRowContext(r.Context(), `
+			SELECT COUNT(DISTINCT u.id)
+			  FROM users u
+			  JOIN user_roles ur ON ur."user" = u.id
+			  JOIN roles role ON role.id = ur.role
+			 WHERE u.status = 1 AND role.name = $1 AND u.id <> $2
+		`, RoleAdmin, id).Scan(&otherActiveAdministrators); err != nil {
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		if otherActiveAdministrators == 0 {
+			http.Error(w, "cannot delete the last active administrator", http.StatusConflict)
 			return
 		}
 	}
-
-	// Clear all FK references to this user before deletion
-	// These tables have created_by, pinned_by, or acknowledged_by columns referencing users
-	clearQueries := []string{
-		`UPDATE changelog SET "user" = NULL WHERE "user" = $1`,
-		`UPDATE scheduled_jobs SET created_by = NULL WHERE created_by = $1`,
-		`UPDATE device_configs SET created_by = NULL WHERE created_by = $1`,
-		`UPDATE device_certs SET pinned_by = NULL WHERE pinned_by = $1`,
-		`UPDATE alert_rules SET created_by = NULL WHERE created_by = $1`,
-		`UPDATE alerts SET acknowledged_by = NULL WHERE acknowledged_by = $1`,
-		`UPDATE reports SET created_by = NULL WHERE created_by = $1`,
-		`UPDATE job_runs SET created_by = NULL WHERE created_by = $1`,
-		`UPDATE maintenance_windows SET created_by = NULL WHERE created_by = $1`,
-	}
-	for _, q := range clearQueries {
-		if _, err := a.DB.Exec(q, id); err != nil {
-			logError("DeleteUser clear FK: %v", err)
-		}
-	}
-
-	// Delete user roles (may cascade automatically, but be explicit)
-	if _, err := a.DB.Exec(`DELETE FROM user_roles WHERE "user" = $1`, id); err != nil {
-		logError("DeleteUser roles: %v", err)
-	}
-
-	// Delete user
-	result, err := a.DB.Exec(`DELETE FROM users WHERE id = $1`, id)
+	result, err := tx.ExecContext(r.Context(), `DELETE FROM users WHERE id=$1`, id)
 	if err != nil {
-		logError("DeleteUser: %v", err)
-		http.Error(w, "failed to delete user: "+err.Error(), 500)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		http.Error(w, "user not found", 404)
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
-
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]any{"status": "ok", "deleted": id})
 }
 
@@ -2547,55 +2777,404 @@ func (a *API) ListSettings(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
 	}
-
-	rows, err := a.DB.Query(`SELECT key, value FROM settings ORDER BY key`)
+	rows, err := a.DB.QueryContext(r.Context(), `SELECT key, value FROM settings ORDER BY key`)
 	if err != nil {
-		logError("ListSettings query error: %v", err)
-		http.Error(w, "query failed", 500)
+		http.Error(w, "query failed", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
-
 	settings := map[string]string{}
 	for rows.Next() {
 		var key, value string
 		if err := rows.Scan(&key, &value); err != nil {
-			continue
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
 		}
-		settings[key] = value
+		if secrets.IsSecretSetting(key) && value != "" {
+			settings[key] = secrets.MaskedValue
+		} else {
+			settings[key] = value
+		}
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "query failed", http.StatusInternalServerError)
+		return
 	}
 	writeJSON(w, settings)
 }
+
+type settingPatch struct {
+	Value string
+	Clear bool
+}
+
+var errUnknownSetting = errors.New("unknown setting")
 
 func (a *API) UpdateSetting(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
 	}
-	key := chi.URLParam(r, "key")
+	key := strings.TrimSpace(chi.URLParam(r, "key"))
+	if key == "" || len(key) > 64 {
+		http.Error(w, "invalid setting key", http.StatusBadRequest)
+		return
+	}
 	var req struct {
 		Value string `json:"value"`
+		Clear bool   `json:"clear,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	_, err := a.DB.Exec(`INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2`, key, req.Value)
+	restart, err := a.applySettingUpdates(r.Context(), map[string]settingPatch{key: {Value: req.Value, Clear: req.Clear}})
 	if err != nil {
-		logError("UpdateSetting error: %v", err)
-		http.Error(w, "update failed", 500)
+		writeSettingError(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"status": "ok"})
+	writeJSON(w, map[string]any{"status": "ok", "restart_required": restart})
 }
 
-// hashPassword creates a bcrypt hash of the password
-func hashPassword(password string) string {
+// UpdateSettings applies a settings form atomically. Credential usernames and
+// passwords are therefore never reloaded as mismatched half-updated pairs.
+func (a *API) UpdateSettings(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	var req struct {
+		Settings map[string]string `json:"settings"`
+		Clear    []string          `json:"clear,omitempty"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if len(req.Settings)+len(req.Clear) == 0 || len(req.Settings)+len(req.Clear) > 100 {
+		http.Error(w, "between 1 and 100 settings are required", http.StatusBadRequest)
+		return
+	}
+	updates := make(map[string]settingPatch, len(req.Settings)+len(req.Clear))
+	for key, value := range req.Settings {
+		key = strings.TrimSpace(key)
+		if key == "" || len(key) > 64 {
+			http.Error(w, "invalid setting key", http.StatusBadRequest)
+			return
+		}
+		updates[key] = settingPatch{Value: value}
+	}
+	for _, key := range req.Clear {
+		key = strings.TrimSpace(key)
+		if key == "" || len(key) > 64 {
+			http.Error(w, "invalid setting key", http.StatusBadRequest)
+			return
+		}
+		if _, exists := updates[key]; exists {
+			http.Error(w, fmt.Sprintf("setting %q cannot be updated and cleared together", key), http.StatusBadRequest)
+			return
+		}
+		updates[key] = settingPatch{Clear: true}
+	}
+	restart, err := a.applySettingUpdates(r.Context(), updates)
+	if err != nil {
+		writeSettingError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"status": "ok", "restart_required": restart})
+}
+
+func writeSettingError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, errUnknownSetting) {
+		status = http.StatusNotFound
+	} else if strings.Contains(err.Error(), "runtime reload") || strings.Contains(err.Error(), "database") || strings.Contains(err.Error(), "encrypt") {
+		status = http.StatusInternalServerError
+	}
+	http.Error(w, err.Error(), status)
+}
+
+func (a *API) applySettingUpdates(ctx context.Context, updates map[string]settingPatch) ([]string, error) {
+	tx, err := a.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT key,value FROM settings FOR UPDATE`)
+	if err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+	current := map[string]string{}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("database error: %w", err)
+		}
+		current[key] = value
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	changed := make(map[string]string, len(updates))
+	for key, update := range updates {
+		if _, exists := current[key]; !exists {
+			return nil, fmt.Errorf("%w: %s", errUnknownSetting, key)
+		}
+		value := update.Value
+		if update.Clear {
+			value = ""
+		}
+		if secrets.IsSecretSetting(key) {
+			if !update.Clear && (value == "" || value == secrets.MaskedValue) {
+				continue
+			}
+			if err := validateSettingValue(key, value); err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			if value != "" {
+				if a.Secrets == nil {
+					return nil, errors.New("encrypt setting: secret store is unavailable")
+				}
+				value, err = a.Secrets.Encrypt(value)
+				if err != nil {
+					return nil, fmt.Errorf("encrypt setting: %w", err)
+				}
+			}
+		} else if err := validateSettingValue(key, value); err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		current[key] = value
+		changed[key] = value
+	}
+
+	if err := validateSettingsSnapshot(current); err != nil {
+		return nil, err
+	}
+	for key, value := range changed {
+		if _, err := tx.ExecContext(ctx, `UPDATE settings SET value=$1,updated_at=NOW() WHERE key=$2`, value, key); err != nil {
+			return nil, fmt.Errorf("database error: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	if a.Firmware != nil {
+		if err := a.Firmware.ReloadConfig(); err != nil {
+			return nil, fmt.Errorf("setting saved but firmware runtime reload failed: %w", err)
+		}
+	}
+	if a.Poller != nil {
+		a.Poller.ReloadSettings()
+	}
+	if a.Alerts != nil {
+		if err := a.Alerts.Reload(); err != nil {
+			return nil, fmt.Errorf("setting saved but alert runtime reload failed: %w", err)
+		}
+	}
+
+	restartSet := map[string]struct{}{}
+	for key := range changed {
+		switch key {
+		case "listen_addr", "zabbix_enabled", "zabbix_listen", "zabbix_allowed_hosts", "cors_origins", "csp_img_sources", "csp_connect_sources":
+			restartSet[key] = struct{}{}
+		}
+	}
+	restart := make([]string, 0, len(restartSet))
+	for key := range restartSet {
+		restart = append(restart, key)
+	}
+	sort.Strings(restart)
+	return restart, nil
+}
+
+func validateSettingValue(key, value string) error {
+	if len(value) > 1<<20 || strings.ContainsRune(value, '\x00') {
+		return errors.New("value is too large or contains a NUL byte")
+	}
+	trimmed := strings.TrimSpace(value)
+	switch key {
+	case "poll_interval":
+		return validateSettingInt(trimmed, 5, 3600)
+	case "poller_workers":
+		return validateSettingInt(trimmed, 1, 500)
+	case "scheduler_max_concurrent":
+		return validateSettingInt(trimmed, 1, 100)
+	case "scheduler_check_interval":
+		return validateSettingInt(trimmed, 1, 3600)
+	case "smtp_port":
+		return validateSettingInt(trimmed, 1, 65535)
+	case "chain_imbalance_threshold_db", "rx_mismatch_threshold_db":
+		return validateSettingInt(trimmed, 1, 100)
+	case "interference_warning_pct", "interference_critical_pct":
+		v, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
+			return errors.New("must be a finite number between 0 and 100")
+		}
+	case "zabbix_enabled", "scheduler_respect_maintenance", "wave_peer_fallback", "wave_mlo_multi_radio":
+		if trimmed != "true" && trimmed != "false" {
+			return errors.New("must be true or false")
+		}
+	case "listen_addr", "zabbix_listen":
+		if err := validateListenAddress(trimmed); err != nil {
+			return err
+		}
+	case "zabbix_server":
+		if trimmed != "" {
+			if strings.ContainsAny(trimmed, " \t\r\n") {
+				return errors.New("must be a hostname or host:port")
+			}
+			if _, _, err := net.SplitHostPort(trimmed); err != nil && strings.Contains(trimmed, ":") && net.ParseIP(trimmed) == nil {
+				return errors.New("must be a hostname, IP address, or host:port")
+			}
+		}
+	case "management_prefixes":
+		var prefixes []string
+		if err := json.Unmarshal([]byte(trimmed), &prefixes); err != nil {
+			return errors.New("must be a JSON array of CIDR prefixes")
+		}
+		for _, prefix := range prefixes {
+			if _, _, err := net.ParseCIDR(strings.TrimSpace(prefix)); err != nil {
+				return fmt.Errorf("invalid CIDR %q", prefix)
+			}
+		}
+	case "zabbix_allowed_hosts":
+		for _, item := range strings.Split(trimmed, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			if net.ParseIP(item) == nil {
+				if _, _, err := net.ParseCIDR(item); err != nil && strings.ContainsAny(item, " /\\\t\r\n") {
+					return fmt.Errorf("invalid allowed host %q", item)
+				}
+			}
+		}
+	case "cors_origins":
+		if trimmed == "" {
+			break
+		}
+		if trimmed == "*" {
+			return errors.New("wildcard origins are forbidden with cookie authentication")
+		}
+		origins := []string{trimmed}
+		if strings.HasPrefix(trimmed, "[") {
+			if err := json.Unmarshal([]byte(trimmed), &origins); err != nil {
+				return errors.New("must be an origin or JSON array of origins")
+			}
+		}
+		for _, origin := range origins {
+			if _, err := normalizeOrigin(origin); err != nil {
+				return err
+			}
+		}
+	case "csp_img_sources", "csp_connect_sources":
+		if strings.ContainsAny(value, ";\r\n\"'") {
+			return errors.New("contains a forbidden CSP delimiter")
+		}
+		for _, source := range strings.Fields(value) {
+			if !strings.HasPrefix(source, "https://") && !(key == "csp_connect_sources" && strings.HasPrefix(source, "wss://")) {
+				return fmt.Errorf("unsupported CSP source %q", source)
+			}
+		}
+	case "firmware_path", "backup_dir":
+		if trimmed == "" || len(trimmed) > 4096 {
+			return errors.New("path is required and must be at most 4096 bytes")
+		}
+	case "smtp_from":
+		if trimmed != "" {
+			address, err := mail.ParseAddress(trimmed)
+			if err != nil || !strings.EqualFold(address.Address, trimmed) {
+				return errors.New("must be a single email address")
+			}
+		}
+	case "ap_cred1_user", "ap_cred2_user", "ap_cred3_user", "sta_cred1_user", "sta_cred2_user", "sta_cred3_user", "smtp_username":
+		if len(trimmed) > 256 || strings.ContainsAny(value, "\r\n") {
+			return errors.New("username is too long or contains a newline")
+		}
+	case "ap_cred1_pass", "ap_cred2_pass", "ap_cred3_pass", "sta_cred1_pass", "sta_cred2_pass", "sta_cred3_pass", "smtp_password":
+		if len(value) > 65536 {
+			return errors.New("secret is too long")
+		}
+	}
+	return nil
+}
+
+func validateSettingInt(value string, min, max int) error {
+	v, err := strconv.Atoi(value)
+	if err != nil || v < min || v > max {
+		return fmt.Errorf("must be an integer between %d and %d", min, max)
+	}
+	return nil
+}
+
+func validateListenAddress(value string) error {
+	_, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return errors.New("must be in host:port form")
+	}
+	return validateSettingInt(port, 1, 65535)
+}
+
+func validateSettingsSnapshot(values map[string]string) error {
+	for _, prefix := range []string{"ap", "sta"} {
+		for i := 1; i <= 3; i++ {
+			user := strings.TrimSpace(values[fmt.Sprintf("%s_cred%d_user", prefix, i)])
+			pass := values[fmt.Sprintf("%s_cred%d_pass", prefix, i)]
+			if (user == "") != (pass == "") {
+				return fmt.Errorf("%s credential slot %d must contain both username and password or neither", strings.ToUpper(prefix), i)
+			}
+		}
+	}
+	warning, warnErr := strconv.ParseFloat(values["interference_warning_pct"], 64)
+	critical, critErr := strconv.ParseFloat(values["interference_critical_pct"], 64)
+	if warnErr == nil && critErr == nil && warning > critical {
+		return errors.New("interference_warning_pct must not exceed interference_critical_pct")
+	}
+	return nil
+}
+
+func validateRequestedRoles(input []string) ([]string, error) {
+	roles := recognizedRoles(input)
+	if len(roles) == 0 {
+		return nil, errors.New("at least one application role is required")
+	}
+	seenInput := map[string]struct{}{}
+	for _, role := range input {
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role == "" {
+			continue
+		}
+		switch role {
+		case RoleViewer, RoleCreator, RoleEditor, RoleAdmin:
+			seenInput[role] = struct{}{}
+		default:
+			return nil, fmt.Errorf("unknown role %q", role)
+		}
+	}
+	if len(seenInput) != len(roles) {
+		return nil, errors.New("roles contain invalid or duplicate entries")
+	}
+	return roles, nil
+}
+
+func hashPassword(password string) (string, error) {
+	if password == "" || len([]byte(password)) > 72 {
+		return "", fmt.Errorf("password must be between 1 and 72 bytes")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		// Should never happen with valid input
-		return ""
+		return "", fmt.Errorf("hash password: %w", err)
 	}
-	return string(hash)
+	return string(hash), nil
 }
 
 // verifyPassword checks a password against a bcrypt hash
@@ -3186,85 +3765,63 @@ func (a *API) BackupConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	claims := getClaims(r)
 	if claims == nil {
-		http.Error(w, "unauthorized", 401)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	deviceID, _ := strconv.Atoi(chi.URLParam(r, "id"))
+	deviceID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || deviceID <= 0 {
+		http.Error(w, "invalid device id", http.StatusBadRequest)
+		return
+	}
 
-	// Get device info including credentials
 	var ip, mac, hostname, platform string
 	var username, password sql.NullString
 	var parentID sql.NullInt64
-	err := a.DB.QueryRow(`
+	err = a.DB.QueryRowContext(r.Context(), `
 		SELECT host(ip_address), mac, COALESCE(hostname, ''), parent_id, COALESCE(platform, ''),
 		       username, password
 		FROM devices WHERE id = $1
 	`, deviceID).Scan(&ip, &mac, &hostname, &parentID, &platform, &username, &password)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		http.Error(w, "device not found", 404)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
 
-	// Use Poller's backup method with device credentials
-	config, err := a.Poller.FetchDeviceBackup(int64(deviceID), ip, platform, username.String, password.String)
+	config, err := a.Poller.FetchDeviceBackup(deviceID, ip, platform, username.String, password.String)
 	if err != nil {
-		http.Error(w, "backup failed: "+err.Error(), 500)
+		http.Error(w, "backup failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	// Save to filesystem - simple structure:
-	// For APs: backups/{AP_IP}/hostname_timestamp.cfg
-	// For STAs: backups/{AP_IP}/{STA_IP}/hostname_timestamp.cfg
-	backupPath := "backups" // Relative to working directory
-	a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
-
-	// Sanitize IP for filesystem (IPv6 has colons)
-	safeIP := sanitizeIPForPath(ip)
-	var dirPath string
-	if parentID.Valid {
-		// STA - get parent AP's IP
-		var apIP string
-		a.DB.QueryRow(`SELECT ip_address FROM devices WHERE id = $1`, parentID.Int64).Scan(&apIP)
-		if apIP == "" {
-			apIP = "unknown-ap"
-		}
-		safeAPIP := sanitizeIPForPath(apIP)
-		dirPath = filepath.Join(backupPath, safeAPIP, safeIP)
-	} else {
-		// AP - store directly under AP IP
-		dirPath = filepath.Join(backupPath, safeIP)
-	}
-
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		http.Error(w, "failed to create directory: "+err.Error(), 500)
+	backupRoot, err := a.configuredBackupRoot(r.Context())
+	if err != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
 		return
 	}
-
-	// Filename: hostname_timestamp.cfg or ip_timestamp.cfg
+	dirPath, err := a.backupDirectory(r.Context(), backupRoot, ip, parentID)
+	if err != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
+	}
 	name := hostname
-	if name == "" {
-		name = strings.ReplaceAll(safeIP, ".", "-")
+	if strings.TrimSpace(name) == "" {
+		name = sanitizeIPForPath(ip)
 	}
-	// Sanitize filename
-	name = strings.ReplaceAll(name, "/", "-")
-	name = strings.ReplaceAll(name, "\\", "-")
-	name = strings.ReplaceAll(name, ":", "-")
-
-	timestamp := time.Now().Format("20060102-150405")
-	filename := filepath.Join(dirPath, fmt.Sprintf("%s_%s.cfg", name, timestamp))
-
-	if err := os.WriteFile(filename, config, 0644); err != nil {
-		http.Error(w, "failed to write file: "+err.Error(), 500)
+	filename, err := configbackup.Write(dirPath, name, config)
+	if err != nil {
+		http.Error(w, "failed to write backup", http.StatusInternalServerError)
 		return
 	}
 
-	// Log
 	deviceType := "AP"
 	if parentID.Valid {
 		deviceType = "STA"
 	}
 	a.logChangelogDevice(mac, fmt.Sprintf("Configuration backed up (%s)", deviceType), claims.UserID)
-
 	writeJSON(w, map[string]any{
 		"path":    filename,
 		"size":    len(config),
@@ -3279,281 +3836,241 @@ func (a *API) RestoreConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	claims := getClaims(r)
 	if claims == nil {
-		http.Error(w, "unauthorized", 401)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	deviceID, _ := strconv.Atoi(chi.URLParam(r, "id"))
+	deviceID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || deviceID <= 0 {
+		http.Error(w, "invalid device id", http.StatusBadRequest)
+		return
+	}
 
 	var req struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 
-	// Get device info
 	var ip, mac, username, password string
-	err := a.DB.QueryRow(`
+	err = a.DB.QueryRowContext(r.Context(), `
 		SELECT host(ip_address), mac, COALESCE(username, ''), COALESCE(password, '')
 		FROM devices WHERE id = $1
 	`, deviceID).Scan(&ip, &mac, &username, &password)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		http.Error(w, "device not found", 404)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
 
-	// Validate path is within backup directory
-	backupPath := "backups"
-	a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
-
-	// Resolve to absolute path (relative to working directory)
-	absBackupPath, err := filepath.Abs(backupPath)
+	backupRoot, err := a.configuredBackupRoot(r.Context())
 	if err != nil {
-		http.Error(w, "invalid backup_dir setting", 500)
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
 		return
 	}
-
-	// Resolve symlinks and get absolute path of requested file
-	absPath, err := filepath.Abs(req.Path)
+	configData, realPath, _, err := configbackup.ReadExisting(backupRoot, req.Path)
 	if err != nil {
-		http.Error(w, "invalid path", 400)
+		http.Error(w, "invalid or unavailable backup", http.StatusBadRequest)
 		return
 	}
 
-	// Resolve symlinks to prevent bypass
-	realPath, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		http.Error(w, "path not found", 404)
+	if err := a.Firmware.PushConfig(ip, username, password, configData); err != nil {
+		http.Error(w, "restore failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-
-	// Ensure path is within backup directory (with proper separator check)
-	if !strings.HasPrefix(realPath, absBackupPath+string(filepath.Separator)) {
-		http.Error(w, "invalid backup path", 400)
-		return
-	}
-
-	// Read config from validated path
-	configData, err := os.ReadFile(realPath)
-	if err != nil {
-		http.Error(w, "config not found: "+err.Error(), 404)
-		return
-	}
-
-	// Push config to device
-	err = a.Firmware.PushConfig(ip, username, password, configData)
-	if err != nil {
-		http.Error(w, "restore failed: "+err.Error(), 500)
-		return
-	}
-
-	// Log
 	a.logChangelogDevice(mac, fmt.Sprintf("Configuration restored from %s", filepath.Base(realPath)), claims.UserID)
-
 	writeJSON(w, map[string]any{"status": "restored"})
 }
 
 // ListConfigs lists config backups for a device from filesystem
 func (a *API) ListConfigs(w http.ResponseWriter, r *http.Request) {
-	deviceID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-
-	// Get device IP and parent
-	var ip string
-	var parentID sql.NullInt64
-	err := a.DB.QueryRow(`SELECT host(ip_address), parent_id FROM devices WHERE id = $1`, deviceID).Scan(&ip, &parentID)
-	if err != nil {
-		http.Error(w, "device not found", 404)
+	if !a.requireView(w, r) {
+		return
+	}
+	deviceID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || deviceID <= 0 {
+		http.Error(w, "invalid device id", http.StatusBadRequest)
 		return
 	}
 
-	// Build path - same structure as BackupConfig
-	backupPath := "backups"
-	a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
-
-	var dirPath string
-	if parentID.Valid {
-		// STA - look under parent AP's directory
-		var apIP string
-		a.DB.QueryRow(`SELECT host(ip_address) FROM devices WHERE id = $1`, parentID.Int64).Scan(&apIP)
-		if apIP == "" {
-			apIP = "unknown-ap"
-		}
-		dirPath = filepath.Join(backupPath, sanitizeIPForPath(apIP), sanitizeIPForPath(ip))
-	} else {
-		// AP - directly under AP IP
-		dirPath = filepath.Join(backupPath, sanitizeIPForPath(ip))
+	var ip string
+	var parentID sql.NullInt64
+	err = a.DB.QueryRowContext(r.Context(), `SELECT host(ip_address), parent_id FROM devices WHERE id = $1`, deviceID).Scan(&ip, &parentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "device not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
 	}
 
-	// List files
-	entries, err := os.ReadDir(dirPath)
+	backupRoot, err := a.configuredBackupRoot(r.Context())
 	if err != nil {
-		// No backups yet
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
+	}
+	dirPath, err := a.backupDirectory(r.Context(), backupRoot, ip, parentID)
+	if err != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	entries, err := os.ReadDir(dirPath)
+	if errors.Is(err, os.ErrNotExist) {
 		writeJSON(w, []any{})
 		return
 	}
+	if err != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
+	}
 
-	var configs []map[string]any
+	configs := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".cfg") {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.EqualFold(filepath.Ext(entry.Name()), ".cfg") {
 			continue
 		}
-		info, err := entry.Info()
+		candidate := filepath.Join(dirPath, entry.Name())
+		realPath, info, err := configbackup.ResolveExisting(backupRoot, candidate)
+		if err != nil {
+			continue
+		}
+		relPath, err := filepath.Rel(backupRoot, realPath)
 		if err != nil {
 			continue
 		}
 		configs = append(configs, map[string]any{
-			"name":       entry.Name(),
-			"path":       filepath.Join(dirPath, entry.Name()),
+			"name":       filepath.Base(realPath),
+			"path":       filepath.ToSlash(relPath),
 			"size":       info.Size(),
 			"created_at": info.ModTime(),
 		})
 	}
-
-	// Sort by date descending (newest first)
-	for i := 0; i < len(configs)-1; i++ {
-		for j := i + 1; j < len(configs); j++ {
-			ti := configs[i]["created_at"].(time.Time)
-			tj := configs[j]["created_at"].(time.Time)
-			if tj.After(ti) {
-				configs[i], configs[j] = configs[j], configs[i]
-			}
-		}
-	}
-
+	sort.Slice(configs, func(i, j int) bool {
+		return configs[i]["created_at"].(time.Time).After(configs[j]["created_at"].(time.Time))
+	})
 	writeJSON(w, configs)
 }
 
-// ListAllConfigs lists all config backups across all devices
+// ListAllConfigs lists all config backups across all devices.
 func (a *API) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
-	backupPath := "backups"
-	a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
+	if !a.requireView(w, r) {
+		return
+	}
+	backupRoot, err := a.configuredBackupRoot(r.Context())
+	if err != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
+	}
 
-	// Build device ID/IP lookup maps
 	deviceByIP := make(map[string]map[string]any)
-	rows, err := a.DB.Query(`SELECT id, host(ip_address), hostname, product FROM devices`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var id int64
-			var ip, hostname, product sql.NullString
-			if rows.Scan(&id, &ip, &hostname, &product) == nil && ip.Valid {
-				deviceByIP[ip.String] = map[string]any{
-					"id":       id,
-					"ip":       ip.String,
-					"hostname": hostname.String,
-					"product":  product.String,
-				}
+	rows, err := a.DB.QueryContext(r.Context(), `SELECT id, host(ip_address), hostname, product FROM devices`)
+	if err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	for rows.Next() {
+		var id int64
+		var ip, hostname, product sql.NullString
+		if err := rows.Scan(&id, &ip, &hostname, &product); err != nil {
+			rows.Close()
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
+		if ip.Valid {
+			deviceByIP[ip.String] = map[string]any{
+				"id": id, "ip": ip.String, "hostname": hostname.String, "product": product.String,
 			}
 		}
 	}
+	if err := rows.Close(); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
 
-	var configs []map[string]any
-
-	// Walk backup directory
-	filepath.WalkDir(backupPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".cfg") {
+	configs := make([]map[string]any, 0)
+	walkErr := filepath.WalkDir(backupRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
 			return nil
 		}
-
-		info, err := d.Info()
+		if d.Type()&os.ModeSymlink != 0 || !strings.EqualFold(filepath.Ext(d.Name()), ".cfg") {
+			return nil
+		}
+		realPath, info, err := configbackup.ResolveExisting(backupRoot, path)
 		if err != nil {
 			return nil
 		}
-
-		// Extract device IP from path: backups/192.168.1.1/file.cfg or backups/192.168.1.1/192.168.1.2/file.cfg
-		relPath, _ := filepath.Rel(backupPath, path)
-		parts := strings.Split(relPath, string(filepath.Separator))
-
-		var deviceIP string
-		if len(parts) >= 2 {
-			// Could be AP directly or STA under AP
-			deviceIP = parts[len(parts)-2] // Directory containing the file
-			// Convert path format back to IP (replace _ with .)
-			deviceIP = strings.ReplaceAll(deviceIP, "_", ".")
+		relPath, err := filepath.Rel(backupRoot, realPath)
+		if err != nil {
+			return nil
 		}
-
-		cfg := map[string]any{
-			"name":       d.Name(),
-			"path":       path,
+		parts := strings.Split(filepath.ToSlash(relPath), "/")
+		deviceIP := ""
+		if len(parts) >= 2 {
+			deviceIP = strings.ReplaceAll(parts[len(parts)-2], "_", ".")
+		}
+		device := map[string]any{"ip": deviceIP}
+		if known, ok := deviceByIP[deviceIP]; ok {
+			device = known
+		}
+		configs = append(configs, map[string]any{
+			"name":       filepath.Base(realPath),
+			"path":       filepath.ToSlash(relPath),
 			"size":       info.Size(),
 			"created_at": info.ModTime(),
-		}
-
-		// Attach device info if found
-		if dev, ok := deviceByIP[deviceIP]; ok {
-			cfg["device"] = dev
-		} else {
-			cfg["device"] = map[string]any{"ip": deviceIP}
-		}
-
-		configs = append(configs, cfg)
+			"device":     device,
+		})
 		return nil
 	})
-
-	// Sort by date descending
-	for i := 0; i < len(configs)-1; i++ {
-		for j := i + 1; j < len(configs); j++ {
-			ti := configs[i]["created_at"].(time.Time)
-			tj := configs[j]["created_at"].(time.Time)
-			if tj.After(ti) {
-				configs[i], configs[j] = configs[j], configs[i]
-			}
-		}
+	if walkErr != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
 	}
-
+	sort.Slice(configs, func(i, j int) bool {
+		return configs[i]["created_at"].(time.Time).After(configs[j]["created_at"].(time.Time))
+	})
 	writeJSON(w, configs)
 }
 
 // DownloadConfig downloads a config backup file
 func (a *API) DownloadConfig(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, "path required", 400)
+	if !a.requireView(w, r) {
 		return
 	}
-
-	// Security: Only allow files under backups directory
-	backupPath := "backups"
-	a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
-
-	absBackup, err := filepath.Abs(backupPath)
+	requested := strings.TrimSpace(r.URL.Query().Get("path"))
+	if requested == "" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return
+	}
+	backupRoot, err := a.configuredBackupRoot(r.Context())
 	if err != nil {
-		http.Error(w, "invalid backup path", 500)
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
 		return
 	}
-
-	absPath, err := filepath.Abs(path)
+	data, realPath, info, err := configbackup.ReadExisting(backupRoot, requested)
 	if err != nil {
-		http.Error(w, "invalid path", 400)
+		http.Error(w, "config not found", http.StatusNotFound)
 		return
 	}
-
-	// Ensure path is within backup directory
-	if !strings.HasPrefix(absPath, absBackup+string(filepath.Separator)) {
-		http.Error(w, "access denied", 403)
-		return
-	}
-
-	// Only allow .cfg files
-	if !strings.HasSuffix(path, ".cfg") {
-		http.Error(w, "invalid file type", 400)
-		return
-	}
-
-	// Read file
-	data, err := os.ReadFile(path)
-	if err != nil {
-		http.Error(w, "file not found", 404)
-		return
-	}
-
-	// Send as download
-	filename := filepath.Base(path)
+	filename := filepath.Base(realPath)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.Write(data)
+	http.ServeContent(w, r, filename, info.ModTime(), bytes.NewReader(data))
 }
 
 // BulkBackup backs up multiple devices
@@ -3563,28 +4080,39 @@ func (a *API) BulkBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	claims := getClaims(r)
 	if claims == nil {
-		http.Error(w, "unauthorized", 401)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	var req struct {
-		DeviceIDs []int `json:"device_ids"`
+		DeviceIDs []int64 `json:"device_ids"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if len(req.DeviceIDs) == 0 || len(req.DeviceIDs) > 1000 {
+		http.Error(w, "device_ids must contain 1 to 1000 entries", http.StatusBadRequest)
 		return
 	}
 
-	// Get backup path setting
-	backupPath := "backups"
-	a.DB.QueryRow(`SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
-
-	var results []map[string]any
+	backupRoot, err := a.configuredBackupRoot(r.Context())
+	if err != nil {
+		http.Error(w, "backup storage unavailable", http.StatusInternalServerError)
+		return
+	}
+	results := make([]map[string]any, 0, len(req.DeviceIDs))
 	for _, deviceID := range req.DeviceIDs {
+		if deviceID <= 0 {
+			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "invalid device id"})
+			continue
+		}
 		var ip, mac, hostname, platform string
 		var username, password sql.NullString
 		var parentID sql.NullInt64
-		err := a.DB.QueryRow(`
+		err := a.DB.QueryRowContext(r.Context(), `
 			SELECT host(ip_address), mac, COALESCE(hostname, ''), parent_id, COALESCE(platform, ''),
 			       username, password
 			FROM devices WHERE id = $1
@@ -3593,58 +4121,55 @@ func (a *API) BulkBackup(w http.ResponseWriter, r *http.Request) {
 			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "not found"})
 			continue
 		}
-
-		// Use Poller's backup method with device credentials
-		config, err := a.Poller.FetchDeviceBackup(int64(deviceID), ip, platform, username.String, password.String)
+		config, err := a.Poller.FetchDeviceBackup(deviceID, ip, platform, username.String, password.String)
 		if err != nil {
 			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": err.Error()})
 			continue
 		}
-
-		// Build directory path - same structure as BackupConfig
-		// Sanitize IP for use in path (IPv6 has colons)
-		safeIP := sanitizeIPForPath(ip)
-		var dirPath string
-		if parentID.Valid {
-			// STA - store under parent AP's directory
-			var apIP string
-			a.DB.QueryRow(`SELECT ip_address FROM devices WHERE id = $1`, parentID.Int64).Scan(&apIP)
-			if apIP == "" {
-				apIP = "unknown-ap"
-			}
-			safeAPIP := sanitizeIPForPath(apIP)
-			dirPath = filepath.Join(backupPath, safeAPIP, safeIP)
-		} else {
-			// AP - store directly under AP IP
-			dirPath = filepath.Join(backupPath, safeIP)
-		}
-
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "mkdir: " + err.Error()})
+		dirPath, err := a.backupDirectory(r.Context(), backupRoot, ip, parentID)
+		if err != nil {
+			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "backup storage unavailable"})
 			continue
 		}
-
 		name := hostname
-		if name == "" {
-			name = strings.ReplaceAll(safeIP, ".", "-")
+		if strings.TrimSpace(name) == "" {
+			name = sanitizeIPForPath(ip)
 		}
-		name = strings.ReplaceAll(name, "/", "-")
-		name = strings.ReplaceAll(name, "\\", "-")
-
-		timestamp := time.Now().Format("20060102-150405")
-		filename := filepath.Join(dirPath, fmt.Sprintf("%s_%s.cfg", name, timestamp))
-
-		if err := os.WriteFile(filename, config, 0644); err != nil {
-			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": err.Error()})
+		filename, err := configbackup.Write(dirPath, name, config)
+		if err != nil {
+			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "backup write failed"})
 			continue
 		}
-
 		a.logChangelogDevice(mac, "Configuration backed up (bulk)", claims.UserID)
-
 		results = append(results, map[string]any{"device_id": deviceID, "status": "success", "path": filename})
 	}
-
 	writeJSON(w, map[string]any{"results": results})
+}
+
+func (a *API) configuredBackupRoot(ctx context.Context) (string, error) {
+	backupPath := "backups"
+	err := a.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = 'backup_dir'`).Scan(&backupPath)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	return configbackup.EnsureRoot(backupPath)
+}
+
+func (a *API) backupDirectory(ctx context.Context, root, ip string, parentID sql.NullInt64) (string, error) {
+	parts := []string{}
+	if parentID.Valid {
+		var apIP string
+		err := a.DB.QueryRowContext(ctx, `SELECT host(ip_address) FROM devices WHERE id = $1`, parentID.Int64).Scan(&apIP)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if strings.TrimSpace(apIP) == "" {
+			apIP = "unknown-ap"
+		}
+		parts = append(parts, sanitizeIPForPath(apIP))
+	}
+	parts = append(parts, sanitizeIPForPath(ip))
+	return configbackup.EnsureDir(root, parts...)
 }
 
 // sanitizeIPForPath converts an IP address to a filesystem-safe string
@@ -4798,20 +5323,23 @@ func (a *API) ListReports(w http.ResponseWriter, r *http.Request) {
 
 // DeleteReport deletes a report
 func (a *API) DeleteReport(w http.ResponseWriter, r *http.Request) {
-	reportID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-
-	result, err := a.DB.Exec(`DELETE FROM reports WHERE id = $1`, reportID)
+	if !a.requireEdit(w, r) {
+		return
+	}
+	reportID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || reportID <= 0 {
+		http.Error(w, "invalid report id", http.StatusBadRequest)
+		return
+	}
+	result, err := a.DB.ExecContext(r.Context(), `DELETE FROM reports WHERE id = $1`, reportID)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		http.Error(w, "report not found", 404)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		http.Error(w, "report not found", http.StatusNotFound)
 		return
 	}
-
 	writeJSON(w, map[string]any{"deleted": true})
 }
 
@@ -5035,6 +5563,9 @@ func (a *API) DownloadReport(w http.ResponseWriter, r *http.Request) {
 
 // CompareReports compares two reports and returns deltas
 func (a *API) CompareReports(w http.ResponseWriter, r *http.Request) {
+	if !a.requireView(w, r) {
+		return
+	}
 	var req struct {
 		ReportID1 int `json:"report_id_1"`
 		ReportID2 int `json:"report_id_2"`
@@ -5809,41 +6340,78 @@ func (a *API) ListAlertRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, rules)
 }
 
+func decodeAlertRulePatch(raw map[string]json.RawMessage, base alerting.Rule) (alerting.Rule, error) {
+	allowed := map[string]bool{
+		"name": true, "enabled": true, "scope": true, "scope_id": true,
+		"target_role": true, "require_alertable": true, "metric": true,
+		"operator": true, "threshold": true, "duration_seconds": true,
+		"notify_channels": true, "notify_emails": true, "webhook_url": true,
+		"cooldown_seconds": true,
+	}
+	baseJSON, err := json.Marshal(base)
+	if err != nil {
+		return base, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(baseJSON, &merged); err != nil {
+		return base, err
+	}
+	for key, value := range raw {
+		if !allowed[key] {
+			return base, fmt.Errorf("unknown alert rule field %q", key)
+		}
+		merged[key] = value
+	}
+	body, err := json.Marshal(merged)
+	if err != nil {
+		return base, err
+	}
+	var rule alerting.Rule
+	if err := json.Unmarshal(body, &rule); err != nil {
+		return base, err
+	}
+	rule.ID = base.ID
+	rule.CreatedAt = base.CreatedAt
+	rule.CreatedBy = base.CreatedBy
+	return rule, nil
+}
+
+func writeAlertManagerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, alerting.ErrNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+	case strings.Contains(err.Error(), "invalid") || strings.Contains(err.Error(), "must") ||
+		strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "unsupported") ||
+		strings.Contains(err.Error(), "scope") || strings.Contains(err.Error(), "threshold"):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 func (a *API) CreateAlertRule(w http.ResponseWriter, r *http.Request) {
 	if !a.requireEdit(w, r) {
 		return
 	}
 	claims := getClaims(r)
-
 	var raw map[string]json.RawMessage
-	if json.NewDecoder(r.Body).Decode(&raw) != nil {
-		http.Error(w, "invalid json", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := dec.Decode(&raw); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	body, _ := json.Marshal(raw)
-	var rule alerting.Rule
-	if json.Unmarshal(body, &rule) != nil {
-		http.Error(w, "invalid alert rule", 400)
+	base := alerting.Rule{Enabled: true, Scope: "all", TargetRole: "all", RequireAlertable: true, CooldownSeconds: 300}
+	rule, err := decodeAlertRulePatch(raw, base)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, ok := raw["enabled"]; !ok {
-		rule.Enabled = true
-	}
-	if _, ok := raw["target_role"]; !ok {
-		rule.TargetRole = "all"
-	}
-	if _, ok := raw["require_alertable"]; !ok {
-		rule.RequireAlertable = true
-	}
-
 	rule.CreatedBy = int(claims.UserID)
-
 	id, err := a.Alerts.CreateRule(&rule)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		writeAlertManagerError(w, err)
 		return
 	}
-
 	writeJSON(w, map[string]any{"ok": true, "id": id})
 }
 
@@ -5851,32 +6419,35 @@ func (a *API) UpdateAlertRule(w http.ResponseWriter, r *http.Request) {
 	if !a.requireEdit(w, r) {
 		return
 	}
-
-	ruleID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-
+	ruleID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil || ruleID <= 0 {
+		http.Error(w, "invalid rule id", http.StatusBadRequest)
+		return
+	}
+	existing, err := a.Alerts.GetRule(ruleID)
+	if err != nil {
+		writeAlertManagerError(w, err)
+		return
+	}
 	var raw map[string]json.RawMessage
-	if json.NewDecoder(r.Body).Decode(&raw) != nil {
-		http.Error(w, "invalid json", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := dec.Decode(&raw); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	body, _ := json.Marshal(raw)
-	var rule alerting.Rule
-	if json.Unmarshal(body, &rule) != nil {
-		http.Error(w, "invalid alert rule", 400)
+	if len(raw) == 0 {
+		http.Error(w, "empty patch", http.StatusBadRequest)
 		return
 	}
-	if _, ok := raw["target_role"]; !ok {
-		rule.TargetRole = "all"
+	rule, err := decodeAlertRulePatch(raw, existing)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if _, ok := raw["require_alertable"]; !ok {
-		rule.RequireAlertable = true
-	}
-
 	if err := a.Alerts.UpdateRule(ruleID, &rule); err != nil {
-		http.Error(w, err.Error(), 500)
+		writeAlertManagerError(w, err)
 		return
 	}
-
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -5884,14 +6455,15 @@ func (a *API) DeleteAlertRule(w http.ResponseWriter, r *http.Request) {
 	if !a.requireEdit(w, r) {
 		return
 	}
-
-	ruleID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-
-	if err := a.Alerts.DeleteRule(ruleID); err != nil {
-		http.Error(w, err.Error(), 500)
+	ruleID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil || ruleID <= 0 {
+		http.Error(w, "invalid rule id", http.StatusBadRequest)
 		return
 	}
-
+	if err := a.Alerts.DeleteRule(ruleID); err != nil {
+		writeAlertManagerError(w, err)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -5900,13 +6472,17 @@ func (a *API) DeleteAlertRule(w http.ResponseWriter, r *http.Request) {
 func (a *API) ListAlerts(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	limit := 100
-	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
-		limit = l
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
 	}
-
 	alerts, err := a.Alerts.ListAlerts(status, limit)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		writeAlertManagerError(w, err)
 		return
 	}
 	if alerts == nil {
@@ -5920,14 +6496,15 @@ func (a *API) AcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims := getClaims(r)
-
-	alertID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-
-	if err := a.Alerts.AcknowledgeAlert(alertID, int(claims.UserID)); err != nil {
-		http.Error(w, err.Error(), 500)
+	alertID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil || alertID <= 0 {
+		http.Error(w, "invalid alert id", http.StatusBadRequest)
 		return
 	}
-
+	if err := a.Alerts.AcknowledgeAlert(alertID, int(claims.UserID)); err != nil {
+		writeAlertManagerError(w, err)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -5935,14 +6512,15 @@ func (a *API) ResolveAlert(w http.ResponseWriter, r *http.Request) {
 	if !a.requireEdit(w, r) {
 		return
 	}
-
-	alertID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-
-	if err := a.Alerts.ResolveAlert(alertID); err != nil {
-		http.Error(w, err.Error(), 500)
+	alertID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil || alertID <= 0 {
+		http.Error(w, "invalid alert id", http.StatusBadRequest)
 		return
 	}
-
+	if err := a.Alerts.ResolveAlert(alertID); err != nil {
+		writeAlertManagerError(w, err)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -6393,9 +6971,9 @@ type ultraDebugToggleRequest struct {
 }
 
 // SetUltraDebug enables or disables the per-device ultra debug ring buffer.
-// Requires EDIT permissions.
+// Requires administrator permissions.
 func (a *API) SetUltraDebug(w http.ResponseWriter, r *http.Request) {
-	if !a.requireEdit(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6439,7 +7017,7 @@ func (a *API) SetUltraDebug(w http.ResponseWriter, r *http.Request) {
 
 // ListUltraDebug returns info about all currently-enabled ultra debug buffers.
 func (a *API) ListUltraDebug(w http.ResponseWriter, r *http.Request) {
-	if !a.requireAuth(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6458,7 +7036,7 @@ func (a *API) ListUltraDebug(w http.ResponseWriter, r *http.Request) {
 // GetUltraDebug returns the contents of a single device's ultra debug buffer.
 // Optional query param: tail=<n> to return only the last n entries.
 func (a *API) GetUltraDebug(w http.ResponseWriter, r *http.Request) {
-	if !a.requireAuth(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6486,7 +7064,7 @@ func (a *API) GetUltraDebug(w http.ResponseWriter, r *http.Request) {
 
 // DownloadUltraDebug downloads the raw JSON array for a device's ultra debug buffer.
 func (a *API) DownloadUltraDebug(w http.ResponseWriter, r *http.Request) {
-	if !a.requireAuth(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6514,9 +7092,9 @@ func (a *API) DownloadUltraDebug(w http.ResponseWriter, r *http.Request) {
 }
 
 // ClearUltraDebug empties a device's ultra debug buffer without disabling it.
-// Requires EDIT permissions.
+// Requires administrator permissions.
 func (a *API) ClearUltraDebug(w http.ResponseWriter, r *http.Request) {
-	if !a.requireEdit(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6548,9 +7126,9 @@ type ultraDebugHostToggleRequest struct {
 
 // SetUltraDebugHost enables or disables a host-scoped ultra debug ring buffer.
 // This is intended for flows where a device ID is not available (e.g. drilldown polling).
-// Requires EDIT permissions.
+// Requires administrator permissions.
 func (a *API) SetUltraDebugHost(w http.ResponseWriter, r *http.Request) {
-	if !a.requireEdit(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6585,7 +7163,7 @@ func (a *API) SetUltraDebugHost(w http.ResponseWriter, r *http.Request) {
 // GetUltraDebugHost returns the contents of a single host's ultra debug buffer.
 // Optional query param: tail=<n> to return only the last n entries.
 func (a *API) GetUltraDebugHost(w http.ResponseWriter, r *http.Request) {
-	if !a.requireAuth(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6613,7 +7191,7 @@ func (a *API) GetUltraDebugHost(w http.ResponseWriter, r *http.Request) {
 
 // DownloadUltraDebugHost downloads the raw JSON array for a host's ultra debug buffer.
 func (a *API) DownloadUltraDebugHost(w http.ResponseWriter, r *http.Request) {
-	if !a.requireAuth(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {
@@ -6643,9 +7221,9 @@ func (a *API) DownloadUltraDebugHost(w http.ResponseWriter, r *http.Request) {
 }
 
 // ClearUltraDebugHost empties a host's ultra debug buffer without disabling it.
-// Requires EDIT permissions.
+// Requires administrator permissions.
 func (a *API) ClearUltraDebugHost(w http.ResponseWriter, r *http.Request) {
-	if !a.requireEdit(w, r) {
+	if !a.requireAdmin(w, r) {
 		return
 	}
 	if a.UltraDebug == nil {

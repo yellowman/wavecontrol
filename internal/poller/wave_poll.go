@@ -263,33 +263,12 @@ func (p *Poller) pollDeviceWave(job pollJob) pollResult {
 			}
 		}
 	}
-	// Check if hostname changed before updating store
+	// Check if hostname changed before updating store.
 	oldStats := p.store.GetByMAC(job.MAC)
 	if oldStats == nil {
 		oldStats = p.store.Get(job.IP)
 	}
 	hostnameChanged := deviceStats.Hostname != "" && (oldStats == nil || oldStats.Hostname != deviceStats.Hostname)
-
-	// Update memory store - returns true if state changed (offline->online)
-	becameOnline := p.store.Update(job.IP, deviceStats)
-	p.store.TrackStabilityStatus(job.IP, deviceStats.Hostname, stats.StatusOnline, deviceStats.Uptime)
-
-	// Update peers first so AP websocket updates include peer_count/peers.
-	// This is important for real-time STA updates in the UI.
-	var ipChanges map[string]string
-	if len(peers) > 0 {
-		// Enrich peers with MAC from database when using IP fallback
-		p.enrichPeersWithMAC(peers)
-		ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, peers)
-	} else {
-		// No peers - still update peer count to 0 (and clear any previous peers)
-		ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, nil)
-	}
-
-	// Broadcast stats update via WebSocket (after peer update)
-	if p.wsHub != nil {
-		p.wsHub.BroadcastStatsUpdate(int(job.DeviceID), deviceStats.MAC, job.IP, deviceStats)
-	}
 
 	// Determine role (AP vs STA) from the most reliable source available.
 	//
@@ -325,6 +304,36 @@ func (p *Poller) pollDeviceWave(job pollJob) pollResult {
 		p.logDebug("pollDeviceWave %s: role=%s (source=%s, jobRole=%s)", job.IP, detectedRole, roleSource, job.Role)
 	}
 
+	peerSnapshotAccepted := true
+	if detectedRole == "ap" {
+		peerSnapshotAccepted = p.acceptPeerSnapshot(job.DeviceID, peers)
+		if !peerSnapshotAccepted && oldStats != nil {
+			deviceStats.PeerCount = oldStats.PeerCount
+			deviceStats.Peers = oldStats.Peers
+		}
+	}
+
+	// Update memory store - returns true if state changed (offline->online).
+	becameOnline := p.store.Update(job.IP, deviceStats)
+	p.store.TrackStabilityStatus(job.IP, deviceStats.Hostname, stats.StatusOnline, deviceStats.Uptime)
+
+	// Only an authoritative AP snapshot may replace peers or mutate child rows.
+	var ipChanges map[string]string
+	if detectedRole == "ap" {
+		if peerSnapshotAccepted {
+			p.enrichPeersWithMAC(peers)
+			ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, peers)
+		}
+	} else {
+		// A directly polled STA must never create child devices from its AP-facing peer list.
+		ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, nil)
+	}
+
+	// Broadcast stats update via WebSocket (after peer update)
+	if p.wsHub != nil {
+		p.wsHub.BroadcastStatsUpdate(int(job.DeviceID), deviceStats.MAC, job.IP, deviceStats)
+	}
+
 	// Defensive cleanup: APs should never have a parent relationship. If a previous bad
 	// association pass (or manual edits) left a parent_id/parent_mac on an AP, clear it
 	// as soon as we positively identify the device as an AP.
@@ -343,7 +352,7 @@ func (p *Poller) pollDeviceWave(job pollJob) pollResult {
 	// Persist/update STA rows in DB (AP only). Run after broadcast to keep UI responsive.
 	// NOTE: When peers is empty/nil for an AP, this call will mark all child STAs as offline
 	// in the DB ("not_associated").
-	if detectedRole == "ap" {
+	if detectedRole == "ap" && peerSnapshotAccepted {
 		p.updateSTAsInDB(job.DeviceID, peers, ipChanges)
 	}
 

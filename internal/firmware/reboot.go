@@ -67,6 +67,13 @@ func (s *Service) RebootDeviceByID(ctx context.Context, deviceID int64) (*Reboot
 func (s *Service) RebootDeviceTarget(ctx context.Context, deviceID int64, ip, mac, hostname, username, password, platform, flavor string) (*RebootResult, error) {
 	_ = ctx // reserved for future request-context propagation; client timeouts protect current calls.
 	ip = strings.TrimSpace(ip)
+	if password != "" {
+		plain, err := s.decryptSecret(password)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt device credential: %w", err)
+		}
+		password = plain
+	}
 	platformLower := strings.ToLower(strings.TrimSpace(platform))
 	flavorUpper := strings.ToUpper(strings.TrimSpace(flavor))
 	if platformLower == "" {
@@ -163,19 +170,16 @@ func (s *Service) rebootCredentialCandidates(username, password string) []reboot
 	}
 
 	add(username, password)
+	configured := append(s.credentialSnapshot(true), s.credentialSnapshot(false)...)
 	if username != "" && password == "" {
-		for _, pass := range s.apPass {
-			add(username, pass)
-		}
-		for _, pass := range s.staPass {
-			add(username, pass)
+		for _, cred := range configured {
+			if strings.EqualFold(strings.TrimSpace(cred.Username), strings.TrimSpace(username)) {
+				add(cred.Username, cred.Password)
+			}
 		}
 	}
-	for _, pass := range s.apPass {
-		add(s.apUser, pass)
-	}
-	for _, pass := range s.staPass {
-		add(s.staUser, pass)
+	for _, cred := range configured {
+		add(cred.Username, cred.Password)
 	}
 
 	return out

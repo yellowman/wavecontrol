@@ -204,28 +204,36 @@ func (p *Poller) pollDeviceAirMAX(job pollJob) pollResult {
 		}
 	}
 
-	// Check for changes before updating store
+	// Check for changes before updating store.
 	oldStats := p.store.GetByMAC(job.MAC)
 	if oldStats == nil {
 		oldStats = p.store.Get(job.IP)
 	}
 	hostnameChanged := deviceStats.Hostname != "" && (oldStats == nil || oldStats.Hostname != deviceStats.Hostname)
 
-	// Update memory store - returns true if state changed (offline->online)
+	var peers []*stats.PeerStats
+	peerSnapshotAccepted := true
+	if status.IsAP() {
+		peers = p.convertAirMAXPeers(status)
+		peerSnapshotAccepted = p.acceptPeerSnapshot(job.DeviceID, peers)
+		if !peerSnapshotAccepted && oldStats != nil {
+			deviceStats.PeerCount = oldStats.PeerCount
+			deviceStats.Peers = oldStats.Peers
+		}
+	}
+
+	// Update memory store - returns true if state changed (offline->online).
 	becameOnline := p.store.Update(job.IP, deviceStats)
 	p.store.TrackStabilityStatus(job.IP, deviceStats.Hostname, stats.StatusOnline, deviceStats.Uptime)
 
-	// Update peers first so AP websocket updates include peer_count/peers.
-	// This is important for real-time STA updates in the UI.
-	var peers []*stats.PeerStats
 	var ipChanges map[string]string
 	if status.IsAP() {
-		peers = p.convertAirMAXPeers(status)
-		// Enrich peers with MAC from database when using IP fallback
-		p.enrichPeersWithMAC(peers)
-		ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, peers)
+		if peerSnapshotAccepted {
+			p.enrichPeersWithMAC(peers)
+			ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, peers)
+		}
 	} else {
-		// Not an AP - ensure any previous peer list is cleared.
+		// A directly polled STA must not retain or create child rows.
 		ipChanges = p.store.UpdatePeers(deviceStats.MAC, job.IP, nil)
 	}
 
@@ -237,7 +245,7 @@ func (p *Poller) pollDeviceAirMAX(job pollJob) pollResult {
 	// Persist/update STA rows in DB (AP only). Run after broadcast to keep UI responsive.
 	// NOTE: When peers is empty/nil for an AP, this call will mark all child STAs as offline
 	// in the DB ("not_associated").
-	if status.IsAP() {
+	if status.IsAP() && peerSnapshotAccepted {
 		p.updateSTAsInDB(job.DeviceID, peers, ipChanges)
 	}
 

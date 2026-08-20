@@ -2,30 +2,57 @@
 
 ## Authentication
 
-All API endpoints (except `/auth/login` and `/ping`) require a Bearer token.
+The browser API uses a server-issued session cookie. The cookie is `HttpOnly`, `SameSite=Strict`, and marked `Secure` when the request is HTTPS. JavaScript never receives or stores the signed session token.
 
-```
-Authorization: Bearer <token>
+All protected requests must send the session cookie. State-changing requests must also be same-origin and include:
+
+```http
+X-WaveControl-CSRF: 1
 ```
 
 ### POST /api/wavecontrol/auth/login
 
-Login and receive JWT token.
+Authenticate and establish the cookie session.
 
 **Request:**
 ```json
 {
-  "username": "admin",
-  "password": "password"
+  "username": "operator",
+  "password": "your-password"
 }
 ```
 
 **Response:**
 ```json
 {
-  "token": "eyJhbG...",
-  "user": { "id": 1, "username": "admin", "roles": ["administrator"] }
+  "username": "operator",
+  "roles": ["administrator"]
 }
+```
+
+The response also includes `Set-Cookie: wavecontrol_session=...`; the token value is never included in JSON.
+
+### POST /api/wavecontrol/auth/logout
+
+Revokes the current user's outstanding sessions and clears the browser cookie. Include `X-WaveControl-CSRF: 1`.
+
+### GET /api/wavecontrol/me
+
+Returns the current user ID, username, and effective roles.
+
+### Command-line example
+
+```bash
+curl -sS -c cookies.txt \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"operator","password":"your-password"}' \
+  http://localhost:8080/api/wavecontrol/auth/login
+
+curl -sS -b cookies.txt http://localhost:8080/api/wavecontrol/devices
+
+curl -sS -b cookies.txt -X POST \
+  -H 'X-WaveControl-CSRF: 1' \
+  http://localhost:8080/api/wavecontrol/devices/1/refresh
 ```
 
 ---
@@ -71,8 +98,8 @@ Add a single device.
 ```json
 {
   "ip": "192.168.1.100",
-  "username": "ubnt",
-  "password": "ubnt",
+  "username": "device-user",
+  "password": "device-password",
   "site_id": 1
 }
 ```
@@ -85,8 +112,8 @@ Add multiple devices.
 ```json
 {
   "ips": ["192.168.1.100", "192.168.1.101", "192.168.1.102"],
-  "username": "ubnt",
-  "password": "ubnt",
+  "username": "device-user",
+  "password": "device-password",
   "site_id": 1
 }
 ```
@@ -411,16 +438,26 @@ Delete user.
 
 List all settings.
 
-### PATCH /api/wavecontrol/settings/{key}
+### PATCH /api/wavecontrol/settings
 
-Update a setting.
+Atomically update a settings form. This is the preferred endpoint for credential pairs because the server validates and reloads the complete snapshot only after every value is committed.
 
-**Request:**
 ```json
 {
-  "value": "60"
+  "settings": {
+    "poll_interval": "60",
+    "ap_cred1_user": "device-user",
+    "ap_cred1_pass": "new-password"
+  },
+  "clear": ["smtp_password"]
 }
 ```
+
+The response contains a `restart_required` array for startup-bound settings.
+
+### PATCH /api/wavecontrol/settings/{key}
+
+Update one setting. Secret values may be preserved by sending the masked value returned by `GET /settings`, or cleared explicitly with `{ "clear": true }`.
 
 ---
 
@@ -440,143 +477,23 @@ WebSocket endpoint for real-time updates.
 
 ---
 
-## Mobile Clients / Push Notifications
+## Alert Notification Delivery
 
-Native Android and iOS clients use the server as the always-on monitor. Mobile clients register OS push tokens, receive alerts through FCM/APNs, and use REST/WebSocket only for state reconciliation and foreground live views.
+Alert rules support three server-side delivery channels: `email`, `webhook`, and `zabbix`. Native mobile notification registration and provider endpoints are intentionally not part of waveControl.
 
-All mobile endpoints require the same Bearer token authentication as the rest of the protected API.
+Each channel is inserted into `alert_notification_outbox` in the same transaction that marks an alert ready for notification. A worker claims rows with `FOR UPDATE SKIP LOCKED`, retries transient failures with bounded exponential backoff, recovers abandoned `sending` rows after a process restart, and moves exhausted deliveries to `dead`.
 
-### POST /api/wavecontrol/mobile/register
+### Email
 
-Register or refresh a mobile push token for the authenticated user.
+Set `smtp_host`, `smtp_port`, `smtp_username`, `smtp_password`, and `smtp_from` through the administrator Settings API. A rule using the `email` channel must also provide one or more `notify_emails` recipients.
 
-**Request:**
-```json
-{
-  "platform": "android",
-  "provider": "fcm",
-  "token": "device-push-token",
-  "device_name": "Pixel NOC phone",
-  "app_version": "1.0.0",
-  "os_version": "Android 15"
-}
-```
+### Webhook
 
-For iOS, use either `{ "platform": "ios", "provider": "apns" }` for direct APNs or `{ "platform": "ios", "provider": "fcm" }` when using Firebase as the APNs bridge.
+A rule using `webhook` must provide an HTTP or HTTPS `webhook_url`. Userinfo, loopback, private, link-local, multicast, and other special-use destinations are rejected. DNS results and every redirect target are revalidated when delivery occurs.
 
-**Response:**
-```json
-{
-  "ok": true,
-  "device": {
-    "id": "uuid",
-    "platform": "android",
-    "provider": "fcm",
-    "device_name": "Pixel NOC phone",
-    "enabled": true
-  }
-}
-```
+### Zabbix sender
 
-### DELETE /api/wavecontrol/mobile/register
-
-Disable a mobile token for the authenticated user.
-
-**Request:**
-```json
-{
-  "platform": "android",
-  "provider": "fcm",
-  "token": "device-push-token"
-}
-```
-
-If `token` is omitted, all enabled tokens for that platform/provider are disabled for the user.
-
-### GET /api/wavecontrol/mobile/devices
-
-List the authenticated user's registered mobile clients. Tokens are never returned.
-
-### GET /api/wavecontrol/mobile/preferences
-
-Get mobile alert preferences for the authenticated user.
-
-### PATCH /api/wavecontrol/mobile/preferences
-
-Update mobile alert preferences.
-
-**Request:**
-```json
-{
-  "push_enabled": true,
-  "notify_critical": true,
-  "notify_warning": true,
-  "notify_info": false,
-  "quiet_hours_start": "22:00:00",
-  "quiet_hours_end": "06:00:00",
-  "timezone": "America/Los_Angeles"
-}
-```
-
-### GET /api/wavecontrol/mobile/bootstrap
-
-Bootstrap a mobile app after login or notification tap.
-
-Query parameters:
-- `since_alert_id`: only return alerts newer than this alert id.
-- `limit`: max alerts, default 100, max 500.
-
-Response includes server time, registered mobile devices, push preferences, recent alerts, current live stats, and the WebSocket path.
-
-### GET /api/wavecontrol/mobile/alerts
-
-Reconcile alert history by cursor.
-
-Query parameters:
-- `since`: return alerts with id greater than this value.
-- `status`: optional status filter.
-- `limit`: default 100, max 500.
-
-### POST /api/wavecontrol/mobile/test-push
-
-Queue a test notification to all enabled mobile devices for the authenticated user.
-
-### Alert rule mobile channel
-
-Add `mobile` to an alert rule's `notify_channels` to send native push notifications:
-
-```json
-{
-  "name": "Down host",
-  "enabled": true,
-  "scope": "all",
-  "metric": "offline_duration",
-  "operator": "gte",
-  "threshold": 180,
-  "duration_seconds": 0,
-  "notify_channels": ["mobile", "email"],
-  "cooldown_seconds": 900
-}
-```
-
-### Push provider settings
-
-Provider configuration is stored in `/api/wavecontrol/settings`:
-
-| Key | Purpose |
-|---|---|
-| `mobile_push_enabled` | Global mobile push switch |
-| `fcm_enabled` | Enable Firebase Cloud Messaging |
-| `fcm_project_id` | Firebase project id; optional if service account JSON includes it |
-| `fcm_service_account_json` | Firebase service account JSON for HTTP v1 send |
-| `apns_enabled` | Enable direct Apple Push Notification service |
-| `apns_team_id` | Apple Developer Team ID |
-| `apns_key_id` | APNs auth key id |
-| `apns_bundle_id` | iOS app bundle id / APNs topic |
-| `apns_private_key_p8` | APNs `.p8` private key contents |
-| `apns_production` | `true` for production APNs, `false` for sandbox |
-
-Push tokens are AES-GCM encrypted at rest using the server JWT secret as the local encryption secret. The durable `notification_outbox` table retries transient FCM/APNs failures and disables a mobile token on terminal provider errors.
+Set `zabbix_server` to a Zabbix server or trapper endpoint. The notification worker sends the alert through the Zabbix sender protocol when the rule includes `zabbix`.
 
 ---
 
@@ -602,8 +519,7 @@ The Alerts page provides:
   - Peer count dropped
   - Low link score
 - Rule form with scope selection for all devices, site, or single device.
-- Notification channels: mobile, email, webhook, and zabbix.
-- Mobile test push button.
+- Notification channels: email, webhook, and Zabbix.
 
 ### Backend endpoints used by the UI
 
@@ -617,7 +533,6 @@ POST   /api/wavecontrol/alerts/rules
 PATCH  /api/wavecontrol/alerts/rules/{id}
 DELETE /api/wavecontrol/alerts/rules/{id}
 
-POST   /api/wavecontrol/mobile/test-push
 ```
 
 ### Rule payload
@@ -632,7 +547,7 @@ POST   /api/wavecontrol/mobile/test-push
   "operator": "gte",
   "threshold": 180,
   "duration_seconds": 0,
-  "notify_channels": ["mobile"],
+  "notify_channels": ["email"],
   "notify_emails": [],
   "webhook_url": "",
   "cooldown_seconds": 900
@@ -644,7 +559,7 @@ POST   /api/wavecontrol/mobile/test-push
 
 ### Recommended alert rule installer
 
-The web **Alerts** page includes an **Install recommended rules** action. It creates the built-in presets that are not already present, using duplicate detection by name, metric, operator, threshold, scope, and scope ID. Installed presets default to the `mobile` notification channel and remain editable afterward.
+The web **Alerts** page includes an **Install recommended rules** action. It creates built-in presets that are not already present, using duplicate detection by name, metric, operator, threshold, scope, and scope ID. Presets are installed without an external delivery channel until the operator explicitly configures one.
 
 ---
 

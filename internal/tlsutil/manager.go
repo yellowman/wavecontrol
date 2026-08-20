@@ -669,7 +669,6 @@ func (m *Manager) BulkLearnCerts(userID int, verifyImmediately bool) (learned, f
 		FROM devices d
 		LEFT JOIN device_certs dc ON d.id = dc.device_id
 		WHERE d.ip_address IS NOT NULL
-			AND d.deleted_at IS NULL
 			AND (d.parent_id IS NULL OR d.managed = TRUE)
 			AND dc.id IS NULL
 	`)
@@ -943,8 +942,7 @@ func (m *Manager) Stats() (total, verified, pending, changed, expired, noCert in
 			COUNT(*) FILTER (WHERE dc.not_after IS NOT NULL AND dc.not_after < NOW()) AS expired
 		FROM device_certs dc
 		JOIN devices d ON d.id = dc.device_id
-		WHERE d.deleted_at IS NULL
-		  AND d.ip_address IS NOT NULL
+		WHERE d.ip_address IS NOT NULL
 		  AND (d.parent_id IS NULL OR d.managed = TRUE)
 	`).Scan(&total, &verified, &pending, &changed, &expired); err != nil {
 		log.Printf("tlsutil.Manager.Stats: query device_certs counts failed: %v", err)
@@ -955,8 +953,7 @@ func (m *Manager) Stats() (total, verified, pending, changed, expired, noCert in
 		SELECT COUNT(*)
 		FROM devices d
 		LEFT JOIN device_certs dc ON dc.device_id = d.id
-		WHERE d.deleted_at IS NULL
-		  AND d.ip_address IS NOT NULL
+		WHERE d.ip_address IS NOT NULL
 		  AND (d.parent_id IS NULL OR d.managed = TRUE)
 		  AND dc.device_id IS NULL
 	`).Scan(&noCert); err != nil {
