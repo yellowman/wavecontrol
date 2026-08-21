@@ -2,6 +2,25 @@
 
 Device management and monitoring system for Ubiquiti Wave (60GHz, 5GHz/6GHz MLO), LTU, and airMAX (M/AC) wireless devices. Provides real-time visibility into device stats only available through the Ubiquiti HTTP API, with a focus on radio-specific metrics like per-chain signal levels. Includes a Zabbix bridge to retrieve these statistics since they are not available from the Ubiquiti device SNMP server.
 
+## Screenshots
+
+These sample views use fictional device names, placeholder metrics, and documentation-only IP addresses. Click any image to open the full-size PNG.
+
+<table>
+  <tr>
+    <td width="50%"><strong>Login</strong><br><a href="docs/screenshots/login.png"><img src="docs/screenshots/login.png" alt="waveControl login screen"></a></td>
+    <td width="50%"><strong>Dashboard</strong><br><a href="docs/screenshots/dashboard.png"><img src="docs/screenshots/dashboard.png" alt="waveControl device dashboard"></a></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>Dashboard with host pane</strong><br><a href="docs/screenshots/dashboard-host-pane.png"><img src="docs/screenshots/dashboard-host-pane.png" alt="waveControl dashboard with a host detail pane open"></a></td>
+    <td width="50%"><strong>Drilldown</strong><br><a href="docs/screenshots/drilldown.png"><img src="docs/screenshots/drilldown.png" alt="waveControl radio drilldown view"></a></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>Reports</strong><br><a href="docs/screenshots/reports.png"><img src="docs/screenshots/reports.png" alt="waveControl reports screen"></a></td>
+    <td width="50%"><strong>Quality</strong><br><a href="docs/screenshots/quality.png"><img src="docs/screenshots/quality.png" alt="waveControl signal quality screen"></a></td>
+  </tr>
+</table>
+
 ## Built for Large Networks
 
 waveControl is designed from the ground up to handle **large ISP deployments with thousands of devices** without the browser slowdowns that plague other network management tools.

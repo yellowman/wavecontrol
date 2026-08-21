@@ -5742,10 +5742,15 @@ tr.selected {
   min-width: 2px;
 }
 
-.signal-good { background: var(--success); }
-.signal-fair { background: var(--warning); }
-.signal-poor { background: var(--danger); }
-.signal-no-signal { background: var(--text-3); }
+/* Report swatches own their backgrounds. Dashboard/detail signal classes stay text-only. */
+.report-signal-stacked .signal-good,
+.report-signal-legend .signal-good { background: var(--success); }
+.report-signal-stacked .signal-fair,
+.report-signal-legend .signal-fair { background: var(--warning); }
+.report-signal-stacked .signal-poor,
+.report-signal-legend .signal-poor { background: var(--danger); }
+.report-signal-stacked .signal-no-signal,
+.report-signal-legend .signal-no-signal { background: var(--text-3); }
 
 .report-signal-legend {
   display: grid;
