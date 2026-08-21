@@ -451,7 +451,6 @@ export function renderTree(filter = '') {
           <span class="tree-toggle ${shouldExpand ? 'expanded' : ''} ${!hasChildren ? 'empty' : ''}" data-id="${ap.id}">></span>
           <span class="tree-status ${apStatus}"></span>
           <span class="tree-label">${escapeHTML(apName)}</span>
-          ${hasChildren ? `<span class="tree-count">${staCount}</span>` : ''}
         </div>
         ${childrenHtml}
       </div>
@@ -1038,19 +1037,17 @@ function renderDeviceRowContent(device, cols) {
   // Device name - prefer hostname, then product+IP combo, then just IP
   const deviceName = escapeHTML(device.hostname || (device.product ? `${device.product} (${device.ip_address})` : device.ip_address) || device.mac || 'Unknown')
 
-  // Managed devices are explicitly added via Add IP / Add Bulk.
-  // They are directly polled even if they are STAs.
+  // APs are already visually top-level, so only directly managed stations
+  // need role badges. Alertability is shown in the host pane rather than as a
+  // persistent dashboard pill; temporary silences remain visible here.
   const inferredRole = String(device.role || (device.parent_id ? 'sta' : 'ap')).toLowerCase()
-	// For APs, this marker is redundant (APs are already top-level / directly polled),
-	// so only show it for non-AP roles.
-	const directBadge = (device.managed && inferredRole !== 'ap')
-		? `<span class="direct-badge" title="Directly managed (Add IP/Bulk)">DIRECT</span>`
-		: ''
+  const directBadge = (device.managed && inferredRole !== 'ap')
+    ? `<span class="direct-badge" title="Directly managed (Add IP/Bulk)">DIRECT</span>`
+    : ''
   const managedStaBadge = (device.managed && inferredRole === 'sta') ? `<span class="role-badge sta">STA</span>` : ''
-  const alertMutedBadge = device.alertable === false ? `<span class="role-badge muted" title="Device is not alertable">NO ALERTS</span>` : ''
   const alertSilenced = device.alert_silenced_until && new Date(device.alert_silenced_until).getTime() > Date.now()
   const alertSilencedBadge = alertSilenced ? `<span class="role-badge muted" title="Alerts temporarily silenced">SILENCED</span>` : ''
-  
+
   // 60GHz signal - prefer server-computed quality (Go > JS)
   const signal60 = device.signal_60ghz || 0
   const signal60Display = signal60 ? `${signal60} dBm` : '-'
@@ -1109,8 +1106,7 @@ function renderDeviceRowContent(device, cols) {
     ${cols.name !== false ? `
       <td class="cell-name">
         ${isSTA ? '<span class="sta-indent">+-</span>' : ''}
-        <span class="device-name">${deviceName}</span>
-        ${device.peer_count ? `<span class="peer-count">${device.peer_count}</span>` : ''}
+        <span class="device-name">${deviceName}</span>${directBadge}${managedStaBadge}${alertSilencedBadge}
       </td>
     ` : ''}
     ${cols.ip !== false ? `<td class="cell-ip">${escapeHTML(device.ip_address || '-')}</td>` : ''}
@@ -1342,6 +1338,17 @@ function renderDeviceRow(device, cols = {}) {
   
   // Device name - prefer hostname, then product+IP combo, then just IP
   const deviceName = escapeHTML(device.hostname || (device.product ? `${device.product} (${device.ip_address})` : device.ip_address) || device.mac || 'Unknown')
+
+  // APs are already visually top-level, so only directly managed stations
+  // need role badges. Alertability is shown in the host pane rather than as a
+  // persistent dashboard pill; temporary silences remain visible here.
+  const inferredRole = String(device.role || (device.parent_id ? 'sta' : 'ap')).toLowerCase()
+  const directBadge = (device.managed && inferredRole !== 'ap')
+    ? `<span class="direct-badge" title="Directly managed (Add IP/Bulk)">DIRECT</span>`
+    : ''
+  const managedStaBadge = (device.managed && inferredRole === 'sta') ? `<span class="role-badge sta">STA</span>` : ''
+  const alertSilenced = device.alert_silenced_until && new Date(device.alert_silenced_until).getTime() > Date.now()
+  const alertSilencedBadge = alertSilenced ? `<span class="role-badge muted" title="Alerts temporarily silenced">SILENCED</span>` : ''
   
   // 60GHz signal (Wave devices) - prefer server-computed quality
   const signal60 = device.signal_60ghz || 0
@@ -1449,8 +1456,7 @@ function renderDeviceRow(device, cols = {}) {
       ${cols.name !== false ? `
         <td class="cell-name">
           ${isSTA ? '<span class="sta-indent">+-</span>' : ''}
-          <span class="device-name">${deviceName}</span>${directBadge}${managedStaBadge}${alertMutedBadge}${alertSilencedBadge}
-          <span class="peer-count" style="${device.peer_count ? '' : 'display:none'}">${device.peer_count || ''}</span>
+          <span class="device-name">${deviceName}</span>${directBadge}${managedStaBadge}${alertSilencedBadge}
         </td>
       ` : ''}
       ${cols.ip !== false ? `<td class="cell-ip">${escapeHTML(device.ip_address || '-')}</td>` : ''}

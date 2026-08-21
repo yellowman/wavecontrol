@@ -588,14 +588,6 @@ button.status-badge.ultra-btn:hover {
   color: var(--yellow);
 }
 
-.tree-count {
-  font-size: 0.7rem;
-  color: var(--text-3);
-  background: var(--bg-2);
-  padding: 1px 5px;
-  border-radius: 8px;
-}
-
 .tree-children {
   padding-left: 1.25rem;
 }
@@ -3444,15 +3436,6 @@ pre.json {
 .sta-indent {
   color: var(--text-3);
   margin-right: 0.5rem;
-}
-
-.peer-count {
-  background: var(--accent);
-  color: white;
-  font-size: 0.7rem;
-  padding: 0.1rem 0.4rem;
-  border-radius: 10px;
-  margin-left: 0.5rem;
 }
 
 .cell-actions {

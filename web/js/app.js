@@ -1405,16 +1405,6 @@ function updateDeviceRow(id, ip, data) {
       if (capCell.textContent !== newText) capCell.textContent = newText
     }
     
-    // Update peer count
-    const peerBadge = row.querySelector('.peer-count')
-    if (peerBadge && data.peer_count !== undefined) {
-      const newText = String(data.peer_count || '')
-      if (peerBadge.textContent !== newText) {
-        peerBadge.textContent = newText
-        peerBadge.style.display = data.peer_count ? '' : 'none'
-      }
-    }
-
     // Update directional diagnosis (derived)
     if (store.columns.dir && fullDevice) {
       const dirCell = row.querySelector('.cell-dir')

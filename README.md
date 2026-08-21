@@ -19,6 +19,9 @@ These sample views use fictional device names, placeholder metrics, and document
     <td width="50%"><strong>Reports</strong><br><a href="docs/screenshots/reports.png"><img src="docs/screenshots/reports.png" alt="waveControl reports screen"></a></td>
     <td width="50%"><strong>Quality</strong><br><a href="docs/screenshots/quality.png"><img src="docs/screenshots/quality.png" alt="waveControl signal quality screen"></a></td>
   </tr>
+  <tr>
+    <td colspan="2"><strong>Map</strong><br><a href="docs/screenshots/map.png"><img src="docs/screenshots/map.png" alt="waveControl network map with fictional Central Oregon sites and wireless links"></a></td>
+  </tr>
 </table>
 
 ## Built for Large Networks
