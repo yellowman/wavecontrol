@@ -1,39 +1,74 @@
-WaveControl Windows/alerts/sysmon release verification
+WaveControl portable build/install release verification
 Date: 2026-08-20
-Base commit: 0e3cb186d869e63a74ed69694a9d07cffbc94ea5
-Patch commit: b58c394832affcf8a7aeee31dbec986f103881fa
+Parent Git commit: b58c394832affcf8a7aeee31dbec986f103881fa
+Portable build commit: e96975599bde7d21c6640fc9f340ff92af016238
+Scope: portable Linux/OpenBSD Makefile, canonical environment template,
+       automatic environment installation, Windows PowerShell/MSBuild packaging,
+       and installation documentation.
 
 PASSED ON THE FINAL SOURCE TREE
-- gofmt check for cmd/ and internal/
 - git diff --check
-- JavaScript syntax checks for all web/*.js
-- HTML parsing
+- root Makefile help/config/environment-template targets
+- make check using the API-compatible offline dependency harness:
+  - gofmt check
+  - all repository Go tests
+  - go vet ./...
+- Linux amd64 and arm64 cross-builds
+- OpenBSD amd64 and arm64 cross-builds
+- Windows amd64 and arm64 PE cross-builds
+- staged Linux installation with expected binary, systemd unit, web assets,
+  schema, migrations, documentation, runtime directories, and file modes
+- staged OpenBSD installation with an OpenBSD executable, rc.d script,
+  web assets, schema, migrations, documentation, runtime directories, and modes
+- repeated Linux and OpenBSD installation preserves the populated active
+  environment file while restoring mode 0600
+- make env creates the local active file once, preserves its contents on a
+  repeated invocation, and enforces mode 0600
+- staged uninstall removes program assets while preserving configuration,
+  firmware, and configuration backups
+- canonical wavecontrol.env.example is byte-identical to the systemd and
+  Windows distributed copies
+- Makefile static audit excludes known GNU-only functions and syntax
+- OpenBSD make(1) feature review confirms .NOTPARALLEL and .PHONY; OpenBSD
+  install(1) confirms the install -d behavior used by the installer
+- systemd-analyze verification of systemd/wavecontrol.service
+- rc.d shell syntax smoke check
+- Windows MSBuild project XML parsing
+- PowerShell delimiter/string structural checks
+- JavaScript syntax checks for every web JavaScript file
+- HTML parsing and Markdown fence checks
 - static security/removal/schema audit
-- authorization audit: 70 POST/PUT/PATCH/DELETE routes inspected
-- complete offline API-compatible dependency-harness test run
-- complete offline go vet run
-- focused race tests: internal/sysmonalerter, internal/alerting, internal/stats
-- Linux amd64 static cross-build
-- Windows amd64 static cross-build (PE32+ x86-64)
-- Windows arm64 static cross-build (PE32+ ARM64)
-- shell syntax checks
-- sysmon protocol integration tests against a local TLS server
-- pinned-certificate rejection test
-- maintained-session and configuration-wake tests
-- bounded sysmon reply test
-- alert lifecycle/outbox regression tests
-- desktop/mobile visual fixture QA for Alerts and Alert Delivery settings
-- no horizontal page overflow at 1440, 1100, or 430 CSS pixels
-- base patch clean-apply and byte-for-byte working-tree comparison
-- Git bundle verification
+- route authorization audit: 70 state-changing routes inspected
+
+PRODUCTION-MODULE ATTEMPT
+- A normal `make build` using the pinned go.mod/go.sum graph was attempted.
+- It failed while fetching modules because the container DNS resolver could not
+  resolve proxy.golang.org. Compilation did not begin. The complete output and
+  exit status are included in the separate verification evidence package.
 
 ENVIRONMENTAL LIMITATIONS (NOT CLAIMED AS PASSES)
-- The exact production module graph could not be downloaded because this container could not resolve proxy.golang.org. The attempted `go test ./...` failed at dependency retrieval, before compilation or tests.
-- PowerShell was not installed in this Linux container. The PowerShell scripts were manually/static reviewed, but were not parsed or executed by PowerShell here.
-- PostgreSQL server/client binaries were not available, so no live database migration or end-to-end database-backed browser test was run in this environment.
-- The cross-built PE files used the repository's API-compatible offline dependency harness and are verification artifacts, not production binaries. Build deployable Windows binaries with `windows/build.ps1`, which uses the pinned production `go.mod`/`go.sum` graph.
+- No OpenBSD host, OpenBSD make/pmake binary, or OpenBSD ksh was available.
+  The Makefile was exercised with GNU make, constrained to the documented
+  common subset, checked against the official OpenBSD make/install manuals,
+  used to stage a complete OpenBSD root, and used to cross-build OpenBSD
+  amd64/arm64 executables. A native OpenBSD `make check && doas make install`
+  remains the final host-level acceptance test.
+- PowerShell, MSBuild, and the .NET SDK were not installed. The scripts and
+  project were statically reviewed and the project XML parsed, but the complete
+  Windows package workflow was not executed by PowerShell/MSBuild here.
+- PostgreSQL server/client binaries were unavailable, so no live database
+  migration or database-backed browser test was run.
+- Cross-built binaries used the repository's API-compatible offline dependency
+  harness and are verification artifacts, not deployable release binaries.
+  Production packages must be built from the pinned normal go.mod/go.sum graph.
 
-PACKAGE POLICY
-- This clean source archive excludes generated verification binaries/logs, old package patches/manifests, the offline module override, and duplicate archive material.
-- `release/CHANGES_FROM_0e3cb186.patch` applies the complete change set to the named base commit.
-- The separately supplied Git bundle contains complete history and branch `openai/windows-alerts-sysmon`.
+INSTALLATION SAFETY PROPERTIES
+- `make install` never rebuilds as root; it requires a previously built binary.
+- `DESTDIR` staging never creates or changes host accounts.
+- `/etc/wavecontrol/wavecontrol.env` is created automatically only when absent,
+  is mode 0600, and is never overwritten during reinstall/upgrade.
+- The canonical sample is installed separately as wavecontrol.env.example.
+- Firmware, configuration backups, and the active environment file survive
+  reinstall and uninstall workflows.
+- Windows packaging creates wavecontrol.env automatically and `-KeepExisting`
+  preserves the populated file and operator runtime data.

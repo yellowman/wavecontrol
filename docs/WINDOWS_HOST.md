@@ -6,6 +6,8 @@ WaveControl on Windows is the same Ubiquiti network-management application as on
 
 - 64-bit Windows 10, Windows 11, or Windows Server 2019 or later
 - Go 1.21 or later for source builds
+- Windows PowerShell 5.1 or PowerShell 7 for the primary package workflow
+- Optional: the .NET SDK or Visual Studio Build Tools for the MSBuild entry point
 - PostgreSQL 14 or later, local or reachable over the network
 - Network reachability from the Windows host to the Ubiquiti management addresses
 
@@ -13,22 +15,49 @@ The server is pure Go and builds with `CGO_ENABLED=0`. PostgreSQL remains an ext
 
 ## Build a complete Windows directory
 
-From PowerShell at the repository root:
+The primary Windows build entry point is the PowerShell packager. From PowerShell at the repository root:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\windows\build.ps1
 ```
 
-The default output is `dist\windows-amd64`. It contains the executable, `web` assets, schema, migrations, documentation, empty firmware/backup directories, the run script, and an executable SHA-256 file.
+The default output is `dist\windows-amd64`. It contains the executable, web assets, schema, migrations, documentation, empty firmware/backup directories, the run script, an executable SHA-256 file, `wavecontrol.env.example`, and an initial `wavecontrol.env`. The active environment file is therefore ready to edit immediately; no manual copy step is required.
 
-To cross-build ARM64 Windows instead:
+To build ARM64 Windows instead:
 
 ```powershell
 .\windows\build.ps1 -Architecture arm64
 ```
 
-`build.ps1` runs `go test ./...` before building. `-SkipTests` exists for packaging only; it should not be used for a release build.
+`build.ps1` runs `go test ./...` before building. `-SkipTests` exists for packaging diagnostics only and should not be used for a release build. To update an existing package directory while preserving its populated environment file, firmware, and backups:
+
+```powershell
+.\windows\build.ps1 -KeepExisting
+```
+
+The builder replaces packaged web assets and migrations even with `-KeepExisting`, preventing stale files from surviving an upgrade.
+
+### Optional MSBuild project
+
+`windows\WaveControl.proj` is a normal MSBuild orchestration project for build agents, Visual Studio Build Tools, or developers who prefer a project-builder interface. It deliberately calls the same PowerShell packager so both workflows produce identical layouts.
+
+```powershell
+# With the .NET SDK
+dotnet msbuild .\windows\WaveControl.proj /t:Package /p:Architecture=amd64
+
+# With Visual Studio Build Tools
+msbuild .\windows\WaveControl.proj /t:Package /p:Architecture=arm64
+```
+
+Supported properties include:
+
+- `/p:SkipTests=true`
+- `/p:KeepExisting=true`
+- `/p:OutputDirectory=C:\WaveControlBuild`
+- `/p:PowerShellExe=pwsh.exe`
+
+The `Clean` target removes the selected output directory, and the `Test` target runs `go test ./...` directly.
 
 ## Initialize PostgreSQL
 
@@ -44,13 +73,14 @@ Use a strong database password and place it in the DSN in `wavecontrol.env`. Exi
 
 ## Configure and run
 
-Inside the built directory:
+Inside the built directory, edit the automatically installed active environment file and run the launcher:
 
 ```powershell
-Copy-Item .\wavecontrol.env.example .\wavecontrol.env
 notepad .\wavecontrol.env
 .\run-wavecontrol.ps1
 ```
+
+If the active file is missing but `wavecontrol.env.example` is present, the launcher creates it and stops with an instruction to edit it. The parser accepts the canonical sample's matching single or double quotes and rejects untouched placeholder values.
 
 Generate the two persistent secrets once and keep them unchanged across restarts:
 
@@ -73,7 +103,7 @@ icacls .\wavecontrol.env /inheritance:r
 icacls .\wavecontrol.env /grant:r 'Administrators:F' 'wavecontrol-svc:R'
 ```
 
-The run script always starts WaveControl in the foreground and explicitly supplies executable-relative paths. This avoids the common Windows behavior where Explorer, Task Scheduler, or a service wrapper starts an executable with `C:\Windows\System32` as its working directory.
+The run script validates the DSN, JWT secret, and exact 256-bit data key before launch. It starts WaveControl in the foreground and explicitly supplies executable-relative paths. This avoids the common Windows behavior where Explorer, Task Scheduler, or a service wrapper starts an executable with `C:\Windows\System32` as its working directory.
 
 ## Automatic startup
 
@@ -87,8 +117,17 @@ WaveControl needs outbound management access to the Ubiquiti devices, PostgreSQL
 
 ## Upgrade procedure
 
-1. Stop the scheduled task/service wrapper.
-2. Back up PostgreSQL and the WaveControl directory.
-3. Replace `wavecontrol.exe` and `web` with the new package.
-4. Preserve `wavecontrol.env`, `firmware`, `backups`, `WAVECONTROL_JWT_SECRET`, and `WAVECONTROL_DATA_KEY`.
-5. Start WaveControl and verify `/health`, login, polling, and alert delivery readiness.
+For an in-place package directory created by the build script:
+
+1. Stop the scheduled task or service wrapper.
+2. Back up PostgreSQL and the complete WaveControl directory.
+3. From the updated source tree, rebuild into that directory with `-KeepExisting`:
+
+   ```powershell
+   .\windows\build.ps1 -KeepExisting -OutputDirectory C:\WaveControl
+   ```
+
+4. Confirm that `wavecontrol.env`, `firmware`, and `backups` are still present and retain their ACLs.
+5. Start WaveControl and verify `/health`, login, polling, and alert-delivery readiness.
+
+When deploying a separately built package, replace the executable, web assets, migrations, schema, documentation, and run script while preserving `wavecontrol.env`, `firmware`, `backups`, `WAVECONTROL_JWT_SECRET`, and `WAVECONTROL_DATA_KEY`.

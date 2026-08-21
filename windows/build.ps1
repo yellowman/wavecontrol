@@ -23,8 +23,19 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 $Go = Get-Command go -ErrorAction Stop
 Write-Host ("Using {0}" -f (& $Go.Source version))
 
-if ((Test-Path $OutputDirectory) -and -not $KeepExisting) {
-    Remove-Item -Recurse -Force $OutputDirectory
+if (Test-Path $OutputDirectory) {
+    if (-not $KeepExisting) {
+        Remove-Item -Recurse -Force $OutputDirectory
+    } else {
+        # Keep operator-owned state, but replace packaged assets so stale files
+        # cannot survive an upgrade build.
+        foreach ($RelativePath in @('web', 'migrations')) {
+            $PackagedPath = Join-Path $OutputDirectory $RelativePath
+            if (Test-Path $PackagedPath) {
+                Remove-Item -Recurse -Force $PackagedPath
+            }
+        }
+    }
 }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
@@ -60,7 +71,14 @@ try {
     Copy-Item -Force (Join-Path $RepositoryRoot 'docs\ALERTING.md') $OutputDirectory
     Copy-Item -Force (Join-Path $RepositoryRoot 'docs\SYSMON_WEB_ALERTER.md') $OutputDirectory
     Copy-Item -Force (Join-Path $PSScriptRoot 'run-wavecontrol.ps1') $OutputDirectory
-    Copy-Item -Force (Join-Path $PSScriptRoot 'wavecontrol.env.example') $OutputDirectory
+
+    $EnvironmentTemplate = Join-Path $RepositoryRoot 'wavecontrol.env.example'
+    $PackagedEnvironmentTemplate = Join-Path $OutputDirectory 'wavecontrol.env.example'
+    $PackagedEnvironment = Join-Path $OutputDirectory 'wavecontrol.env'
+    Copy-Item -Force $EnvironmentTemplate $PackagedEnvironmentTemplate
+    if (-not (Test-Path -LiteralPath $PackagedEnvironment -PathType Leaf)) {
+        Copy-Item -Force $EnvironmentTemplate $PackagedEnvironment
+    }
 
     New-Item -ItemType Directory -Force -Path (Join-Path $OutputDirectory 'firmware') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $OutputDirectory 'backups') | Out-Null
@@ -71,7 +89,8 @@ try {
     Write-Host ''
     Write-Host 'Windows package created:' -ForegroundColor Green
     Write-Host $OutputDirectory
-    Write-Host 'Copy wavecontrol.env.example to wavecontrol.env, fill in the required values, then run:'
+    Write-Host 'wavecontrol.env was created automatically if it did not already exist.'
+    Write-Host 'Edit wavecontrol.env, then run:'
     Write-Host '.\run-wavecontrol.ps1'
 }
 finally {

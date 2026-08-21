@@ -1,0 +1,34 @@
+<Project DefaultTargets="Package" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Optional MSBuild entry point for Windows build agents and Visual Studio
+    Build Tools. The PowerShell packager remains the implementation so the
+    MSBuild and direct PowerShell workflows produce the same directory layout.
+  -->
+  <PropertyGroup>
+    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\'))</RepositoryRoot>
+    <Architecture Condition="'$(Architecture)' == ''">amd64</Architecture>
+    <OutputDirectory Condition="'$(OutputDirectory)' == ''">$(RepositoryRoot)dist\windows-$(Architecture)</OutputDirectory>
+    <PowerShellExe Condition="'$(PowerShellExe)' == ''">powershell.exe</PowerShellExe>
+    <SkipTests Condition="'$(SkipTests)' == ''">false</SkipTests>
+    <KeepExisting Condition="'$(KeepExisting)' == ''">false</KeepExisting>
+    <SkipTestsSwitch Condition="'$(SkipTests)' == 'true'">-SkipTests</SkipTestsSwitch>
+    <KeepExistingSwitch Condition="'$(KeepExisting)' == 'true'">-KeepExisting</KeepExistingSwitch>
+  </PropertyGroup>
+
+  <Target Name="Package">
+    <Message Importance="high" Text="Packaging WaveControl for Windows $(Architecture)" />
+    <Exec
+      WorkingDirectory="$(RepositoryRoot)"
+      Command="&quot;$(PowerShellExe)&quot; -NoLogo -NoProfile -ExecutionPolicy Bypass -File &quot;$(RepositoryRoot)windows\build.ps1&quot; -Architecture &quot;$(Architecture)&quot; -OutputDirectory &quot;$(OutputDirectory)&quot; $(SkipTestsSwitch) $(KeepExistingSwitch)" />
+  </Target>
+
+  <Target Name="Build" DependsOnTargets="Package" />
+
+  <Target Name="Test">
+    <Exec WorkingDirectory="$(RepositoryRoot)" Command="go test ./..." />
+  </Target>
+
+  <Target Name="Clean">
+    <RemoveDir Directories="$(OutputDirectory)" Condition="Exists('$(OutputDirectory)')" />
+  </Target>
+</Project>

@@ -270,101 +270,177 @@ psql -U wavecontrol -h localhost wavecontrol < schema.sql
 Install PostgreSQL 14+ locally or use a reachable PostgreSQL server, then create the database and load `schema.sql` with `psql.exe`. The Windows package/build procedure is documented in [docs/WINDOWS_HOST.md](docs/WINDOWS_HOST.md).
 
 
-### Build and Run
+### Linux and OpenBSD: make workflow
 
-```bash
-# Generate persistent secrets once. Keep both values across restarts.
-export WAVECONTROL_DSN="postgres://wavecontrol:your-password-here@127.0.0.1/wavecontrol?sslmode=disable"
-export WAVECONTROL_JWT_SECRET="$(openssl rand -base64 48)"
-export WAVECONTROL_DATA_KEY="$(openssl rand -base64 32)"
+The repository includes a single portable `Makefile` written for the common GNU make/BSD make (pmake) subset. Use the native `make` command on both Linux and OpenBSD.
 
-# An empty database also requires an explicit first administrator.
-export WAVECONTROL_BOOTSTRAP_USERNAME="wavecontrol-admin"
-export WAVECONTROL_BOOTSTRAP_PASSWORD="replace-with-a-strong-password"
+Build as an ordinary user:
 
-# Build
-go build -o wavecontrol ./cmd/server
-
-# Run in daemon mode (default - backgrounds, logs to syslog)
-./wavecontrol
-
-# Run in debug/foreground mode (for development)
-./wavecontrol -d
-
-# Access UI: http://localhost:8080
-# Remove the two WAVECONTROL_BOOTSTRAP_* variables after the first successful start.
+```sh
+make
 ```
 
-On Windows, use the complete PowerShell packaging path rather than copying only the executable:
+For a release-oriented local check:
+
+```sh
+make check
+```
+
+`make check` verifies Go formatting, confirms that the three distributed environment templates are identical, runs `go test ./...`, and runs `go vet ./...`.
+
+Install from the same source tree after a successful build:
+
+```sh
+# Linux
+sudo make install
+
+# OpenBSD
+doas make install
+```
+
+`make install` performs the complete host installation:
+
+- Creates the `_wavecontrol` user and group when absent, with `/var/wavecontrol` as its home.
+- Installs the binary as `/usr/local/bin/wavecontrol`.
+- Installs immutable web assets under `/var/wavecontrol/web` and writable firmware/configuration-backup directories under `/var/wavecontrol`.
+- Installs `schema.sql`, migrations, and documentation under `/usr/local/share`.
+- Installs the systemd unit on Linux or the rc.d script on OpenBSD.
+- Installs `/etc/wavecontrol/wavecontrol.env.example` and creates `/etc/wavecontrol/wavecontrol.env` automatically **only when the active file does not already exist**. Upgrades never overwrite the populated environment file.
+
+Edit the installed environment file before starting the service:
+
+```sh
+sudoedit /etc/wavecontrol/wavecontrol.env       # Linux
+# or
+doas vi /etc/wavecontrol/wavecontrol.env       # OpenBSD
+```
+
+Generate the persistent secrets once:
+
+```sh
+openssl rand -base64 48   # WAVECONTROL_JWT_SECRET
+openssl rand -base64 32   # WAVECONTROL_DATA_KEY
+```
+
+Set the PostgreSQL DSN, replace both secret placeholders, and—only for the first start of an empty database—uncomment the bootstrap username and password. After the administrator account is created, comment or remove the two bootstrap variables and restart WaveControl. Never rotate `WAVECONTROL_DATA_KEY` on an existing database without first re-encrypting the stored credentials.
+
+Load a new database from the source tree or the installed schema:
+
+```sh
+psql -U wavecontrol -h 127.0.0.1 wavecontrol < schema.sql
+# installed copy:
+psql -U wavecontrol -h 127.0.0.1 wavecontrol < /usr/local/share/wavecontrol/schema.sql
+```
+
+Enable and start the installed service through the same Makefile:
+
+```sh
+# Linux
+sudo make enable start
+sudo make status
+
+# OpenBSD
+doas make enable start
+doas make status
+```
+
+For an upgrade, stop or leave the service running as operationally appropriate, build as the normal account, rerun `make install` as root, and then run `make restart`. The installer replaces packaged assets while preserving `/etc/wavecontrol/wavecontrol.env`, firmware, and configuration backups.
+
+Useful targets:
+
+| Target | Purpose |
+|---|---|
+| `make` or `make build` | Build `build/wavecontrol` for the current host |
+| `make check` | Formatting, environment-template, tests, and vet |
+| `make env` | Create a local `wavecontrol.env` from the sample without overwriting it |
+| `make run` | Run a foreground development instance using `.wavecontrol/` |
+| `make cross-linux TARGET_ARCH=arm64` | Cross-build a Linux executable |
+| `make cross-openbsd TARGET_ARCH=amd64` | Cross-build an OpenBSD executable |
+| `make cross-windows TARGET_ARCH=amd64` | Cross-build only the Windows executable |
+| `make install` | Complete Linux/OpenBSD installation |
+| `make enable`, `start`, `restart`, `status`, `stop` | Manage the native service |
+| `make uninstall` | Remove program files while preserving configuration and runtime data |
+| `make help` | Show the target summary |
+
+A packaging system can stage files without modifying the build host:
+
+```sh
+make install DESTDIR=/tmp/wavecontrol-linux INSTALL_OS=Linux
+
+make cross-openbsd TARGET_ARCH=amd64
+make install DESTDIR=/tmp/wavecontrol-openbsd INSTALL_OS=OpenBSD \
+    BINARY=build/openbsd-amd64/wavecontrol
+```
+
+### Development run
+
+Create and edit a repository-local environment file, then run in the foreground:
+
+```sh
+make env
+vi wavecontrol.env
+make run
+```
+
+The local environment file is mode `0600` and ignored by Git. Runtime firmware and backup data are kept under `.wavecontrol/`, also ignored by Git.
+
+### Windows build and package workflow
+
+Windows remains only a host for WaveControl; the monitored devices are still Ubiquiti radios. The complete package—not a bare `.exe`—should be built from PowerShell:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process Bypass
 .\windows\build.ps1
-Copy-Item .\dist\windows-amd64\wavecontrol.env.example .\dist\windows-amd64\wavecontrol.env
+notepad .\dist\windows-amd64\wavecontrol.env
 .\dist\windows-amd64\run-wavecontrol.ps1
 ```
 
-The script supplies executable-relative working and web-root paths so launches from Explorer, Task Scheduler, or a service wrapper do not accidentally look for assets under `C:\Windows\System32`.
+The builder runs the Go tests, compiles a native Windows executable with `CGO_ENABLED=0`, and packages the web UI, migrations, schema, documentation, runtime directories, and launch script. It installs both `wavecontrol.env.example` and an initial `wavecontrol.env` automatically. An existing active environment file is preserved when rebuilding with `-KeepExisting`:
 
-### Directory Setup
-
-Create the wavecontrol user and directories before first run. Once set up, just run `wavecontrol` with no flags - it automatically drops to `_wavecontrol` and uses their home directory.
-
-#### Linux (Debian/Ubuntu)
-
-```bash
-# Create dedicated user with home /var/wavecontrol
-useradd -r -s /usr/sbin/nologin -d /var/wavecontrol -m _wavecontrol
-
-# Copy web assets
-cp -r web /var/wavecontrol/
-
-# Create writable directories
-mkdir -p /var/wavecontrol/{firmware,backups}
-chown -R _wavecontrol:_wavecontrol /var/wavecontrol
-
-# Install binary
-cp wavecontrol /usr/local/bin/
+```powershell
+.\windows\build.ps1 -Architecture arm64
+.\windows\build.ps1 -KeepExisting
 ```
 
-#### OpenBSD
+For Windows build agents or developers who prefer a project-builder entry point, the repository also includes a normal MSBuild project that invokes the same PowerShell packager:
 
-```bash
-# Create dedicated user with home /var/wavecontrol
-useradd -s /sbin/nologin -d /var/wavecontrol -m _wavecontrol
+```powershell
+# .NET SDK
+dotnet msbuild .\windows\WaveControl.proj /t:Package /p:Architecture=amd64
 
-# Copy web assets
-cp -r web /var/wavecontrol/
-
-# Create writable directories
-mkdir -p /var/wavecontrol/{firmware,backups}
-chown -R _wavecontrol:_wavecontrol /var/wavecontrol
-
-# Install binary
-cp wavecontrol /usr/local/bin/
+# Visual Studio Build Tools
+msbuild .\windows\WaveControl.proj /t:Package /p:Architecture=arm64
 ```
 
-#### Directory Structure
+Optional MSBuild properties include `/p:SkipTests=true`, `/p:KeepExisting=true`, `/p:OutputDirectory=C:\WaveControlBuild`, and `/p:PowerShellExe=pwsh.exe`.
 
-After setup:
+The launch script accepts quoted or unquoted values in `wavecontrol.env`, validates the required DSN and persistent secrets, creates the runtime directories, and supplies executable-relative working and web-root paths. This makes launches from Explorer, Task Scheduler, or a service wrapper independent of the caller's working directory. See [Windows host installation](docs/WINDOWS_HOST.md) for PostgreSQL, ACL, startup, firewall, and upgrade details.
+
+### Installed directory layout
 
 ```
 /usr/local/bin/
-+-- wavecontrol              # Binary
++-- wavecontrol
 
-/var/wavecontrol/            # _wavecontrol home directory
-+-- web/                     # Web assets (copied from archive)
-|   +-- index.html
-|   +-- js/
-|   +-- css/
-+-- firmware/                # Firmware .bin files (upload via UI or copy)
-+-- backups/                 # Device config backups (created at runtime)
+/usr/local/share/wavecontrol/
++-- schema.sql
++-- migrations/
+
+/etc/wavecontrol/
++-- wavecontrol.env.example
++-- wavecontrol.env          # generated once; operator-owned secrets
+
+/var/wavecontrol/
++-- web/                     # installed read-only application assets
++-- firmware/                # writable firmware uploads
++-- backups/                 # writable device configuration backups
 ```
 
-| Directory | Purpose | Writable |
-|-----------|---------|----------|
-| `web/` | Static assets | No (read-only) |
-| `firmware/` | Firmware uploads | Yes |
-| `backups/` | Config backups | Yes |
+| Directory | Purpose | Writable by WaveControl |
+|---|---|---|
+| `/var/wavecontrol/web` | Static browser assets | No |
+| `/var/wavecontrol/firmware` | Firmware uploads | Yes |
+| `/var/wavecontrol/backups` | Device configuration backups | Yes |
 
 ### Command Line Flags
 
@@ -393,12 +469,14 @@ Use `-U` to skip chroot (just chdir to user's home without chroot).
 
 **Chroot Semantics (when running as root):**
 
-The chroot jail provides defense-in-depth by restricting filesystem access:
+The chroot jail provides defense-in-depth by restricting filesystem access. The actual startup order is:
 
-1. **Before chroot:** Opens database connection, binds listen socket, loads TLS certs
-2. **Chroot call:** Changes root directory to service user's home (e.g., `/var/wavecontrol`)
-3. **After chroot:** Only files inside the jail are accessible; `/etc`, `/usr`, etc. are unreachable
-4. **Privilege drop:** Switches to unprivileged user via setuid/setgid
+1. **Before chroot:** Resolves the working/web paths, daemonizes, initializes logging, and writes the PID file
+2. **Chroot call:** Changes the filesystem root to the service user's home (for example, `/var/wavecontrol`)
+3. **Privilege drop:** Switches to the unprivileged account with `setgid`/`setuid`, then applies the OpenBSD pledge
+4. **Inside the jail:** Loads the application secrets, connects to PostgreSQL, initializes services, binds the HTTP listener, and begins polling
+
+Only files inside the jail are accessible after step 2; `/etc`, `/usr`, and host resolver/certificate files are otherwise unreachable.
 
 This means:
 - Firmware files must be inside the chroot (default: `./firmware/` relative to home)
@@ -409,7 +487,8 @@ This means:
 **Chroot requirements:**
 - Use IP address in DSN (`127.0.0.1` not `localhost`) - no DNS resolution after chroot
 - PostgreSQL must accept TCP connections (not Unix socket paths)
-- All required files (web assets, firmware, TLS certs) must be inside or loaded before chroot
+- Web assets, firmware, backups, and any filesystem-based certificate material needed at runtime must be inside the jail
+- Use `-U` when an integration must use host resolver or CA files that are intentionally kept outside `/var/wavecontrol`
 
 ### Reverse Proxy Setup
 
@@ -492,62 +571,42 @@ rcctl start relayd
 
 ### Running as a Service
 
-#### systemd (Linux)
+The portable Makefile installs and manages the appropriate native service definition:
 
-Install the supplied unit and root-owned environment file:
+```sh
+# Linux/systemd
+sudo make enable start
+sudo make status
 
-```bash
-install -d -m 0750 /etc/wavecontrol
-install -m 0600 systemd/wavecontrol.env.example /etc/wavecontrol/wavecontrol.env
-install -m 0644 systemd/wavecontrol.service /etc/systemd/system/wavecontrol.service
-
-# Edit the DSN and generate the two persistent secrets in wavecontrol.env.
-# For an empty database, temporarily enable the two bootstrap variables.
-systemctl daemon-reload
-systemctl enable --now wavecontrol
+# OpenBSD rc.d
+doas make enable start
+doas make status
 ```
 
-After the first administrator is created, remove the bootstrap username/password from the environment file and restart. Never regenerate `WAVECONTROL_DATA_KEY` on an existing database; it protects stored device and service credentials.
+The Linux unit runs the server in the foreground as `_wavecontrol` and reads the root-owned `/etc/wavecontrol/wavecontrol.env`. The OpenBSD rc.d script starts as root so WaveControl can chroot and drop privileges to `_wavecontrol`; it sources the same root-owned environment file before doing so. Neither service generates secrets at startup.
 
-#### OpenBSD rc.d
-
-Install the supplied rc.d script and the same persistent environment file:
-
-```bash
-install -d -m 0750 /etc/wavecontrol
-install -m 0600 systemd/wavecontrol.env.example /etc/wavecontrol/wavecontrol.env
-install -m 0555 rc.d/wavecontrol /etc/rc.d/wavecontrol
-
-# Edit /etc/wavecontrol/wavecontrol.env before starting.
-rcctl enable wavecontrol
-rcctl start wavecontrol
-```
-
-The rc.d script refuses to start without all three required variables. It never generates replacement keys at boot.
+On Windows, run `run-wavecontrol.ps1` under a dedicated non-administrator account through Task Scheduler or a service wrapper with restart-on-failure configured. The script always runs WaveControl in the foreground and uses absolute package-relative paths.
 
 ## Quick Start
 
-For development/testing:
+For a source-tree development instance:
 
-```bash
-# 1. Create database (as postgres superuser)
+```sh
+# Create and load PostgreSQL first.
 psql -U postgres -c "CREATE DATABASE wavecontrol;"
 psql -U postgres wavecontrol < schema.sql
 
-# 2. Set persistent application secrets and an explicit first administrator
-export WAVECONTROL_DSN="postgres://postgres@127.0.0.1/wavecontrol?sslmode=disable"
-export WAVECONTROL_JWT_SECRET="$(openssl rand -base64 48)"
-export WAVECONTROL_DATA_KEY="$(openssl rand -base64 32)"
-export WAVECONTROL_BOOTSTRAP_USERNAME="wavecontrol-admin"
-export WAVECONTROL_BOOTSTRAP_PASSWORD="replace-with-a-strong-password"
+# Create the local sample and edit the DSN/secrets/bootstrap values.
+make env
+vi wavecontrol.env
 
-# 3. Build and run
-go build -o wavecontrol ./cmd/server
-./wavecontrol -d
-
-# 4. Access UI at http://localhost:8080, sign in with the bootstrap account,
-# then remove the two bootstrap variables.
+# Build and run in the foreground.
+make run
 ```
+
+Open `http://127.0.0.1:8080`, sign in with the explicit bootstrap account, then remove the bootstrap variables from `wavecontrol.env` before the next restart.
+
+For an installed Linux or OpenBSD host, use the full `make`, privileged `make install`, environment edit, and `make enable start` sequence in the Installation section instead.
 
 ## Security & Privileges
 
@@ -809,6 +868,8 @@ Protected browser API requests use the HttpOnly cookie. State-changing requests 
 
 ```
 wavecontrol/
++-- Makefile              # GNU make/BSD make build, install, and service workflow
++-- wavecontrol.env.example # Canonical cross-platform environment template
 +-- cmd/server/
 |   +-- main.go        # HTTP server, poller startup
 |   +-- api.go         # REST API handlers
@@ -822,9 +883,11 @@ wavecontrol/
 |   +-- index.html     # SPA HTML
 |   +-- css/styles.css # Dark/light theme
 |   +-- js/            # Frontend modules
-+-- rc.d/wavecontrol   # OpenBSD rc.d script
-+-- systemd/wavecontrol.service  # Linux systemd unit
-+-- schema.sql         # PostgreSQL schema
++-- rc.d/wavecontrol          # OpenBSD rc.d script
++-- systemd/wavecontrol.service # Linux systemd unit
++-- windows/build.ps1          # Complete Windows packager
++-- windows/WaveControl.proj   # Optional MSBuild entry point
++-- schema.sql                 # PostgreSQL schema
 +-- go.mod
 ```
 

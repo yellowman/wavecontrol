@@ -5464,6 +5464,25 @@ Alert evaluation is server-authoritative and uses two layers:
 Evaluation order is: enabled rule, scope match, role match, alertable/silence gate, metric existence, threshold condition, persistence, cooldown, transactional occurrence/outbox creation. Full lifecycle semantics are defined in the Alerting System section and `docs/ALERTING.md`.
 
 
+## Host build and installation workflow
+
+The repository root provides one `Makefile` for GNU make on Linux and BSD make on OpenBSD. It must remain within their shared pmake-compatible feature subset: ordinary variables and targets, `.PHONY`, shell recipes, and no GNU-only make functions or pattern-specific behavior. The normal workflow is an unprivileged `make`, followed by privileged `make install`.
+
+The Unix installer must:
+
+- Create the `_wavecontrol` user/group when absent and require `/var/wavecontrol` as the account home.
+- Install the binary under `/usr/local/bin`, schema/migrations/documentation under `/usr/local/share`, web assets under `/var/wavecontrol/web`, and the native systemd or rc.d definition.
+- Create writable `/var/wavecontrol/firmware` and `/var/wavecontrol/backups` directories without making the web tree writable by the daemon.
+- Install the canonical `wavecontrol.env.example` and create `/etc/wavecontrol/wavecontrol.env` only when it does not already exist. Reinstallation may harden its mode but must never replace its contents.
+- Support staged packaging through `DESTDIR` and explicit Linux/OpenBSD service selection without creating accounts on the build host.
+
+`make env` follows the same create-if-missing rule for a repository-local development environment. `make run` uses an isolated `.wavecontrol` runtime directory and must refuse a root development launch.
+
+The canonical environment sample is shared by systemd, OpenBSD rc.d, and Windows. It uses the common one-line `NAME=value` syntax, documents persistent key handling, and keeps first-user bootstrap credentials disabled until explicitly configured.
+
+Windows packaging is implemented by `windows/build.ps1`. The optional `windows/WaveControl.proj` MSBuild entry point must invoke that same packager rather than maintain a second packaging implementation. A package contains both `wavecontrol.env.example` and an automatically created `wavecontrol.env`; `-KeepExisting` preserves the populated active file and runtime data while replacing packaged assets.
+
+
 ## Windows host runtime
 
 Windows is a supported WaveControl server host, not a monitored endpoint type. `GOOS=windows` builds must use `CGO_ENABLED=0` and include the same Ubiquiti poller, PostgreSQL storage, web UI, alert engine, and report implementation as Unix builds.

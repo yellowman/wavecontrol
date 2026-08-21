@@ -15,7 +15,12 @@ if ([string]::IsNullOrWhiteSpace($EnvironmentFile)) {
 }
 
 if (-not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {
-    throw "Environment file not found: $EnvironmentFile. Copy wavecontrol.env.example to wavecontrol.env and configure it first."
+    $Template = Join-Path $Root 'wavecontrol.env.example'
+    if (Test-Path -LiteralPath $Template -PathType Leaf) {
+        Copy-Item -LiteralPath $Template -Destination $EnvironmentFile
+        throw "Created $EnvironmentFile from the sample. Edit it before starting WaveControl."
+    }
+    throw "Environment file not found: $EnvironmentFile"
 }
 
 foreach ($RawLine in Get-Content -LiteralPath $EnvironmentFile) {
@@ -24,8 +29,15 @@ foreach ($RawLine in Get-Content -LiteralPath $EnvironmentFile) {
     $Separator = $Line.IndexOf('=')
     if ($Separator -lt 1) { throw "Invalid environment line: $RawLine" }
     $Name = $Line.Substring(0, $Separator).Trim()
-    $Value = $Line.Substring($Separator + 1)
+    $Value = $Line.Substring($Separator + 1).Trim()
     if ($Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Invalid environment variable name: $Name" }
+    if ($Value.Length -ge 2) {
+        $First = $Value[0]
+        $Last = $Value[$Value.Length - 1]
+        if (($First -eq "'" -and $Last -eq "'") -or ($First -eq '"' -and $Last -eq '"')) {
+            $Value = $Value.Substring(1, $Value.Length - 2)
+        }
+    }
     [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
 }
 
@@ -33,6 +45,7 @@ $Required = @('WAVECONTROL_DSN', 'WAVECONTROL_JWT_SECRET', 'WAVECONTROL_DATA_KEY
 foreach ($Name in $Required) {
     $Value = [Environment]::GetEnvironmentVariable($Name, 'Process')
     if ([string]::IsNullOrWhiteSpace($Value)) { throw "$Name is required in $EnvironmentFile" }
+    if ($Value -match 'CHANGE_ME|REPLACE_WITH') { throw "$Name still contains a sample placeholder in $EnvironmentFile" }
 }
 if ($env:WAVECONTROL_JWT_SECRET.Length -lt 32) {
     throw 'WAVECONTROL_JWT_SECRET must be at least 32 characters.'

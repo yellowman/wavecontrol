@@ -1,4 +1,4 @@
-# WaveControl v145: Windows host, expanded alerts, and sysmon-web delivery
+# WaveControl v145: portable installation, Windows host, expanded alerts, and sysmon-web delivery
 
 Release date: 2026-08-20  
 Base commit: `0e3cb186d869e63a74ed69694a9d07cffbc94ea5`
@@ -6,6 +6,15 @@ Base commit: `0e3cb186d869e63a74ed69694a9d07cffbc94ea5`
 ## Scope boundary
 
 Windows support means that the WaveControl server can be built and run on a Windows host. It does **not** add Windows endpoint monitoring. WaveControl continues to poll and alert on Ubiquiti APs and subscriber radios only.
+
+## Portable build and installation workflow
+
+- Root `Makefile` works with GNU make on Linux and BSD make on OpenBSD without GNU-only make functions.
+- Normal workflow is `make`, privileged `make install`, edit `/etc/wavecontrol/wavecontrol.env`, then `make enable start`.
+- The installer creates the `_wavecontrol` account when absent, installs runtime assets and the native service definition, supports `DESTDIR`, and preserves configuration/firmware/backups during upgrades.
+- `wavecontrol.env.example` is the canonical cross-platform sample. Unix installation creates the active file only when absent; `make env` does the same for development.
+- Windows packaging now creates the active environment file automatically and preserves it with `-KeepExisting`.
+- `windows/WaveControl.proj` provides an optional MSBuild entry point while delegating to the same PowerShell packager.
 
 ## Windows hosting
 
