@@ -9,6 +9,25 @@ import {
   triggerUpdateCounts
 } from './virtual-integration.js?v=11'
 
+
+async function requestConfirmation(message, options = {}) {
+  const dialog = window.waveControlConfirm
+  if (typeof dialog !== 'function') {
+    showToast('The confirmation dialog is not available. Reload WaveControl and try again.', 'error')
+    return false
+  }
+  return Boolean(await dialog(message, options))
+}
+
+async function requestInput(options = {}) {
+  const dialog = window.waveControlInput
+  if (typeof dialog !== 'function') {
+    showToast('The input dialog is not available. Reload WaveControl and try again.', 'error')
+    return null
+  }
+  return dialog(options)
+}
+
 // Use threshold from virtual-integration.js
 const VIRTUAL_TABLE_THRESHOLD = VIRTUAL_THRESHOLD
 
@@ -753,7 +772,17 @@ function renderDevicesRegular(container) {
     btn.addEventListener('click', async e => {
       e.stopPropagation()
       const id = parseInt(btn.dataset.id)
-      if (!confirm('Delete this device?')) return
+      const confirmed = await requestConfirmation(
+        'This device and its WaveControl inventory record will be removed. Discovered child devices may also disappear from the current view.',
+        {
+          title: 'Delete device?',
+          eyebrow: 'Inventory change',
+          confirmText: 'Delete device',
+          tone: 'danger',
+          calloutTitle: 'This action removes the selected device from WaveControl.'
+        }
+      )
+      if (!confirmed) return
       
       try {
         await api.deleteDevice(id)
@@ -1251,7 +1280,17 @@ async function handleRefreshClick(deviceId) {
 
 // Handle delete button click  
 async function handleDeleteClick(deviceId) {
-  if (!confirm('Delete this device?')) return
+  const confirmed = await requestConfirmation(
+    'This device and its WaveControl inventory record will be removed. Discovered child devices may also disappear from the current view.',
+    {
+      title: 'Delete device?',
+      eyebrow: 'Inventory change',
+      confirmText: 'Delete device',
+      tone: 'danger',
+      calloutTitle: 'This action removes the selected device from WaveControl.'
+    }
+  )
+  if (!confirmed) return
   
   try {
     await api.deleteDevice(deviceId)
@@ -2935,85 +2974,167 @@ export function renderLogs(container, logs) {
 
 // Render users management
 export function renderUsers(container, users, roles) {
+  const availableRoles = Array.isArray(roles) ? roles : []
+  const defaultRole = availableRoles.some(role => role.name === 'viewer')
+    ? 'viewer'
+    : (availableRoles[0]?.name || '')
+
   container.innerHTML = `
-    <div style="margin-bottom:1rem">
-      <button class="btn btn-primary" id="btnAddUser">+ Add User</button>
+    <div class="user-add-form">
+      <div class="form-group">
+        <label for="componentNewUsername">Username</label>
+        <input type="text" id="componentNewUsername" class="input-sm" autocomplete="off" placeholder="operator.name" />
+      </div>
+      <div class="form-group">
+        <label for="componentNewPassword">Temporary password</label>
+        <input type="password" id="componentNewPassword" class="input-sm" autocomplete="new-password" placeholder="Enter a strong password" />
+      </div>
+      <div class="form-group">
+        <label for="componentNewRole">Initial role</label>
+        <select id="componentNewRole" class="select-sm">
+          ${availableRoles.map(role => `<option value="${escapeAttr(role.name)}" ${role.name === defaultRole ? 'selected' : ''}>${escapeHTML(role.name)}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn btn-primary" id="componentAddUser">Add user</button>
     </div>
-    <table class="logs-table">
-      <thead>
-        <tr>
-          <th>Username</th>
-          <th>Roles</th>
-          <th>Status</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${users.map(u => `
+    <div class="modal-table-wrap">
+      <table class="logs-table user-table">
+        <thead>
           <tr>
-            <td>${escapeHTML(u.username)}</td>
-            <td>${escapeHTML((u.roles || []).join(', ') || '-')}</td>
-            <td>${u.status === 1 ? '<span class="text-success">Active</span>' : '<span class="text-error">Disabled</span>'}</td>
-            <td>
-              <button class="btn btn-secondary btn-edit-user" data-id="${u.id}" data-username="${escapeAttr(u.username)}">Edit</button>
-              <button class="btn btn-danger btn-delete-user" data-id="${u.id}">Delete</button>
-            </td>
+            <th>Username</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th class="table-actions-heading">Actions</th>
           </tr>
-        `).join('')}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          ${(users || []).map(user => `
+            <tr data-id="${user.id}">
+              <td><strong>${escapeHTML(user.username)}</strong></td>
+              <td>
+                <select class="select-sm component-user-role" data-id="${user.id}" aria-label="Role for ${escapeAttr(user.username)}">
+                  ${availableRoles.map(role => `<option value="${escapeAttr(role.name)}" ${(user.roles || []).includes(role.name) ? 'selected' : ''}>${escapeHTML(role.name)}</option>`).join('')}
+                </select>
+              </td>
+              <td><span class="status-pill ${user.status === 1 ? 'online' : 'offline'}">${user.status === 1 ? 'Active' : 'Disabled'}</span></td>
+              <td class="table-actions">
+                <button class="btn btn-secondary btn-sm component-reset-user" data-id="${user.id}" data-username="${escapeAttr(user.username)}">Set password</button>
+                <button class="btn btn-secondary btn-sm component-toggle-user" data-id="${user.id}" data-status="${user.status}">${user.status === 1 ? 'Disable' : 'Enable'}</button>
+                <button class="btn btn-danger btn-sm component-delete-user" data-id="${user.id}" data-username="${escapeAttr(user.username)}">Delete</button>
+              </td>
+            </tr>
+          `).join('') || '<tr><td colspan="4"><div class="modal-empty-state"><strong>No user accounts found.</strong><span>Create an account above to grant WaveControl access.</span></div></td></tr>'}
+        </tbody>
+      </table>
+    </div>
   `
-  
-  document.getElementById('btnAddUser')?.addEventListener('click', () => {
-    const username = prompt('Username:')
-    if (!username) return
-    
-    const password = prompt('Password:')
-    if (!password) return
-    
-    const roleList = roles.map(r => r.name).join(', ')
-    const roleInput = prompt(`Roles (comma-separated): ${roleList}`, 'viewer')
-    const userRoles = roleInput ? roleInput.split(',').map(r => r.trim()) : ['viewer']
-    
-    api.createUser(username, password, userRoles).then(() => {
+
+  const addButton = container.querySelector('#componentAddUser')
+  addButton?.addEventListener('click', async () => {
+    const username = container.querySelector('#componentNewUsername')?.value.trim() || ''
+    const password = container.querySelector('#componentNewPassword')?.value || ''
+    const role = container.querySelector('#componentNewRole')?.value || defaultRole
+    if (!username || !password || !role) {
+      showToast('Username, password, and role are required.', 'error')
+      return
+    }
+    addButton.disabled = true
+    const originalText = addButton.textContent
+    addButton.textContent = 'Creating…'
+    try {
+      await api.createUser(username, password, [role])
       showToast('User created', 'success')
       location.reload()
-    }).catch(e => {
-      showToast('Failed: ' + e.message, 'error')
-    })
+    } catch (error) {
+      showToast('User creation failed: ' + error.message, 'error')
+      addButton.disabled = false
+      addButton.textContent = originalText
+    }
   })
-  
-  container.querySelectorAll('.btn-delete-user').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = parseInt(btn.dataset.id)
-      if (!confirm('Delete this user?')) return
-      
+
+  container.querySelectorAll('.component-user-role').forEach(select => {
+    select.addEventListener('change', async () => {
+      const id = Number.parseInt(select.dataset.id, 10)
+      select.disabled = true
       try {
-        await api.deleteUser(id)
-        showToast('User deleted', 'success')
+        await api.updateUser(id, { roles: [select.value] })
+        showToast('User role updated', 'success')
+      } catch (error) {
+        showToast('Role update failed: ' + error.message, 'error')
         location.reload()
-      } catch (e) {
-        showToast('Failed: ' + e.message, 'error')
+      } finally {
+        select.disabled = false
       }
     })
   })
-  
-  container.querySelectorAll('.btn-edit-user').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = parseInt(btn.dataset.id)
-      const username = btn.dataset.username
-      
-      const password = prompt(`New password for ${username} (leave empty to keep):`)
-      if (password === null) return
-      
-      const updates = {}
-      if (password) updates.password = password
-      
+
+  container.querySelectorAll('.component-toggle-user').forEach(button => {
+    button.addEventListener('click', async () => {
+      const id = Number.parseInt(button.dataset.id, 10)
+      const currentStatus = Number.parseInt(button.dataset.status, 10)
+      const newStatus = currentStatus === 1 ? 0 : 1
+      button.disabled = true
       try {
-        await api.updateUser(id, updates)
-        showToast('User updated', 'success')
-      } catch (e) {
-        showToast('Failed: ' + e.message, 'error')
+        await api.updateUser(id, { status: newStatus })
+        showToast(`User ${newStatus === 1 ? 'enabled' : 'disabled'}`, 'success')
+        location.reload()
+      } catch (error) {
+        showToast('Status update failed: ' + error.message, 'error')
+        button.disabled = false
+      }
+    })
+  })
+
+  container.querySelectorAll('.component-reset-user').forEach(button => {
+    button.addEventListener('click', async () => {
+      const username = button.dataset.username || 'user'
+      const password = await requestInput({
+        title: `Set password for ${username}`,
+        eyebrow: 'Access control',
+        message: 'The user’s existing sessions will be invalidated after the password is changed.',
+        label: 'New password',
+        inputType: 'password',
+        required: true,
+        placeholder: 'Enter a strong password',
+        confirmText: 'Update password',
+        helpText: 'Use a unique password. WaveControl does not display the saved value.',
+        validate: value => value.length >= 8 || 'Use at least 8 characters.'
+      })
+      if (password === null) return
+      button.disabled = true
+      try {
+        await api.updateUser(Number.parseInt(button.dataset.id, 10), { password })
+        showToast('Password updated and prior sessions revoked', 'success')
+      } catch (error) {
+        showToast('Password update failed: ' + error.message, 'error')
+      } finally {
+        button.disabled = false
+      }
+    })
+  })
+
+  container.querySelectorAll('.component-delete-user').forEach(button => {
+    button.addEventListener('click', async () => {
+      const username = button.dataset.username || 'this user'
+      const confirmed = await requestConfirmation(
+        `${username} will lose WaveControl access and all active sessions will be invalidated.`,
+        {
+          title: 'Delete user account?',
+          eyebrow: 'Access control',
+          confirmText: 'Delete user',
+          tone: 'danger',
+          calloutTitle: 'This account and its role assignments will be removed.'
+        }
+      )
+      if (!confirmed) return
+      button.disabled = true
+      try {
+        await api.deleteUser(Number.parseInt(button.dataset.id, 10))
+        showToast('User deleted', 'success')
+        location.reload()
+      } catch (error) {
+        showToast('User deletion failed: ' + error.message, 'error')
+        button.disabled = false
       }
     })
   })

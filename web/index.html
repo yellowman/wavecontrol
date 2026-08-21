@@ -7,7 +7,7 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous" />
-  <link rel="stylesheet" href="css/styles.css?v=57"/>
+  <link rel="stylesheet" href="css/styles.css?v=59"/>
 </head>
 <body class="not-authed">
   <div id="networkBanner" class="network-banner hidden">Checking connection...</div>
@@ -88,163 +88,226 @@
   <div id="addDeviceModal" class="modal hidden">
     <div class="modal-content">
       <div class="modal-header">
-        <h3>Add Device</h3>
-        <button class="modal-close" id="closeAddDevice">&times;</button>
+        <div class="modal-heading">
+          <h3>Add Device</h3>
+          <p class="modal-subtitle">Discover one management address and add the responding radio to inventory.</p>
+        </div>
+        <button type="button" class="modal-close" id="closeAddDevice" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label>IP Address</label>
-          <input type="text" id="addDeviceIP" placeholder="192.168.1.1" />
+        <div class="modal-callout">
+          <span class="modal-callout-icon">i</span>
+          <div>WaveControl identifies the platform, model, MAC address, and role during discovery. Device-specific credentials override configured defaults.</div>
         </div>
-        <div class="form-group">
-          <label>Username <small>(optional)</small></label>
-          <input type="text" id="addDeviceUser" placeholder="Device username" />
-        </div>
-        <div class="form-group">
-          <label>Password <small>(optional)</small></label>
-          <input type="password" id="addDevicePass" placeholder="password" />
+        <div class="modal-section">
+          <div class="modal-section-title">Management endpoint</div>
+          <div class="modal-field-grid">
+            <div class="form-group field-span-2">
+              <label for="addDeviceIP">IP address</label>
+              <input type="text" id="addDeviceIP" placeholder="192.168.1.1" inputmode="decimal" autocomplete="off" data-modal-initial-focus />
+              <small class="form-hint">Enter a reachable management IP, not a customer-facing address.</small>
+            </div>
+            <div class="form-group">
+              <label for="addDeviceUser">Username <small>(optional)</small></label>
+              <input type="text" id="addDeviceUser" placeholder="Device username" autocomplete="username" />
+            </div>
+            <div class="form-group">
+              <label for="addDevicePass">Password <small>(optional)</small></label>
+              <input type="password" id="addDevicePass" placeholder="Device password" autocomplete="current-password" />
+            </div>
+          </div>
         </div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" id="cancelAddDevice">Cancel</button>
-        <button class="btn btn-primary" id="confirmAddDevice">Add Device</button>
+        <span class="modal-footer-note">Discovery does not change device configuration.</span>
+        <button type="button" class="btn btn-secondary" id="cancelAddDevice">Cancel</button>
+        <button type="button" class="btn btn-primary" id="confirmAddDevice">Discover &amp; Add</button>
       </div>
     </div>
   </div>
-  
+
   <!-- Bulk Add Modal -->
   <div id="bulkAddModal" class="modal hidden">
-  <div class="modal-content modal-wide">
+    <div class="modal-content modal-wide">
       <div class="modal-header">
-        <h3>Bulk Add Devices</h3>
-        <button class="modal-close" id="closeBulkAdd">&times;</button>
+        <div class="modal-heading">
+          <h3>Bulk Add Devices</h3>
+          <p class="modal-subtitle">Queue multiple management addresses for concurrent discovery using one optional credential pair.</p>
+        </div>
+        <button type="button" class="modal-close" id="closeBulkAdd" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label>IP Addresses <small>(one per line or comma-separated)</small></label>
-          <textarea id="bulkAddIPs" rows="10" placeholder="192.168.1.1&#10;192.168.1.2&#10;192.168.1.3"></textarea>
-        </div>
-        <div class="form-row">
+        <div class="modal-section">
+          <div class="modal-section-title">Discovery targets</div>
           <div class="form-group">
-            <label>Username</label>
-            <input type="text" id="bulkAddUser" placeholder="Device username" />
-          </div>
-          <div class="form-group">
-            <label>Password</label>
-            <input type="password" id="bulkAddPass" placeholder="password" />
+            <label for="bulkAddIPs">IP addresses</label>
+            <textarea id="bulkAddIPs" rows="10" placeholder="192.168.1.1&#10;192.168.1.2&#10;192.168.1.3" spellcheck="false" data-modal-initial-focus></textarea>
+            <small class="form-hint">Use one address per line or separate addresses with commas. Duplicates are ignored.</small>
           </div>
         </div>
-        <div id="bulkAddResults" class="bulk-results hidden"></div>
+        <div class="modal-section">
+          <div class="modal-section-title">Credential override <span class="text-muted">Optional</span></div>
+          <div class="modal-field-grid">
+            <div class="form-group">
+              <label for="bulkAddUser">Username</label>
+              <input type="text" id="bulkAddUser" placeholder="Device username" autocomplete="username" />
+            </div>
+            <div class="form-group">
+              <label for="bulkAddPass">Password</label>
+              <input type="password" id="bulkAddPass" placeholder="Device password" autocomplete="current-password" />
+            </div>
+          </div>
+        </div>
+        <div id="bulkAddResults" class="bulk-results hidden" aria-live="polite"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" id="cancelBulkAdd">Cancel</button>
-        <button class="btn btn-primary" id="confirmBulkAdd">Add All</button>
+        <span class="modal-footer-note">Each address reports its own result.</span>
+        <button type="button" class="btn btn-secondary" id="cancelBulkAdd">Cancel</button>
+        <button type="button" class="btn btn-primary" id="confirmBulkAdd">Start Discovery</button>
       </div>
     </div>
   </div>
-  
+
   <!-- Upgrade Modal -->
-  <div id="upgradeModal" class="modal hidden">
-    <div class="modal-content">
+  <div id="upgradeModal" class="modal hidden" data-modal-backdrop="static">
+    <div class="modal-content modal-wide">
       <div class="modal-header">
-        <h3>Firmware Upgrade</h3>
-        <button class="modal-close" id="closeUpgrade">&times;</button>
+        <div class="modal-heading">
+          <h3>Firmware Upgrade</h3>
+          <p class="modal-subtitle">Confirm the target image and rollout scope before starting a tracked upgrade job.</p>
+        </div>
+        <button type="button" class="modal-close" id="closeUpgrade" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="upgrade-info" id="upgradeInfo"></div>
-        <div class="form-group">
-          <label>Target Version</label>
-          <select id="upgradeSelect"></select>
-          <small class="form-hint">Correct firmware file selected automatically based on device type</small>
+        <div class="upgrade-info modal-summary" id="upgradeInfo"></div>
+        <div class="modal-section">
+          <div class="modal-section-title">Target firmware</div>
+          <div class="form-group">
+            <label for="upgradeSelect">Version / image</label>
+            <select id="upgradeSelect" data-modal-initial-focus></select>
+            <small class="form-hint">Compatible firmware is selected from the device platform and flavor.</small>
+          </div>
+          <div id="upgradeWarning" class="form-warning hidden" role="alert"></div>
         </div>
-        <div id="upgradeWarning" class="form-warning hidden"></div>
-        <div class="form-check">
-          <input type="checkbox" id="upgradeForce" />
-          <label for="upgradeForce">Force upgrade (re-upload even if same version)</label>
+        <div class="modal-section">
+          <div class="modal-section-title">Rollout options</div>
+          <div class="modal-choice-grid">
+            <label class="modal-choice">
+              <input type="checkbox" id="upgradeForce" />
+              <span><strong>Force re-upload</strong><small>Upload and install even when the selected version matches the device.</small></span>
+            </label>
+            <label class="modal-choice" id="upgradeFanoutOption">
+              <input type="checkbox" id="upgradeFanout" />
+              <span><strong>Include connected STAs</strong><small>Create a fanout job for the AP and currently associated subscribers.</small></span>
+            </label>
+          </div>
         </div>
-        <div class="form-check" id="upgradeFanoutOption">
-          <input type="checkbox" id="upgradeFanout" />
-          <label for="upgradeFanout">Fanout: Include connected STAs in upgrade</label>
-        </div>
-        <div id="upgradeProgress" class="upgrade-progress hidden"></div>
+        <div id="upgradeProgress" class="upgrade-progress hidden" aria-live="polite"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" id="cancelUpgrade">Cancel</button>
-        <button class="btn btn-primary" id="confirmUpgrade">Upgrade</button>
+        <span class="modal-footer-note">The job panel retains progress if this dialog is closed.</span>
+        <button type="button" class="btn btn-secondary" id="cancelUpgrade">Cancel</button>
+        <button type="button" class="btn btn-primary" id="confirmUpgrade">Start Upgrade</button>
       </div>
     </div>
   </div>
   
   <!-- Auth Retry Modal (for failed STA credentials) -->
-  <div id="authRetryModal" class="modal hidden">
+  <div id="authRetryModal" class="modal hidden" data-modal-backdrop="static">
     <div class="modal-content">
       <div class="modal-header">
-        <h3>Authentication Required</h3>
-        <button class="modal-close" id="closeAuthRetry">&times;</button>
+        <div class="modal-heading">
+          <h3>Authentication Required</h3>
+          <p class="modal-subtitle">One or more subscriber radios rejected the available credentials.</p>
+        </div>
+        <button type="button" class="modal-close" id="closeAuthRetry" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
-        <p id="authRetryInfo">Some devices failed authentication. Enter credentials to retry:</p>
+        <div class="modal-callout warning">
+          <span class="modal-callout-icon">!</span>
+          <div id="authRetryInfo">Review the failed devices, then supply a credential pair for this retry only.</div>
+        </div>
         <div id="authRetryDevices" class="auth-retry-list"></div>
-        <div class="form-group">
-          <label>Username</label>
-          <input type="text" id="authRetryUser" placeholder="Device username" />
+        <div class="modal-section">
+          <div class="modal-section-title">Retry credentials</div>
+          <div class="modal-field-grid">
+            <div class="form-group">
+              <label for="authRetryUser">Username</label>
+              <input type="text" id="authRetryUser" placeholder="Device username" autocomplete="username" data-modal-initial-focus />
+            </div>
+            <div class="form-group">
+              <label for="authRetryPass">Password</label>
+              <input type="password" id="authRetryPass" placeholder="Device password" autocomplete="current-password" />
+            </div>
+          </div>
+          <label class="modal-choice">
+            <input type="checkbox" id="authRetryForce" />
+            <span><strong>Force upgrade</strong><small>Retry even when the target version appears to be installed already.</small></span>
+          </label>
         </div>
-        <div class="form-group">
-          <label>Password</label>
-          <input type="password" id="authRetryPass" />
-        </div>
-        <div class="form-check">
-          <input type="checkbox" id="authRetryForce" />
-          <label for="authRetryForce">Force upgrade</label>
-        </div>
-        <div id="authRetryResults" class="bulk-results hidden"></div>
+        <div id="authRetryResults" class="bulk-results hidden" aria-live="polite"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" id="cancelAuthRetry">Skip</button>
-        <button class="btn btn-primary" id="confirmAuthRetry">Retry with Credentials</button>
+        <button type="button" class="btn btn-secondary" id="cancelAuthRetry">Skip Failed Devices</button>
+        <button type="button" class="btn btn-primary" id="confirmAuthRetry">Retry Authentication</button>
       </div>
     </div>
   </div>
-  
+
   <!-- Batch Config Modal -->
-  <div id="batchConfigModal" class="modal hidden">
+  <div id="batchConfigModal" class="modal hidden" data-modal-backdrop="static">
     <div class="modal-content modal-wide">
       <div class="modal-header">
-        <h3>Batch Configuration</h3>
-        <button class="modal-close" data-wc-action="close-modal" data-modal-id="batchConfigModal">&times;</button>
+        <div class="modal-heading">
+          <h3>Batch Configuration</h3>
+          <p class="modal-subtitle">Apply only the checked settings to the selected inventory devices.</p>
+        </div>
+        <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="batchConfigModal" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label>Select Devices</label>
-          <select id="batchDevices" multiple size="6"></select>
+        <div class="modal-callout warning">
+          <span class="modal-callout-icon">!</span>
+          <div>Configuration changes are sent directly to each selected device. Review the target list and enable only fields you intend to replace.</div>
         </div>
-        <div class="config-grid">
-          <div class="config-row">
-            <input type="checkbox" id="cfgSSID" />
-            <label for="cfgSSID">SSID</label>
-            <input type="text" id="cfgSSIDValue" placeholder="New SSID" />
-          </div>
-          <div class="config-row">
-            <input type="checkbox" id="cfgChannel" />
-            <label for="cfgChannel">Channel</label>
-            <input type="number" id="cfgChannelValue" placeholder="Channel" />
-          </div>
-          <div class="config-row">
-            <input type="checkbox" id="cfgPower" />
-            <label for="cfgPower">TX Power</label>
-            <input type="number" id="cfgPowerValue" placeholder="dBm" />
-          </div>
-          <div class="config-row">
-            <input type="checkbox" id="cfgPassword" />
-            <label for="cfgPassword">Password</label>
-            <input type="password" id="cfgPasswordValue" placeholder="New Password" />
+        <div class="modal-section">
+          <div class="modal-section-title">Targets</div>
+          <div class="form-group">
+            <label for="batchDevices">Select devices</label>
+            <select id="batchDevices" multiple size="7" data-modal-initial-focus></select>
+            <small class="form-hint">Use Ctrl/Cmd or Shift to select multiple devices.</small>
           </div>
         </div>
-        <div id="batchConfigResults" class="batch-results"></div>
+        <div class="modal-section">
+          <div class="modal-section-title">Changes to apply</div>
+          <div class="config-grid config-grid-modern">
+            <div class="config-row">
+              <input type="checkbox" id="cfgSSID" />
+              <label for="cfgSSID">SSID</label>
+              <input type="text" id="cfgSSIDValue" placeholder="New SSID" />
+            </div>
+            <div class="config-row">
+              <input type="checkbox" id="cfgChannel" />
+              <label for="cfgChannel">Channel</label>
+              <input type="number" id="cfgChannelValue" placeholder="Channel" />
+            </div>
+            <div class="config-row">
+              <input type="checkbox" id="cfgPower" />
+              <label for="cfgPower">TX power</label>
+              <input type="number" id="cfgPowerValue" placeholder="dBm" />
+            </div>
+            <div class="config-row">
+              <input type="checkbox" id="cfgPassword" />
+              <label for="cfgPassword">Password</label>
+              <input type="password" id="cfgPasswordValue" placeholder="New password" autocomplete="new-password" />
+            </div>
+          </div>
+        </div>
+        <div id="batchConfigResults" class="batch-results" aria-live="polite"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="batchConfigModal">Cancel</button>
-        <button class="btn btn-primary" id="confirmBatchConfig">Apply Changes</button>
+        <span class="modal-footer-note">Unchecked settings remain unchanged.</span>
+        <button type="button" class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="batchConfigModal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="confirmBatchConfig">Apply Selected Changes</button>
       </div>
     </div>
   </div>
@@ -253,8 +316,8 @@
   <div id="antennaConfigModal" class="modal hidden">
     <div class="modal-content modal-xwide antenna-modal">
       <div class="modal-header">
-        <h2>AP Antenna Parameters</h2>
-        <button class="modal-close" id="closeAntennaConfig">&times;</button>
+        <div class="modal-heading"><h2>AP Antenna Parameters</h2><p class="modal-subtitle">Review and edit sector geometry used by planning and export tools.</p></div>
+        <button type="button" class="modal-close" id="closeAntennaConfig" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body antenna-body" id="antennaConfigBody"></div>
       <div class="modal-footer">
@@ -267,8 +330,8 @@
   <div id="exportSectorsModal" class="modal hidden">
     <div class="modal-content modal-xwide">
       <div class="modal-header">
-        <h2>Sector CSV Export</h2>
-        <button class="modal-close" id="closeExportSectors">&times;</button>
+        <div class="modal-heading"><h2>Sector CSV Export</h2><p class="modal-subtitle">Preview the planning dataset before copying or downloading it.</p></div>
+        <button type="button" class="modal-close" id="closeExportSectors" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
         <p class="text-muted" style="margin-top:0; font-size: 13px;">
@@ -293,7 +356,7 @@
           </div>
         </div>
       </div>
-      <div class="modal-footer" style="display:flex; justify-content:flex-end; gap: 10px; flex-wrap:wrap;">
+      <div class="modal-footer">
         <button class="btn" id="closeExportSectorsFooter">Close</button>
       </div>
     </div>
@@ -303,8 +366,8 @@
   <div id="jobEventsModal" class="modal hidden">
     <div class="modal-content modal-wide">
       <div class="modal-header">
-        <h3>Job Events</h3>
-        <button class="modal-close" id="closeJobEvents">&times;</button>
+        <div class="modal-heading"><h3>Job Events</h3><p class="modal-subtitle">Chronological execution details, device responses, and failure context.</p></div>
+        <button type="button" class="modal-close" id="closeJobEvents" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body">
         <div id="jobEventsInfo" class="job-events-info"></div>
@@ -323,8 +386,8 @@
   <div id="ultraDebugModal" class="modal hidden">
     <div class="modal-content modal-xwide ultra-modal">
       <div class="modal-header">
-        <h3>Ultra Debug</h3>
-        <button class="modal-close" id="closeUltraDebug">&times;</button>
+        <div class="modal-heading"><h3>Ultra Debug</h3><p class="modal-subtitle">Administrator-only capture viewer with automatic secret redaction.</p></div>
+        <button type="button" class="modal-close" id="closeUltraDebug" aria-label="Close dialog">&times;</button>
       </div>
       <div class="modal-body ultra-body">
         <div class="ultra-controls">
@@ -404,6 +467,6 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
   <script src="js/jszip.min.js"></script>
-  <script type="module" src="js/app.js?v=119"></script>
+  <script type="module" src="js/app.js?v=121"></script>
 </body>
 </html>

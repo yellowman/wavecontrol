@@ -47,48 +47,56 @@ Previous tools like UNMS/UISP would grind to a halt with 500+ devices. waveContr
 - **Config Management**: Backup, restore, batch push configurations
 - **Scheduled Jobs**: Upgrades, reboots, refresh with repeat options
 - **Maintenance Windows**: Define maintenance periods to pause alerts/jobs
-- **Reports**: Network health, inventory, performance reports
+- **Reports**: Versioned health, inventory, performance, chain-imbalance, and RX-mismatch snapshots
 
 ### Reports
 
-Generate point-in-time snapshots of network health, inventory, and performance. Reports are stored in the database and can be compared to track changes over time.
+Reports are immutable, versioned snapshots stored in PostgreSQL. Opening an existing report renders the data captured at generation time; it does not silently replace saved values with the current dashboard state. The Reports page provides searchable history, same-type comparison, print output, and JSON/CSV downloads.
 
 **Report Types:**
 
 | Type | Contents |
 |------|----------|
-| **Health** | Availability (online/offline), link quality distribution, stability metrics (flaps/reboots), system health (CPU/memory/temp), firmware distribution, top offenders |
-| **Inventory** | Complete device list with hostname, IP, MAC, model, firmware, parent AP, site assignment |
-| **Performance** | Throughput totals (AP/STA breakdown), signal quality distribution, top APs by throughput, worst signal STAs, capacity risk analysis |
+| **Network Health** | Authoritative inventory availability, AP/STA split, metric coverage, band-aware subscriber signal quality, system pressure, stability, firmware distribution, site summaries, and ranked operational exceptions |
+| **Device Inventory** | Complete AP/STA inventory with status, platform family, firmware, region/site placement, parent AP, and last-seen data |
+| **Performance Summary** | Captured aggregate throughput history, AP/STA rates, platform/site aggregates, subscriber signal distribution, capacity-risk APs, and missing-metric coverage |
+| **Chain Imbalance** | Ranked device-radio and peer-link findings whose sanitized per-chain spread exceeds the configured threshold |
+| **RX Level Mismatch** | Ranked links whose AP-side and STA-side receive levels disagree beyond the configured threshold |
 
-**Health Report Metrics:**
-- **Availability**: Online/offline counts, uptime percentage
-- **Link Quality**: Good/fair/poor signal distribution (using band-specific thresholds)
-- **Stability**: Flap counts (1h/24h), reboot counts (1h/24h)
-- **System Health**: High CPU (>80%), high memory (>80%), high temperature (>70deg C)
-- **Top Offenders**: Offline devices, flapping devices, poor signal STAs, high CPU devices
+**Snapshot and coverage behavior:**
+- Inventory counts and status come from the database; live measurements are matched by normalized MAC address.
+- Every report records a schema version, generation timestamp, inventory scope, and explicit metric coverage.
+- Performance reports store the current in-memory throughput-history ring inside the report. Reopening the report uses those captured samples.
+- Legacy performance reports that predate captured history are clearly labeled before the UI offers current history as a fallback.
+- Radio selection includes Wave 60 GHz, MLO 6 GHz, 5 GHz, LTU, and additional reported radios.
+- Health offenders and RF diagnostics are severity-ranked rather than returned in arbitrary iteration order.
+- Performance CSV includes both AP and STA rows. Empty diagnostic reports still export a valid header-only CSV.
 
-**Performance Report Features:**
-- **Throughput History Chart**: Native SVG line chart showing TX/RX over the last 30 minutes
-- **Signal Quality Bar**: Visual distribution of good/fair/poor STAs
-- **AP Performance Tab**: Top 50 APs by throughput with client counts and poor %
-- **STA Performance Tab**: Top 50 STAs by throughput with parent AP
-- **Capacity Risk Tab**: APs with >20% poor signal clients
-
-**Report Comparison:**
-- Select two reports of the same type to compare
-- View side-by-side with delta values
-- Color-coded changes (green=improvement, red=degradation)
+**Report workflow:**
+- Editors and administrators can generate and delete snapshots; viewers can inspect, compare, print, and download them.
+- Search report history by type, creator, date, or report ID and filter by report type.
+- Compare two snapshots of the same type. Deltas are calculated as newer minus older and use metric-aware improvement/degradation coloring.
+- Sort device, site, platform, offender, and diagnostic tables directly in the full-screen report viewer.
+- Download the original JSON snapshot or a report-specific CSV representation.
 
 **Data Retention:**
 
 | Data Type | Storage | Retention |
 |-----------|---------|-----------|
-| Reports | PostgreSQL | Permanent (until deleted) |
-| Throughput History | In-memory | ~30 minutes (60 samples at 30s intervals) |
-| Stability Tracking | In-memory | 24 hours (rolling window) |
+| Reports | PostgreSQL | Permanent until explicitly deleted |
+| Throughput History | In memory and copied into each performance report | Approximately 30 minutes live; permanent inside the saved report |
+| Stability Tracking | In memory and summarized into each health report | 24-hour rolling live window; summary permanent inside the saved report |
 
-**Note:** In-memory data (throughput history, stability metrics) resets on server restart. Generate reports to capture snapshots before maintenance.
+### Modal and Dialog UX
+
+waveControl uses one responsive modal runtime rather than browser-native `alert()`, `confirm()`, or `prompt()` dialogs. Static and dynamically generated dialogs share the same header, sections, form controls, consequences, and footer actions.
+
+- Focus is moved into the dialog, trapped while open, and restored to the launching control on close.
+- Escape and backdrop behavior are explicit; body scrolling is locked while a modal is active.
+- Inputs, selects, text areas, day pickers, choice cards, warnings, loading states, and destructive confirmations use the same dark/light-theme styling.
+- Long workflows use wide or full-screen shells with internal scrolling and responsive mobile layouts.
+- Certificate management, drilldown lists, scheduled jobs, job details, user/device actions, firmware/configuration operations, Ultra Debug, and maintenance windows use the shared dialog system.
+- Maintenance-window editing loads the existing record and sends an update rather than accidentally creating a duplicate.
 
 ### Integration
 - **Zabbix Bridge**: Native agent protocol on port 10050
@@ -121,7 +129,7 @@ Generate point-in-time snapshots of network health, inventory, and performance. 
 | Map | Geographic view with GPS markers, signal-colored links, KMZ export |
 | Quality | Signal + Modulation quality tables, issues queue, mismatches |
 | Config | Backup/restore, batch configuration push |
-| Reports | Generate and download network reports |
+| Reports | Generate, inspect, compare, print, and download saved network snapshots |
 | Settings | Poll interval, credentials, Zabbix, scheduled jobs |
 
 ### Quality Page

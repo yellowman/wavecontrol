@@ -1722,18 +1722,25 @@ GET    /api/wavecontrol/roles
 ### Reports
 
 ```
-GET  /api/wavecontrol/reports
-     List generated reports
+GET    /api/wavecontrol/reports?limit=200&type=health
+       List saved reports, optionally filtered by type
 
-POST /api/wavecontrol/reports/generate
-     Generate new report
-     Body: { "type": "health|inventory|performance", ... }
+POST   /api/wavecontrol/reports/generate
+       Generate a new immutable snapshot
+       Body: { "type": "health|inventory|performance|chain|rx_mismatch" }
 
-GET  /api/wavecontrol/reports/{id}
-     Get report metadata
+GET    /api/wavecontrol/reports/{id}
+       Get report metadata and captured JSON data
 
-GET  /api/wavecontrol/reports/{id}/download
-     Download report file
+GET    /api/wavecontrol/reports/{id}/download?format=json|csv
+       Download the original JSON snapshot or report-specific CSV
+
+DELETE /api/wavecontrol/reports/{id}
+       Delete a saved report; editor or administrator required
+
+POST   /api/wavecontrol/reports/compare
+       Compare two same-type snapshots
+       Body: { "report_id_1": 100, "report_id_2": 125 }
 ```
 
 ### Search & Logs
@@ -4014,66 +4021,70 @@ Notes:
 
 ### Reports
 
-**Report Types:**
+Reports are durable, immutable JSONB snapshots. A saved report must render its captured data; current live values must never silently replace values from the original snapshot. Every newly generated report includes `report_version`, `report_type`, `report_name`, `scope`, and `generated_at`.
 
-**Health Report:**
-- Summary: Online/offline counts, uptime percentage, AP/STA breakdown
-- Link Quality: Good/Fair/Poor signal distribution for STAs (using band-specific thresholds)
-- Stability: Flap counts (1h/24h), reboot counts (1h/24h)
-- System Health: High CPU, high memory, high temperature counts
-- Firmware Distribution: Version counts across fleet
-- Top Offenders: Offline devices, flapping devices, rebooting devices, worst signal STAs, high CPU devices
+**Supported report types:**
 
-**Inventory Report:**
-- Complete device list with hostname, IP, MAC, model, firmware
-- Parent AP relationship for STAs
-- Site and region assignment
-- Status (online/offline)
+1. `health` — authoritative availability, AP/STA split, explicit metric coverage, band-aware STA signal quality, CPU/memory/temperature exceptions, flap/reboot counters, firmware/site summaries, and severity-ranked offenders.
+2. `inventory` — the complete AP/STA inventory with platform family, firmware, region/site, parent relationship, status, and last-seen data.
+3. `performance` — aggregate AP/STA rates, captured throughput-history samples, platform/site aggregates, measured STA signal distribution, capacity-risk APs, full measured device rows, and a bounded missing-metric list.
+4. `chain` — device-radio and peer-link chain spread above the configured threshold after sanitizing placeholder values.
+5. `rx_mismatch` — AP/STA receive-level deltas above the configured threshold.
 
-**Performance Report:**
-- Summary: Total TX/RX rates, AP vs STA breakdown, average STA signal
-- Throughput History Chart: Line chart showing TX/RX over last 30 minutes (live data)
-- Signal Quality: Distribution bar showing Good/Fair/Poor percentages
-- AP Performance Tab: Top APs by throughput with client counts and poor %
-- STA Performance Tab: Top STAs by throughput with parent AP and signal
-- Worst Signal Tab: STAs with weakest signal levels
-- Capacity Risk Tab: APs with >20% poor signal clients
+**Data authority and coverage:**
+- Database inventory is authoritative for device count, AP/STA role, site/region, parent relationship, firmware, and persisted status.
+- In-memory metrics are joined to inventory by normalized lowercase MAC.
+- Each report includes `coverage.inventory_devices`, `coverage.metrics_devices`, `coverage.missing_metrics`, `coverage.signal_samples`, and `coverage.coverage_pct` where applicable.
+- Radio evaluation covers 60 GHz, 6 GHz, 5 GHz, LTU, and additional reported radio entries.
+- STA signal grading uses 60 GHz thresholds for 60 GHz links and the standard 5 GHz/LTU thresholds for other supported bands.
+- Offender, weak-signal, chain, RX-mismatch, capacity-risk, flap, and reboot lists are deterministically severity-ranked.
 
-**Report Header Strip (all report types):**
-- Scope: All devices or filtered selection
-- Breakdown: AP count, STA count
-- Data Coverage: Devices with metrics / total devices
-- Generated timestamp
+**Performance history:**
+- The stats store retains approximately 60 samples, nominally 30 minutes at a 30-second interval.
+- `performance` generation copies that ring into `throughput_history` inside the report JSON.
+- The report viewer draws the chart from the captured array.
+- For a legacy report without a `throughput_history` field, the viewer may offer current history only with an explicit warning that the chart is not part of the saved snapshot.
 
-**Report Comparison:**
-- Select two reports of the same type via checkboxes
-- View side-by-side comparison with delta values
-- Highlights positive/negative changes with color coding
-- Supports health, performance, and inventory comparisons
+**Report UI:**
+- The page presents report-type cards, searchable/filterable report history, role-aware generation/deletion, and same-type comparison selection.
+- Saved reports open in a full-screen responsive modal with metadata strip, metric cards, sortable tables, report-specific tabs, print output, and JSON/CSV actions.
+- Comparison deltas are calculated as report 2 minus report 1 and use metric-aware positive/negative coloring.
+- Viewers can list, open, compare, print, and download. Generation and deletion require editor or administrator privileges.
 
-**Stability Tracking (in-memory):**
-- Flap detection: Tracks online->offline transitions per device
-- Reboot detection: Detects uptime resets while device is online
-- Rolling windows: 1-hour and 24-hour counters
-- Automatic cleanup of old events
+**CSV:**
+- All five types support CSV.
+- Performance CSV includes both AP and STA rows.
+- Inventory CSV includes role, parent, site/region, platform, status, and last-seen fields.
+- Health CSV includes summary/coverage metrics and ranked offenders.
+- Empty `chain` and `rx_mismatch` reports return a valid header-only CSV.
 
-**Throughput History (in-memory):**
-- Ring buffer stores last 60 samples (30 min at 30s intervals)
-- Records total TX/RX and online/offline counts per sample
-- Rendered as a native SVG line chart in Performance reports
-- Data resets on server restart
-
-**API Endpoints:**
+**API endpoints:**
 ```
-GET  /api/wavecontrol/reports              - List reports
-POST /api/wavecontrol/reports/generate     - Generate new report
-GET  /api/wavecontrol/reports/{id}         - Get report with data
-GET  /api/wavecontrol/reports/{id}/download - Download as JSON or CSV
-POST /api/wavecontrol/reports/compare      - Compare two reports
-
-GET  /api/wavecontrol/stats/throughput-history - Get throughput history
-GET  /api/wavecontrol/stats/stability          - Get stability stats
+GET    /api/wavecontrol/reports?limit=200&type=health
+POST   /api/wavecontrol/reports/generate
+GET    /api/wavecontrol/reports/{id}
+GET    /api/wavecontrol/reports/{id}/download?format=json
+GET    /api/wavecontrol/reports/{id}/download?format=csv
+DELETE /api/wavecontrol/reports/{id}
+POST   /api/wavecontrol/reports/compare
 ```
+
+### Modal and Dialog System
+
+All application dialogs use the shared modal runtime. Browser-native `alert()`, `confirm()`, and `prompt()` calls are prohibited in loaded application JavaScript.
+
+Required behavior:
+- semantic dialog role/ARIA state;
+- initial focus, tab-key focus trap, and focus restoration;
+- Escape handling and explicit backdrop policy;
+- body scroll lock while any modal is open;
+- responsive standard, wide, extra-wide, and full-screen shells;
+- internally scrollable body with stable header/footer actions;
+- consistent dark/light form controls, including selects and time inputs;
+- consequence text for destructive or operational confirmations;
+- loading, empty, validation, and error states that do not rely on native popups.
+
+Dynamic certificate, drilldown, scheduler, job-detail, user/device, firmware, configuration, Ultra Debug, and maintenance-window dialogs must use this runtime. Editing a maintenance window must populate the existing record and issue `PATCH /maintenance-windows/{id}`; creating a new record uses `POST /maintenance-windows`.
 
 ### Database Schema Additions
 

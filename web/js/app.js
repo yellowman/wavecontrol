@@ -1,8 +1,8 @@
-import { api, auth, ws, sync } from './api.js?v=27'
+import { api, auth, ws, sync } from './api.js?v=28'
 import { store } from './store.js?v=15'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=64'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=65'
 import { 
   wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, scrollToDeviceById 
 } from './virtual-integration.js?v=11'
@@ -38,6 +38,357 @@ function escapeAttr(str) {
     .replace(/>/g, '&gt;')
 }
 
+
+// Unified modal behavior for both static and dynamically-created dialogs.
+// Existing call sites can continue toggling the `hidden` class; the observer
+// supplies focus management, scroll locking, backdrop/escape dismissal and
+// accessibility semantics consistently across the application.
+const modalRuntime = {
+  visible: new Set(),
+  previousFocus: new WeakMap(),
+  syncQueued: false
+}
+
+function getModalElement(value) {
+  if (!value) return null
+  if (value instanceof HTMLElement) return value.classList.contains('modal') ? value : value.closest('.modal')
+  return document.getElementById(String(value))
+}
+
+function modalFocusableElements(modal) {
+  if (!modal) return []
+  return Array.from(modal.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )).filter(el => !el.closest('.hidden') && el.getClientRects().length > 0)
+}
+
+function enhanceModal(modal) {
+  if (!modal || !modal.classList.contains('modal')) return
+  const content = modal.querySelector(':scope > .modal-content') || modal.querySelector('.modal-content')
+  if (!content) return
+
+  modal.setAttribute('role', 'dialog')
+  modal.setAttribute('aria-modal', 'true')
+  content.setAttribute('role', 'document')
+  if (!content.hasAttribute('tabindex')) content.tabIndex = -1
+
+  const heading = modal.querySelector('.modal-header h1, .modal-header h2, .modal-header h3, .modal-header h4')
+  if (heading) {
+    if (!heading.id) heading.id = `${modal.id || 'wavecontrol-modal'}-title`
+    modal.setAttribute('aria-labelledby', heading.id)
+  } else if (!modal.hasAttribute('aria-label')) {
+    modal.setAttribute('aria-label', 'Dialog')
+  }
+
+  modal.querySelectorAll('.modal-close').forEach(button => {
+    if (button.tagName === 'BUTTON' && !button.getAttribute('type')) button.type = 'button'
+    if (!button.getAttribute('aria-label')) button.setAttribute('aria-label', 'Close dialog')
+    button.setAttribute('title', button.getAttribute('title') || 'Close')
+  })
+  modal.dataset.modalEnhanced = 'true'
+}
+
+function topVisibleModal() {
+  const visible = Array.from(document.querySelectorAll('.modal:not(.hidden)'))
+    .filter(modal => getComputedStyle(modal).display !== 'none')
+  return visible.at(-1) || null
+}
+
+function focusModal(modal) {
+  if (!modal || modal.classList.contains('hidden')) return
+  const preferred = modal.querySelector('[data-modal-initial-focus]')
+  const autofocus = modal.querySelector('[autofocus]')
+  const focusable = modalFocusableElements(modal)
+  const target = preferred || autofocus || focusable[0] || modal.querySelector('.modal-content')
+  target?.focus({ preventScroll: true })
+}
+
+function syncModalRuntime() {
+  modalRuntime.syncQueued = false
+  const visibleNow = new Set(
+    Array.from(document.querySelectorAll('.modal:not(.hidden)'))
+      .filter(modal => getComputedStyle(modal).display !== 'none')
+  )
+
+  document.querySelectorAll('.modal').forEach(enhanceModal)
+
+  for (const modal of visibleNow) {
+    if (modalRuntime.visible.has(modal)) continue
+    const active = document.activeElement
+    if (active instanceof HTMLElement && !modal.contains(active)) {
+      modalRuntime.previousFocus.set(modal, active)
+    }
+    requestAnimationFrame(() => focusModal(modal))
+  }
+
+  for (const modal of modalRuntime.visible) {
+    if (visibleNow.has(modal)) continue
+    const previous = modalRuntime.previousFocus.get(modal)
+    modalRuntime.previousFocus.delete(modal)
+    if (visibleNow.size === 0 && previous instanceof HTMLElement && previous.isConnected) {
+      requestAnimationFrame(() => previous.focus({ preventScroll: true }))
+    }
+  }
+
+  modalRuntime.visible = visibleNow
+  document.body.classList.toggle('modal-open', visibleNow.size > 0)
+}
+
+function scheduleModalRuntimeSync() {
+  if (modalRuntime.syncQueued) return
+  modalRuntime.syncQueued = true
+  queueMicrotask(syncModalRuntime)
+}
+
+function openModalElement(value) {
+  const modal = getModalElement(value)
+  if (!modal) return null
+  enhanceModal(modal)
+  modal.classList.remove('hidden')
+  scheduleModalRuntimeSync()
+  return modal
+}
+
+function closeModalElement(value) {
+  const modal = getModalElement(value)
+  if (!modal) return
+  modal.classList.add('hidden')
+  scheduleModalRuntimeSync()
+}
+
+let activeDecisionDialog = null
+
+function finishActiveDecisionDialog(result) {
+  if (typeof activeDecisionDialog === 'function') activeDecisionDialog(result)
+}
+
+function showConfirmDialog(message, options = {}) {
+  finishActiveDecisionDialog(false)
+
+  const {
+    title = 'Confirm action',
+    eyebrow = 'Confirmation required',
+    confirmText = 'Confirm',
+    cancelText = 'Cancel',
+    tone = 'danger',
+    calloutTitle = tone === 'danger' ? 'This action may be destructive.' : 'Review this action before continuing.'
+  } = options
+
+  const modal = document.createElement('div')
+  modal.className = 'modal hidden'
+  modal.dataset.modalBackdrop = 'static'
+  modal.dataset.modalEscape = 'false'
+  modal.innerHTML = `
+    <div class="modal-content modal-confirm-card">
+      <div class="modal-header">
+        <div class="modal-heading">
+          <span class="modal-eyebrow"></span>
+          <h3></h3>
+          <p class="modal-subtitle">Confirm the details below before WaveControl proceeds.</p>
+        </div>
+        <button type="button" class="modal-close" aria-label="Cancel and close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-callout ${tone === 'danger' ? 'danger' : tone === 'warning' ? 'warning' : ''}">
+          <span class="modal-callout-icon" aria-hidden="true">!</span>
+          <div>
+            <strong class="modal-dialog-callout-title"></strong>
+            <p class="modal-dialog-message"></p>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dialog-cancel data-modal-initial-focus></button>
+        <button type="button" class="btn ${tone === 'danger' ? 'btn-danger' : 'btn-primary'}" data-dialog-confirm></button>
+      </div>
+    </div>
+  `
+
+  modal.querySelector('.modal-eyebrow').textContent = eyebrow
+  modal.querySelector('h3').textContent = title
+  modal.querySelector('.modal-dialog-callout-title').textContent = calloutTitle
+  modal.querySelector('.modal-dialog-message').textContent = String(message || '')
+  modal.querySelector('[data-dialog-cancel]').textContent = cancelText
+  modal.querySelector('[data-dialog-confirm]').textContent = confirmText
+  document.body.appendChild(modal)
+
+  return new Promise(resolve => {
+    let settled = false
+    const finish = result => {
+      if (settled) return
+      settled = true
+      if (activeDecisionDialog === finish) activeDecisionDialog = null
+      closeModalElement(modal)
+      modal.remove()
+      resolve(Boolean(result))
+    }
+    activeDecisionDialog = finish
+    modal.querySelector('.modal-close').addEventListener('click', () => finish(false), { once: true })
+    modal.querySelector('[data-dialog-cancel]').addEventListener('click', () => finish(false), { once: true })
+    modal.querySelector('[data-dialog-confirm]').addEventListener('click', () => finish(true), { once: true })
+    openModalElement(modal)
+  })
+}
+
+function showInputDialog(options = {}) {
+  finishActiveDecisionDialog(null)
+
+  const {
+    title = 'Enter a value',
+    eyebrow = 'Input required',
+    message = '',
+    label = 'Value',
+    value = '',
+    placeholder = '',
+    inputType = 'text',
+    multiline = false,
+    rows = 5,
+    min,
+    max,
+    required = false,
+    confirmText = 'Continue',
+    cancelText = 'Cancel',
+    helpText = '',
+    validate
+  } = options
+
+  const modal = document.createElement('div')
+  modal.className = 'modal hidden'
+  modal.dataset.modalBackdrop = 'static'
+  modal.dataset.modalEscape = 'false'
+  modal.innerHTML = `
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-heading">
+          <span class="modal-eyebrow"></span>
+          <h3></h3>
+          <p class="modal-subtitle modal-input-dialog-copy"></p>
+        </div>
+        <button type="button" class="modal-close" aria-label="Cancel and close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="form-group">
+            <label for="wavecontrolDialogInput"></label>
+            <div class="modal-input-host"></div>
+            <small class="form-hint modal-input-help"></small>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dialog-cancel></button>
+        <button type="button" class="btn btn-primary" data-dialog-confirm></button>
+      </div>
+    </div>
+  `
+
+  modal.querySelector('.modal-eyebrow').textContent = eyebrow
+  modal.querySelector('h3').textContent = title
+  modal.querySelector('.modal-input-dialog-copy').textContent = message
+  modal.querySelector('label').textContent = label
+  modal.querySelector('.modal-input-help').textContent = helpText
+  modal.querySelector('[data-dialog-cancel]').textContent = cancelText
+  modal.querySelector('[data-dialog-confirm]').textContent = confirmText
+
+  const input = document.createElement(multiline ? 'textarea' : 'input')
+  input.id = 'wavecontrolDialogInput'
+  if (!multiline) input.type = inputType
+  if (multiline) input.rows = rows
+  input.value = String(value ?? '')
+  input.placeholder = placeholder
+  input.required = Boolean(required)
+  input.dataset.modalInitialFocus = ''
+  if (min !== undefined && !multiline) input.min = String(min)
+  if (max !== undefined && !multiline) input.max = String(max)
+  modal.querySelector('.modal-input-host').appendChild(input)
+  document.body.appendChild(modal)
+
+  return new Promise(resolve => {
+    let settled = false
+    const finish = result => {
+      if (settled) return
+      settled = true
+      if (activeDecisionDialog === finish) activeDecisionDialog = null
+      closeModalElement(modal)
+      modal.remove()
+      resolve(result)
+    }
+    const accept = () => {
+      input.setCustomValidity('')
+      if (!input.reportValidity()) return
+      if (typeof validate === 'function') {
+        const validationResult = validate(input.value)
+        if (validationResult !== true && validationResult !== undefined && validationResult !== '') {
+          input.setCustomValidity(typeof validationResult === 'string' ? validationResult : 'Enter a valid value.')
+          input.reportValidity()
+          return
+        }
+      }
+      finish(input.value)
+    }
+    activeDecisionDialog = finish
+    modal.querySelector('.modal-close').addEventListener('click', () => finish(null), { once: true })
+    modal.querySelector('[data-dialog-cancel]').addEventListener('click', () => finish(null), { once: true })
+    modal.querySelector('[data-dialog-confirm]').addEventListener('click', accept)
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !multiline) {
+        event.preventDefault()
+        accept()
+      }
+    })
+    openModalElement(modal)
+  })
+}
+
+
+// Shared component modules are loaded before this entrypoint, so expose the
+// application dialog service once initialization reaches this point. Event
+// handlers call these functions later, after the full modal runtime is ready.
+window.waveControlConfirm = showConfirmDialog
+window.waveControlInput = showInputDialog
+
+const modalObserver = new MutationObserver(mutations => {
+  if (mutations.some(mutation => mutation.type === 'childList' ||
+      (mutation.type === 'attributes' && mutation.target instanceof HTMLElement && mutation.target.classList.contains('modal')))) {
+    scheduleModalRuntimeSync()
+  }
+})
+modalObserver.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] })
+document.querySelectorAll('.modal').forEach(enhanceModal)
+scheduleModalRuntimeSync()
+
+document.addEventListener('mousedown', event => {
+  const modal = event.target instanceof HTMLElement && event.target.classList.contains('modal') ? event.target : null
+  if (modal && modal.dataset.modalBackdrop !== 'static') closeModalElement(modal)
+})
+
+document.addEventListener('keydown', event => {
+  const modal = topVisibleModal()
+  if (!modal) return
+  if (event.key === 'Escape' && modal.dataset.modalEscape !== 'false') {
+    event.preventDefault()
+    closeModalElement(modal)
+    return
+  }
+  if (event.key !== 'Tab') return
+
+  const focusable = modalFocusableElements(modal)
+  if (focusable.length === 0) {
+    event.preventDefault()
+    modal.querySelector('.modal-content')?.focus()
+    return
+  }
+  const first = focusable[0]
+  const last = focusable.at(-1)
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
+})
+
 // Route UI actions through one delegated listener so generated markup never needs
 // inline event handlers.  This keeps the script CSP meaningful and centralizes
 // validation of data attributes before privileged actions are invoked.
@@ -60,7 +411,7 @@ document.addEventListener('click', async (event) => {
   switch (action) {
     case 'close-modal': {
       const modalId = target.dataset.modalId
-      if (modalId) document.getElementById(modalId)?.classList.add('hidden')
+      closeModalElement(modalId || target.closest('.modal'))
       break
     }
     case 'delete-firmware':
@@ -2740,7 +3091,17 @@ function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
       showToast('Recommended alert rules are already installed', 'success')
       return
     }
-    if (!confirm(`Install ${missing.length} recommended alert rule${missing.length === 1 ? '' : 's'}? They default to in-application alerts and can be edited afterward.`)) return
+    const confirmed = await showConfirmDialog(
+      `WaveControl will add ${missing.length} recommended fleet rule${missing.length === 1 ? '' : 's'}. New rules default to in-application notifications and can be reviewed or edited afterward.`,
+      {
+        title: 'Install recommended alert rules?',
+        eyebrow: 'Alert policy change',
+        confirmText: 'Install rules',
+        tone: 'warning',
+        calloutTitle: 'This changes the fleet alert policy.'
+      }
+    )
+    if (!confirmed) return
     const btn = container.querySelector('#alertInstallRecommended')
     btn.disabled = true
     try {
@@ -2794,7 +3155,18 @@ function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
     btn.addEventListener('click', async () => {
       const id = parseInt(btn.dataset.alertRuleDelete, 10)
       const rule = rules.find(r => r.id === id)
-      if (!rule || !confirm(`Delete alert rule "${rule.name}"? Existing alert history remains.`)) return
+      if (!rule) return
+      const confirmed = await showConfirmDialog(
+        `Rule “${rule.name}” will be removed. Existing alert history will remain available.`,
+        {
+          title: 'Delete alert rule?',
+          eyebrow: 'Alert policy change',
+          confirmText: 'Delete rule',
+          tone: 'danger',
+          calloutTitle: 'New alerts will no longer be evaluated by this rule.'
+        }
+      )
+      if (!confirmed) return
       btn.disabled = true
       try {
         await api.deleteAlertRule(id)
@@ -3144,7 +3516,17 @@ async function renderFirmwarePage(container) {
 
 // Delete firmware helper (global for onclick)
 window.deleteFirmware = async function(reference, displayName = reference) {
-  if (!confirm(`Delete firmware "${displayName}"?`)) return
+  const confirmed = await showConfirmDialog(
+    `Firmware image “${displayName}” will be removed from WaveControl’s firmware library.`,
+    {
+      title: 'Delete firmware image?',
+      eyebrow: 'Firmware library',
+      confirmText: 'Delete firmware',
+      tone: 'danger',
+      calloutTitle: 'Scheduled jobs that reference this image may no longer be runnable.'
+    }
+  )
+  if (!confirmed) return
   
   try {
     await api.deleteFirmware(reference)
@@ -3768,151 +4150,214 @@ function closeCertModal() {
 
 // Show certificate management modal
 async function showCertModal(type) {
-  // Never stack duplicate modals ("View All Certs" used to create multiple windows).
   closeCertModal()
 
-  const endpoint = type === 'pending' ? '/tls/certs/pending' : '/tls/certs'
-  const title = type === 'pending' ? 'Pending Certificates' : 'All Device Certificates'
+  const pendingOnly = type === 'pending'
+  const endpoint = pendingOnly ? '/tls/certs/pending' : '/tls/certs'
+  const title = pendingOnly ? 'Pending device certificates' : 'Device certificate trust'
+  const subtitle = pendingOnly
+    ? 'Review fingerprints that have not yet been trusted or that changed after a device replacement.'
+    : 'Inspect the pinned TLS identity, validity period, and verification state for every managed device.'
 
-  // Render immediately so the user gets feedback even if the API is slow.
-  const shell = `
-    <div class="modal" id="certModal">
-      <div class="modal-content modal-large">
-        <div class="modal-header">
+  const modal = document.createElement('div')
+  modal.id = 'certModal'
+  modal.className = 'modal hidden'
+  modal.innerHTML = `
+    <div class="modal-content modal-xwide cert-modal-shell">
+      <div class="modal-header">
+        <div class="modal-heading">
+          <span class="modal-eyebrow">TLS device identity</span>
           <h3 id="certModalTitle">${escapeHTML(title)}</h3>
-          <button class="modal-close close-modal" aria-label="Close">&times;</button>
+          <p class="modal-subtitle">${escapeHTML(subtitle)}</p>
         </div>
-        <div class="modal-body">
-          <div id="certModalContent">
-            <div class="loading">Loading certificates...</div>
+        <button type="button" class="modal-close" data-cert-modal-close aria-label="Close certificate manager">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="certModalContent" aria-live="polite">
+          <div class="modal-empty modal-loading-state">
+            <span class="report-loading-ring" aria-hidden="true"></span>
+            <strong>Loading certificate inventory…</strong>
           </div>
         </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary close-modal">Close</button>
-        </div>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-footer-note">Trust changes are recorded in the WaveControl changelog.</span>
+        <button type="button" class="btn btn-secondary" data-cert-modal-close>Close</button>
       </div>
     </div>
   `
+  document.body.appendChild(modal)
+  modal.querySelectorAll('[data-cert-modal-close]').forEach(button => button.addEventListener('click', closeCertModal))
+  openModalElement(modal)
 
-  document.body.insertAdjacentHTML('beforeend', shell)
-
-  const modal = document.getElementById('certModal')
-  modal.querySelectorAll('.close-modal').forEach(btn => btn.addEventListener('click', closeCertModal))
-  modal.addEventListener('click', (e) => {
-    // Click-outside-to-close
-    if (e.target === modal) closeCertModal()
-  })
-
-  const contentEl = document.getElementById('certModalContent')
+  const contentEl = modal.querySelector('#certModalContent')
 
   try {
     const result = await api.get(endpoint)
-    const certs = result.certs || []
-
+    const certs = Array.isArray(result?.certs) ? result.certs : []
     if (!contentEl) return
+
     if (certs.length === 0) {
-      contentEl.innerHTML = '<p>No certificates found.</p>'
+      contentEl.innerHTML = `
+        <div class="modal-empty">
+          <div>
+            <strong>${pendingOnly ? 'No certificates need review' : 'No device certificates found'}</strong>
+            <p>${pendingOnly ? 'Every discovered certificate is currently verified.' : 'Certificates appear after WaveControl establishes TLS connections to devices.'}</p>
+          </div>
+        </div>
+      `
       return
     }
 
+    const now = Date.now()
+    const statusFor = cert => cert.changed_at ? 'changed' : (cert.verified ? 'verified' : 'pending')
+    const verifiedCount = certs.filter(cert => statusFor(cert) === 'verified').length
+    const pendingCount = certs.filter(cert => statusFor(cert) === 'pending').length
+    const changedCount = certs.filter(cert => statusFor(cert) === 'changed').length
+    const expiredCount = certs.filter(cert => cert.not_after && new Date(cert.not_after).getTime() < now).length
+
     contentEl.innerHTML = `
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Device</th>
-            <th>Fingerprint</th>
-            <th>Subject</th>
-            <th>Expires</th>
-            <th>Status</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${certs.map(c => {
-            const status = c.changed_at ? 'changed' : (c.verified ? 'verified' : 'pending')
-            const statusClass = status === 'verified' ? 'stat-good' : (status === 'changed' ? 'stat-error' : 'stat-warn')
-            const expiry = c.not_after ? new Date(c.not_after).toLocaleDateString() : '-'
-            const expired = c.not_after && new Date(c.not_after) < new Date()
-
-            const fp = (c.fingerprint || '')
-            const fpShort = fp.length > 16 ? fp.substring(0, 16) + '...' : fp
-
-            const subj = (c.subject || '')
-            const subjShort = subj.length > 40 ? subj.substring(0, 40) + '...' : subj
-
-            return `
-              <tr data-device-id="${escapeAttr(c.device_id || '')}">
-                <td>
-                  <strong>${escapeHTML(c.hostname || c.ip || 'Unknown')}</strong>
-                  ${c.ip ? `<br><small>${escapeHTML(c.ip)}</small>` : ''}
-                </td>
-                <td><code title="${escapeAttr(fp)}">${escapeHTML(fpShort)}</code></td>
-                <td title="${escapeAttr(subj)}">${escapeHTML(subjShort)}</td>
-                <td class="${expired ? 'stat-error' : ''}">${escapeHTML(expiry)}</td>
-                <td>
-                  <span class="${statusClass}">${escapeHTML(status)}</span>
-                  ${c.previous_fingerprint ? `<br><small>was: ${escapeHTML(c.previous_fingerprint.substring(0, 8))}...</small>` : ''}
-                </td>
-                <td>
-                  ${(!c.verified || c.changed_at) ? `<button class="btn btn-sm btn-verify-cert" data-id="${escapeAttr(c.device_id || '')}">Verify</button>` : ''}
-                  <button class="btn btn-sm btn-danger btn-unpin-cert" data-id="${escapeAttr(c.device_id || '')}">Unpin</button>
-                </td>
-              </tr>
-            `
-          }).join('')}
-        </tbody>
-      </table>
+      <div class="modal-summary cert-summary">
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Certificates</span>
+          <span class="modal-summary-value">${certs.length}</span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Verified</span>
+          <span class="modal-summary-value stat-good">${verifiedCount}</span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Pending</span>
+          <span class="modal-summary-value stat-warn">${pendingCount}</span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Changed</span>
+          <span class="modal-summary-value ${changedCount ? 'stat-error' : ''}">${changedCount}</span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Expired</span>
+          <span class="modal-summary-value ${expiredCount ? 'stat-error' : ''}">${expiredCount}</span>
+        </div>
+      </div>
+      <div class="modal-callout ${changedCount ? 'warning' : ''}">
+        <span class="modal-callout-icon" aria-hidden="true">i</span>
+        <div>
+          <strong>${changedCount ? 'Changed fingerprints require operator review.' : 'Pinned fingerprints protect device management sessions.'}</strong>
+          <p>${changedCount ? 'Verify the physical device replacement or certificate rotation before accepting a new identity.' : 'Unpin only when intentionally replacing a radio or recovering from a certificate change.'}</p>
+        </div>
+      </div>
+      <div class="modal-table-wrap cert-table-wrap">
+        <table class="data-table cert-table">
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>Fingerprint</th>
+              <th>Certificate subject</th>
+              <th>Expires</th>
+              <th>Status</th>
+              <th class="table-actions-column">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${certs.map(cert => {
+              const status = statusFor(cert)
+              const expiryDate = cert.not_after ? new Date(cert.not_after) : null
+              const expired = expiryDate && expiryDate.getTime() < now
+              const expiry = expiryDate && !Number.isNaN(expiryDate.getTime()) ? expiryDate.toLocaleDateString() : 'Unknown'
+              const fingerprint = String(cert.fingerprint || '')
+              const fingerprintShort = fingerprint.length > 23 ? `${fingerprint.slice(0, 23)}…` : fingerprint || 'Unavailable'
+              const subject = String(cert.subject || '')
+              const subjectShort = subject.length > 56 ? `${subject.slice(0, 56)}…` : subject || 'Unavailable'
+              return `
+                <tr data-device-id="${escapeAttr(cert.device_id || '')}">
+                  <td>
+                    <strong>${escapeHTML(cert.hostname || cert.ip || 'Unknown device')}</strong>
+                    ${cert.ip ? `<small class="table-secondary">${escapeHTML(cert.ip)}</small>` : ''}
+                  </td>
+                  <td><code class="cert-fingerprint" title="${escapeAttr(fingerprint)}">${escapeHTML(fingerprintShort)}</code></td>
+                  <td title="${escapeAttr(subject)}">${escapeHTML(subjectShort)}</td>
+                  <td class="${expired ? 'stat-error' : ''}">${escapeHTML(expiry)}${expired ? '<small class="table-secondary">Expired</small>' : ''}</td>
+                  <td>
+                    <span class="cert-status cert-status-${escapeAttr(status)}">${escapeHTML(status)}</span>
+                    ${cert.previous_fingerprint ? `<small class="table-secondary" title="${escapeAttr(cert.previous_fingerprint)}">Previous ${escapeHTML(String(cert.previous_fingerprint).slice(0, 11))}…</small>` : ''}
+                  </td>
+                  <td class="table-actions">
+                    ${(!cert.verified || cert.changed_at) ? `<button type="button" class="btn btn-sm btn-primary btn-verify-cert" data-id="${escapeAttr(cert.device_id || '')}">Verify</button>` : ''}
+                    <button type="button" class="btn btn-sm btn-danger-subtle btn-unpin-cert" data-id="${escapeAttr(cert.device_id || '')}">Unpin</button>
+                  </td>
+                </tr>
+              `
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
     `
 
-    // Wire up verify buttons
-    contentEl.querySelectorAll('.btn-verify-cert').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const deviceId = btn.dataset.id
-        btn.disabled = true
-        btn.textContent = '...'
+    contentEl.querySelectorAll('.btn-verify-cert').forEach(button => {
+      button.addEventListener('click', async () => {
+        const deviceId = button.dataset.id
+        button.disabled = true
+        const originalText = button.textContent
+        button.textContent = 'Verifying…'
         try {
           await api.post(`/devices/${deviceId}/cert/verify`, {})
-          const statusSpan = btn.closest('tr')?.querySelector('td:nth-child(5) span')
-          if (statusSpan) {
-            statusSpan.textContent = 'verified'
-            statusSpan.className = 'stat-good'
+          const row = button.closest('tr')
+          const status = row?.querySelector('.cert-status')
+          if (status) {
+            status.textContent = 'verified'
+            status.className = 'cert-status cert-status-verified'
           }
-          btn.remove()
+          button.remove()
           showToast('Certificate verified', 'success')
           loadTLSSettings?.()
-        } catch (e) {
-          showToast('Failed: ' + e.message, 'error')
-          btn.disabled = false
-          btn.textContent = 'Verify'
+        } catch (error) {
+          showToast('Verification failed: ' + error.message, 'error')
+          button.disabled = false
+          button.textContent = originalText
         }
       })
     })
 
-    // Wire up unpin buttons
-    contentEl.querySelectorAll('.btn-unpin-cert').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const deviceId = btn.dataset.id
-        if (!confirm('Unpin this certificate? The device will need to be re-verified.')) return
-        btn.disabled = true
-        btn.textContent = '...'
+    contentEl.querySelectorAll('.btn-unpin-cert').forEach(button => {
+      button.addEventListener('click', async () => {
+        const deviceId = button.dataset.id
+        const deviceName = button.closest('tr')?.querySelector('td strong')?.textContent || 'this device'
+        const confirmed = await showConfirmDialog(
+          `The trusted fingerprint for ${deviceName} will be removed. WaveControl will require the next certificate to be reviewed and verified again.`,
+          {
+            title: 'Unpin device certificate?',
+            eyebrow: 'TLS trust change',
+            confirmText: 'Unpin certificate',
+            tone: 'warning',
+            calloutTitle: 'Device trust will return to a pending state.'
+          }
+        )
+        if (!confirmed) return
+        button.disabled = true
+        const originalText = button.textContent
+        button.textContent = 'Unpinning…'
         try {
           await api.delete(`/devices/${deviceId}/cert`)
-          btn.closest('tr')?.remove()
+          button.closest('tr')?.remove()
           showToast('Certificate unpinned', 'success')
           loadTLSSettings?.()
-        } catch (e) {
-          showToast('Failed: ' + e.message, 'error')
-          btn.disabled = false
-          btn.textContent = 'Unpin'
+        } catch (error) {
+          showToast('Unpin failed: ' + error.message, 'error')
+          button.disabled = false
+          button.textContent = originalText
         }
       })
     })
-
-  } catch (e) {
+  } catch (error) {
     if (contentEl) {
-      contentEl.innerHTML = `<p class="error">Failed to load certificates: ${escapeHTML(e.message)}</p>`
+      contentEl.innerHTML = `
+        <div class="modal-callout danger">
+          <span class="modal-callout-icon" aria-hidden="true">!</span>
+          <div><strong>Certificate inventory could not be loaded.</strong><p>${escapeHTML(error.message)}</p></div>
+        </div>
+      `
     }
-    showToast('Failed to load certificates: ' + e.message, 'error')
+    showToast('Failed to load certificates: ' + error.message, 'error')
   }
 }
 
@@ -4019,7 +4464,17 @@ async function loadUserManagement() {
     container.querySelectorAll('.btn-delete-user').forEach(btn => {
       btn.addEventListener('click', async () => {
         const id = parseInt(btn.dataset.id)
-        if (!confirm('Delete this user?')) return
+        const confirmed = await showConfirmDialog(
+          'The user account and its WaveControl role assignments will be removed. Active sessions are invalidated by the server.',
+          {
+            title: 'Delete user account?',
+            eyebrow: 'Access control',
+            confirmText: 'Delete user',
+            tone: 'danger',
+            calloutTitle: 'This account will no longer be able to sign in.'
+          }
+        )
+        if (!confirmed) return
         
         try {
           await api.deleteUser(id)
@@ -4245,7 +4700,17 @@ async function loadSitesRegionsManager() {
     // Delete region
     container.querySelectorAll('.delete-region').forEach(btn => {
       btn.addEventListener('click', async () => {
-        if (!confirm('Delete this region? Sites will be unassigned.')) return
+        const confirmed = await showConfirmDialog(
+          'The region will be removed and its sites will become unassigned. Device records are not deleted.',
+          {
+            title: 'Delete region?',
+            eyebrow: 'Inventory structure',
+            confirmText: 'Delete region',
+            tone: 'warning',
+            calloutTitle: 'Site organization will change immediately.'
+          }
+        )
+        if (!confirmed) return
         try {
           await api.deleteRegion(btn.dataset.id)
           showToast('Region deleted', 'success')
@@ -4259,7 +4724,17 @@ async function loadSitesRegionsManager() {
     // Delete site
     container.querySelectorAll('.delete-site').forEach(btn => {
       btn.addEventListener('click', async () => {
-        if (!confirm('Delete this site? Devices will be unassigned.')) return
+        const confirmed = await showConfirmDialog(
+          'The site will be removed and its devices will become unassigned. Device records are not deleted.',
+          {
+            title: 'Delete site?',
+            eyebrow: 'Inventory structure',
+            confirmText: 'Delete site',
+            tone: 'warning',
+            calloutTitle: 'Device site assignments will be cleared.'
+          }
+        )
+        if (!confirmed) return
         try {
           await api.deleteSite(btn.dataset.id)
           showToast('Site deleted', 'success')
@@ -5183,7 +5658,7 @@ async function exportMapKMZ() {
   const devicesWithGPS = filteredDevices.filter(d => d.gps_lat && d.gps_lon)
   
   if (devicesWithGPS.length === 0) {
-    alert('No devices with GPS coordinates to export')
+    showToast('No devices with GPS coordinates to export', 'warning')
     return
   }
   
@@ -5224,7 +5699,7 @@ async function exportMapKMZ() {
     console.log(`Exported ${devicesWithGPS.length} devices to ${filename}`)
   } catch (e) {
     console.error('KMZ export error:', e)
-    alert('Error exporting KMZ: ' + e.message)
+    showToast('KMZ export failed: ' + e.message, 'error')
   }
 }
 
@@ -6002,13 +6477,23 @@ function renderMismatchesTab(container) {
     btn.addEventListener('click', async () => {
       const id = btn.dataset.id
       if (!id) return
-      if (!confirm('Remove this device from WaveControl?')) return
+      const confirmed = await showConfirmDialog(
+        'The inventory record will be permanently removed from WaveControl. Polling history and relationships may no longer be available.',
+        {
+          title: 'Remove device from WaveControl?',
+          eyebrow: 'Inventory deletion',
+          confirmText: 'Remove device',
+          tone: 'danger',
+          calloutTitle: 'This cannot be undone from the application.'
+        }
+      )
+      if (!confirmed) return
       try {
         await api.deleteDevice(id)
         await refreshDevices()
         renderCurrentQualityTab()
       } catch (e) {
-        alert('Failed to delete device: ' + e.message)
+        showToast('Failed to delete device: ' + e.message, 'error')
       }
     })
   })
@@ -8327,7 +8812,17 @@ window.showDeviceBackups = async function(deviceId) {
 
 // Restore config helper
 window.restoreConfig = async function(deviceId, path) {
-  if (!confirm('Restore this configuration? The device will reboot.')) return
+  const confirmed = await showConfirmDialog(
+    'WaveControl will restore the selected configuration backup and reboot the device. Management connectivity may be interrupted while it returns.',
+    {
+      title: 'Restore device configuration?',
+      eyebrow: 'Configuration change',
+      confirmText: 'Restore and reboot',
+      tone: 'warning',
+      calloutTitle: 'The device will temporarily go offline.'
+    }
+  )
+  if (!confirmed) return
   
   try {
     showToast('Restoring config...', 'info')
@@ -8536,49 +9031,74 @@ function showDrilldownListsModal() {
     modal.id = 'drilldownListsModal'
     modal.className = 'modal hidden'
     document.body.appendChild(modal)
-    
-    // Close on backdrop click
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) {
-        modal.classList.add('hidden')
-      }
-    })
   }
-  
+
+  store.editingDrilldownListId = null
   modal.innerHTML = `
-    <div class="modal-content modal-lg">
+    <div class="modal-content modal-large drilldown-manager-shell">
       <div class="modal-header">
-        <h4>Manage Drilldown Lists</h4>
-        <button class="modal-close" data-wc-action="close-modal" data-modal-id="drilldownListsModal">&times;</button>
+        <div class="modal-heading">
+          <span class="modal-eyebrow">Focused monitoring</span>
+          <h3>Manage drilldown lists</h3>
+          <p class="modal-subtitle">Create compact polling views for radios or infrastructure that need closer operational attention.</p>
+        </div>
+        <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="drilldownListsModal" aria-label="Close drilldown list manager">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="drilldown-lists-section">
-          <h5>Lists</h5>
-          <div id="drilldownListsContainer">Loading...</div>
-          <div class="form-row" style="margin-top: 1rem; gap: 0.5rem;">
-            <input type="text" id="newListName" placeholder="New list name..." class="form-input" style="flex: 2;" />
-            <input type="number" id="newListInterval" placeholder="Interval (s)" value="30" min="30" class="form-input" style="width: 100px;" />
-            <button class="btn btn-primary" data-wc-action="create-drilldown-list">Create</button>
+        <section class="modal-section drilldown-lists-section">
+          <div class="modal-section-title">
+            <span>Polling lists</span>
+            <span class="modal-section-badge">Minimum interval 30 seconds</span>
           </div>
-        </div>
-        <div id="drilldownHostsSection" style="display: none; margin-top: 1.5rem;">
-          <h5>Hosts in <span id="currentListName"></span></h5>
-          <div id="drilldownHostsContainer"></div>
-          <div class="form-row" style="margin-top: 1rem;">
-            <input type="text" id="newHostIP" placeholder="Host IP address..." class="form-input" />
-            <button class="btn btn-primary" data-wc-action="add-drilldown-host">Add Host</button>
+          <p class="modal-section-copy">The built-in AP list is always available. Custom lists can include any directly reachable host.</p>
+          <div id="drilldownListsContainer" class="modal-table-wrap" aria-live="polite">
+            <div class="modal-empty modal-empty-compact">Loading lists…</div>
           </div>
-        </div>
+          <div class="modal-inline-form drilldown-create-row">
+            <div class="form-group drilldown-name-field">
+              <label for="newListName">New list name</label>
+              <input type="text" id="newListName" placeholder="Backhaul watch" class="form-input" autocomplete="off" />
+            </div>
+            <div class="form-group drilldown-interval-field">
+              <label for="newListInterval">Poll interval</label>
+              <div class="input-with-suffix">
+                <input type="number" id="newListInterval" value="30" min="30" step="5" class="form-input" inputmode="numeric" />
+                <span>sec</span>
+              </div>
+            </div>
+            <button type="button" class="btn btn-primary modal-inline-action" data-wc-action="create-drilldown-list">Create list</button>
+          </div>
+        </section>
+
+        <section id="drilldownHostsSection" class="modal-section hidden">
+          <div class="modal-section-title">
+            <span>Hosts in <strong id="currentListName"></strong></span>
+            <span class="modal-section-badge">Custom membership</span>
+          </div>
+          <p class="modal-section-copy">Add an IP address or resolvable host that WaveControl can poll from the server.</p>
+          <div id="drilldownHostsContainer" class="modal-table-wrap" aria-live="polite"></div>
+          <div class="modal-inline-form drilldown-host-row">
+            <div class="form-group">
+              <label for="newHostIP">Host address</label>
+              <input type="text" id="newHostIP" placeholder="192.0.2.10" class="form-input" autocomplete="off" />
+            </div>
+            <button type="button" class="btn btn-primary modal-inline-action" data-wc-action="add-drilldown-host">Add host</button>
+          </div>
+        </section>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-footer-note">List changes take effect on the next polling interval.</span>
+        <button type="button" class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="drilldownListsModal">Done</button>
       </div>
     </div>
   `
-  modal.classList.remove('hidden')
+
+  openModalElement(modal)
   renderDrilldownListsInModal()
 }
 
 window.closeDrilldownListsModal = function() {
-  const modal = document.getElementById('drilldownListsModal')
-  if (modal) modal.classList.add('hidden')
+  closeModalElement('drilldownListsModal')
 }
 
 async function renderDrilldownListsInModal() {
@@ -8665,7 +9185,17 @@ window.createDrilldownList = async function() {
 }
 
 window.deleteDrilldownList = async function(id) {
-  if (!confirm('Delete this drilldown list?')) return
+  const confirmed = await showConfirmDialog(
+    'The custom drilldown list and its host membership will be removed. Device inventory is not affected.',
+    {
+      title: 'Delete drilldown list?',
+      eyebrow: 'Monitoring list',
+      confirmText: 'Delete list',
+      tone: 'danger',
+      calloutTitle: 'This custom polling view will be removed.'
+    }
+  )
+  if (!confirmed) return
   
   try {
     await api.deleteDrilldownList(id)
@@ -8684,7 +9214,7 @@ window.editDrilldownList = async function(listId, listName) {
   const nameSpan = document.getElementById('currentListName')
   const container = document.getElementById('drilldownHostsContainer')
   
-  if (section) section.style.display = 'block'
+  if (section) section.classList.remove('hidden')
   if (nameSpan) nameSpan.textContent = listName
   if (container) container.innerHTML = 'Loading...'
   
@@ -9020,1497 +9550,1446 @@ function renderDrilldownBody() {
   })
 }
 
-function renderReportsPage(container) {
-  container.innerHTML = `
-    <div class="page page-reports">
-      <div class="reports-header">
-        <h3>Network Reports</h3>
-        <button class="btn btn-primary" id="btnGenerateReport">Generate Report</button>
+const REPORT_TYPE_META = Object.freeze({
+  health: {
+    title: 'Network Health',
+    shortTitle: 'Health',
+    description: 'Availability, link quality, system pressure, stability, firmware spread, and ranked operational exceptions.',
+    caption: 'Operational snapshot',
+    tone: 'health'
+  },
+  inventory: {
+    title: 'Device Inventory',
+    shortTitle: 'Inventory',
+    description: 'Authoritative AP and STA inventory with status, platform, firmware, site placement, and parent relationships.',
+    caption: 'Asset snapshot',
+    tone: 'inventory'
+  },
+  performance: {
+    title: 'Performance Summary',
+    shortTitle: 'Performance',
+    description: 'Aggregate throughput history, radio metrics, signal distribution, capacity risk, and metric-coverage gaps.',
+    caption: 'Performance snapshot',
+    tone: 'performance'
+  },
+  chain: {
+    title: 'Chain Imbalance',
+    shortTitle: 'Chain imbalance',
+    description: 'Ranked device and peer-side chain spread above the configured imbalance threshold.',
+    caption: 'RF diagnostic',
+    tone: 'chain'
+  },
+  rx_mismatch: {
+    title: 'RX Level Mismatch',
+    shortTitle: 'RX mismatch',
+    description: 'Links where the AP-side and STA-side receive levels disagree beyond the configured threshold.',
+    caption: 'Link diagnostic',
+    tone: 'rx'
+  }
+})
+
+const reportPageState = {
+  reports: [],
+  selectedType: 'health',
+  search: '',
+  typeFilter: 'all',
+  compareMode: false,
+  selectedIds: new Set(),
+  loading: false,
+  activeReport: null,
+  chartSamples: null,
+  chartLegacy: false
+}
+
+function reportMeta(type) {
+  return REPORT_TYPE_META[type] || {
+    title: formatMetricName(type || 'report'),
+    shortTitle: formatMetricName(type || 'report'),
+    description: 'Saved waveControl report snapshot.',
+    caption: 'Report snapshot',
+    tone: 'default'
+  }
+}
+
+function reportIcon(type, className = '') {
+  const paths = {
+    health: '<path d="M3 12h4l2.4-5.2 4.2 10.4L16 12h5"/><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"/>',
+    inventory: '<rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/><path d="M7 8h.01M7 19h.01M11 8h7M11 19h7"/>',
+    performance: '<path d="M4 19h16"/><path d="m5 15 4-4 3 2 6-7"/><path d="M15 6h3v3"/>',
+    chain: '<path d="M4 7h7M13 7h7M8 4v6M16 4v6"/><path d="M4 17h4M10 17h10M6 14v6M14 14v6"/>',
+    rx_mismatch: '<path d="M4 18V9M9 18V5M15 18v-7M20 18V3"/><path d="M3 21h18"/>',
+    compare: '<path d="M8 3 4 7l4 4"/><path d="M4 7h10a4 4 0 0 1 4 4v1"/><path d="m16 21 4-4-4-4"/><path d="M20 17H10a4 4 0 0 1-4-4v-1"/>',
+    search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>',
+    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/>',
+    download: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
+    print: '<path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="7"/>',
+    trash: '<path d="M3 6h18M8 6V3h8v3M19 6l-1 15H6L5 6M10 11v5M14 11v5"/>',
+    view: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/>'
+  }
+  return `<svg class="report-icon ${escapeAttr(className)}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[type] || paths.inventory}</svg>`
+}
+
+function reportCanEdit() {
+  const roles = Array.isArray(store.user?.roles) ? store.user.roles : []
+  return roles.includes('editor') || roles.includes('administrator')
+}
+
+function reportSafeNumber(value, fallback = 0) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
+function reportInteger(value) {
+  return Math.round(reportSafeNumber(value)).toLocaleString()
+}
+
+function reportPercent(value, digits = 1) {
+  return `${reportSafeNumber(value).toFixed(digits)}%`
+}
+
+function reportDate(value, options = {}) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return 'Unknown time'
+  return date.toLocaleString([], {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+    ...options
+  })
+}
+
+function reportRelativeTime(value) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return ''
+  const seconds = Math.round((date.getTime() - Date.now()) / 1000)
+  const absolute = Math.abs(seconds)
+  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+  if (absolute < 60) return formatter.format(seconds, 'second')
+  if (absolute < 3600) return formatter.format(Math.round(seconds / 60), 'minute')
+  if (absolute < 86400) return formatter.format(Math.round(seconds / 3600), 'hour')
+  if (absolute < 604800) return formatter.format(Math.round(seconds / 86400), 'day')
+  return formatter.format(Math.round(seconds / 604800), 'week')
+}
+
+function reportLastSeen(value) {
+  if (!value) return 'Never'
+  return reportDate(value)
+}
+
+function reportTypeBadge(type) {
+  const meta = reportMeta(type)
+  return `<span class="report-type-badge report-type-badge-${escapeAttr(meta.tone)}">${reportIcon(type)}<span>${escapeHTML(meta.shortTitle)}</span></span>`
+}
+
+function reportStatusPill(status) {
+  const normalized = ['online', 'offline'].includes(String(status).toLowerCase()) ? String(status).toLowerCase() : 'unknown'
+  return `<span class="report-status-pill report-status-${normalized}"><span class="report-status-dot"></span>${escapeHTML(formatMetricName(normalized))}</span>`
+}
+
+function reportQualityPill(quality, signal = null, band = '') {
+  const normalized = ['good', 'fair', 'poor'].includes(quality) ? quality : 'no_signal'
+  const label = normalized === 'no_signal' ? 'No signal' : formatMetricName(normalized)
+  const value = reportSafeNumber(signal, 0)
+  const detail = value < 0 ? `${value} dBm${band ? ` · ${escapeHTML(band)}` : ''}` : escapeHTML(band || '')
+  return `<span class="report-quality-pill report-quality-${normalized}" title="${escapeAttr(detail)}"><span class="report-status-dot"></span>${escapeHTML(label)}${value < 0 ? `<strong>${value} dBm</strong>` : ''}</span>`
+}
+
+function reportEmptyState(title, message, iconType = 'inventory') {
+  return `
+    <div class="report-empty-state">
+      <div class="report-empty-icon">${reportIcon(iconType)}</div>
+      <h4>${escapeHTML(title)}</h4>
+      <p>${escapeHTML(message)}</p>
+    </div>
+  `
+}
+
+function reportTableWrap(table, className = '') {
+  return `<div class="report-table-wrap ${escapeAttr(className)}">${table}</div>`
+}
+
+function reportSection(title, description, body, className = '') {
+  return `
+    <section class="report-section-card ${escapeAttr(className)}">
+      <div class="report-section-heading">
+        <div>
+          <h4>${escapeHTML(title)}</h4>
+          ${description ? `<p>${escapeHTML(description)}</p>` : ''}
+        </div>
       </div>
-      
-      <div class="report-types">
-        <div class="report-type" data-type="health">
-          <h4>Network Health</h4>
-          <p>Overall network status, device uptime, and signal quality summary.</p>
-        </div>
-        <div class="report-type" data-type="inventory">
-          <h4>Device Inventory</h4>
-          <p>Complete list of all devices with firmware versions and configuration.</p>
-        </div>
-        <div class="report-type" data-type="performance">
-          <h4>Performance Summary</h4>
-          <p>Throughput, capacity utilization, and link quality metrics.</p>
-        </div>
-        <div class="report-type" data-type="chain">
-          <h4>Chain Imbalance</h4>
-          <p>Devices and links with per-chain RSSI spread greater than 5 dB, marked as AP side, STA side, or both.</p>
-        </div>
-        <div class="report-type" data-type="rx_mismatch">
-          <h4>RX Level Mismatch</h4>
-          <p>Links where AP RX and STA RX for the same link differ by more than 8 dB.</p>
-        </div>
+      <div class="report-section-body">${body}</div>
+    </section>
+  `
+}
+
+function reportMetricCard(label, value, detail = '', tone = '', footer = '') {
+  return `
+    <article class="report-metric-card ${tone ? `report-metric-${escapeAttr(tone)}` : ''}">
+      <span class="report-metric-label">${escapeHTML(label)}</span>
+      <strong class="report-metric-value">${escapeHTML(String(value))}</strong>
+      ${detail ? `<span class="report-metric-detail">${escapeHTML(detail)}</span>` : ''}
+      ${footer ? `<div class="report-metric-footer">${footer}</div>` : ''}
+    </article>
+  `
+}
+
+function reportMetaStrip(data, items = []) {
+  const coverage = data.coverage || {}
+  const generated = data.generated_at ? reportDate(data.generated_at) : 'Unknown time'
+  const version = reportSafeNumber(data.report_version, 1)
+  const standardItems = [
+    ['Scope', data.scope === 'all' || !data.scope ? 'All inventory devices' : String(data.scope)],
+    ['Generated', generated],
+    ['Snapshot', `Schema v${version}`]
+  ]
+  if (coverage.inventory_devices !== undefined) {
+    standardItems.splice(2, 0, ['Metric coverage', `${reportInteger(coverage.metrics_devices)}/${reportInteger(coverage.inventory_devices)} · ${reportPercent(coverage.coverage_pct)}`])
+  }
+  return `
+    <div class="report-meta-strip">
+      ${[...standardItems, ...items].map(([label, value]) => `
+        <div class="report-meta-item"><span>${escapeHTML(label)}</span><strong>${escapeHTML(String(value))}</strong></div>
+      `).join('')}
+    </div>
+  `
+}
+
+function reportDistribution(data, labelFormatter = formatMetricName, limit = 12) {
+  const entries = Object.entries(data || {})
+    .map(([key, value]) => [key, reportSafeNumber(value)])
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+  if (entries.length === 0) return reportEmptyState('No distribution data', 'This snapshot did not include values for this distribution.')
+  const max = Math.max(...entries.map(entry => entry[1]), 1)
+  return `
+    <div class="report-distribution-list">
+      ${entries.map(([key, value]) => {
+        const percent = Math.max(2, value / max * 100)
+        return `
+          <div class="report-distribution-row">
+            <div class="report-distribution-label"><span title="${escapeAttr(key)}">${escapeHTML(labelFormatter(key))}</span><strong>${reportInteger(value)}</strong></div>
+            <div class="report-distribution-track"><span style="--report-bar-size:${percent.toFixed(2)}%"></span></div>
+          </div>
+        `
+      }).join('')}
+    </div>
+  `
+}
+
+function reportSignalDistribution(values) {
+  const good = reportSafeNumber(values?.good)
+  const fair = reportSafeNumber(values?.fair)
+  const poor = reportSafeNumber(values?.poor)
+  const noSignal = reportSafeNumber(values?.no_signal)
+  const total = good + fair + poor + noSignal
+  if (total === 0) return reportEmptyState('No signal samples', 'No subscriber signal samples were available in this snapshot.', 'performance')
+  const segments = [
+    ['good', good, 'Good'], ['fair', fair, 'Fair'], ['poor', poor, 'Poor'], ['no-signal', noSignal, 'No signal']
+  ]
+  return `
+    <div class="report-signal-summary">
+      <div class="report-signal-stacked" role="img" aria-label="Signal quality distribution">
+        ${segments.filter(([, count]) => count > 0).map(([tone, count, label]) => `<span class="signal-${tone}" style="--report-segment-size:${(count / total * 100).toFixed(2)}%" title="${escapeAttr(`${label}: ${count}`)}"></span>`).join('')}
       </div>
-      
-      <div class="reports-section">
-        <h4>Recent Reports</h4>
-        <div id="reportsList" class="reports-list">
-          <p class="text-muted">No reports generated yet.</p>
-        </div>
-      </div>
-      
-      <div class="report-viewer" id="reportViewer" style="display:none">
-        <div class="report-viewer-header">
-          <h4 id="reportViewerTitle">Report</h4>
-          <button class="btn btn-sm" id="closeReportViewer">Close</button>
-        </div>
-        <div class="report-content" id="reportContent"></div>
+      <div class="report-signal-legend">
+        ${segments.map(([tone, count, label]) => `<span><i class="signal-${tone}"></i>${escapeHTML(label)} <strong>${reportInteger(count)}</strong></span>`).join('')}
       </div>
     </div>
   `
-  
-  // Report type selection
-  document.querySelectorAll('.report-type').forEach(el => {
-    el.addEventListener('click', () => {
-      document.querySelectorAll('.report-type').forEach(e => e.classList.remove('selected'))
-      el.classList.add('selected')
-    })
+}
+
+function reportSiteSummaryTable(rows, options = {}) {
+  const sites = Array.isArray(rows) ? rows : []
+  if (sites.length === 0) return reportEmptyState('No site summary', 'No site assignments were present in this snapshot.')
+  const includeMetrics = options.metrics !== false
+  const includeRF = options.rf === true
+  const includeRates = options.rates === true
+  const table = `
+    <table class="report-table report-sortable">
+      <thead><tr>
+        <th data-sort-type="text">Site</th>
+        <th data-sort-type="text">Region</th>
+        <th data-sort-type="number">Total</th>
+        <th data-sort-type="number">APs</th>
+        <th data-sort-type="number">STAs</th>
+        <th data-sort-type="number">Online</th>
+        <th data-sort-type="number">Offline</th>
+        <th data-sort-type="number">Unknown</th>
+        ${includeMetrics ? '<th data-sort-type="number">Coverage</th>' : ''}
+        ${includeRF ? '<th data-sort-type="number">Poor signal</th><th data-sort-type="number">High CPU</th>' : ''}
+        ${includeRates ? '<th data-sort-type="number">TX</th><th data-sort-type="number">RX</th>' : ''}
+      </tr></thead>
+      <tbody>${sites.map(site => `
+        <tr>
+          <td><strong>${escapeHTML(site.site || 'Unassigned')}</strong></td>
+          <td>${escapeHTML(site.region || '—')}</td>
+          <td data-sort-value="${reportSafeNumber(site.total)}">${reportInteger(site.total)}</td>
+          <td data-sort-value="${reportSafeNumber(site.ap_count)}">${reportInteger(site.ap_count)}</td>
+          <td data-sort-value="${reportSafeNumber(site.sta_count)}">${reportInteger(site.sta_count)}</td>
+          <td data-sort-value="${reportSafeNumber(site.online)}"><span class="report-count-good">${reportInteger(site.online)}</span></td>
+          <td data-sort-value="${reportSafeNumber(site.offline)}"><span class="${reportSafeNumber(site.offline) > 0 ? 'report-count-bad' : ''}">${reportInteger(site.offline)}</span></td>
+          <td data-sort-value="${reportSafeNumber(site.unknown)}">${reportInteger(site.unknown)}</td>
+          ${includeMetrics ? `<td data-sort-value="${reportSafeNumber(site.coverage_pct)}"><span class="report-inline-meter"><i style="--report-meter:${Math.min(100, reportSafeNumber(site.coverage_pct)).toFixed(1)}%"></i><strong>${reportPercent(site.coverage_pct)}</strong></span></td>` : ''}
+          ${includeRF ? `<td data-sort-value="${reportSafeNumber(site.poor_signal)}">${reportInteger(site.poor_signal)}</td><td data-sort-value="${reportSafeNumber(site.high_cpu)}">${reportInteger(site.high_cpu)}</td>` : ''}
+          ${includeRates ? `<td data-sort-value="${reportSafeNumber(site.tx_rate)}">${escapeHTML(formatRate(site.tx_rate))}</td><td data-sort-value="${reportSafeNumber(site.rx_rate)}">${escapeHTML(formatRate(site.rx_rate))}</td>` : ''}
+        </tr>
+      `).join('')}</tbody>
+    </table>
+  `
+  return reportTableWrap(table)
+}
+
+function renderReportsPage(container) {
+  reportPageState.compareMode = false
+  reportPageState.selectedIds.clear()
+  const canEdit = reportCanEdit()
+  const typeCards = Object.entries(REPORT_TYPE_META).map(([type, meta]) => `
+    <button type="button" class="report-type-card ${type === reportPageState.selectedType ? 'selected' : ''}" data-report-type="${escapeAttr(type)}" aria-pressed="${type === reportPageState.selectedType}">
+      <span class="report-type-icon report-type-icon-${escapeAttr(meta.tone)}">${reportIcon(type)}</span>
+      <span class="report-type-copy">
+        <span class="report-type-caption">${escapeHTML(meta.caption)}</span>
+        <strong>${escapeHTML(meta.title)}</strong>
+        <span>${escapeHTML(meta.description)}</span>
+      </span>
+      <span class="report-type-check" aria-hidden="true">✓</span>
+    </button>
+  `).join('')
+
+  container.innerHTML = `
+    <div class="page page-reports">
+      <section class="reports-hero">
+        <div class="reports-hero-copy">
+          <span class="page-eyebrow">Reports & diagnostics</span>
+          <h2>Network intelligence snapshots</h2>
+          <p>Generate durable, versioned snapshots for operations, troubleshooting, inventory control, and before/after comparison. Saved reports never silently substitute current data.</p>
+        </div>
+        <div class="reports-hero-status">
+          <span class="reports-live-dot"></span>
+          <div><strong>Snapshot engine v2</strong><span>Authoritative inventory + captured metrics</span></div>
+        </div>
+      </section>
+
+      <section class="report-generator-card">
+        <div class="report-generator-heading">
+          <div>
+            <span class="section-eyebrow">Create a report</span>
+            <h3>Choose the question you need answered</h3>
+          </div>
+          ${canEdit ? '' : '<span class="report-permission-note">Viewer access · generation requires Editor</span>'}
+        </div>
+        <div class="report-type-grid">${typeCards}</div>
+        <div class="report-generator-footer">
+          <div id="reportSelectionSummary" class="report-selection-summary"></div>
+          <button type="button" class="btn btn-primary report-generate-button" id="btnGenerateReport" ${canEdit ? '' : 'disabled'}>
+            <span class="report-button-icon">${reportIcon(reportPageState.selectedType)}</span>
+            <span class="report-generate-label">Generate ${escapeHTML(reportMeta(reportPageState.selectedType).shortTitle)} snapshot</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="reports-history-card">
+        <div class="reports-history-heading">
+          <div>
+            <span class="section-eyebrow">Saved snapshots</span>
+            <h3>Report history</h3>
+            <p id="reportHistoryCount">Loading saved reports…</p>
+          </div>
+          <div class="reports-history-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="btnToggleCompare">${reportIcon('compare')} Compare</button>
+            <button type="button" class="btn btn-secondary btn-sm btn-icon-label" id="btnRefreshReports" title="Refresh report history">${reportIcon('refresh')} Refresh</button>
+          </div>
+        </div>
+        <div class="reports-history-toolbar">
+          <label class="report-search-field">
+            ${reportIcon('search')}
+            <span class="sr-only">Search reports</span>
+            <input type="search" id="reportSearch" placeholder="Search type, creator, date, or ID" value="${escapeAttr(reportPageState.search)}" autocomplete="off">
+          </label>
+          <label class="report-filter-field">
+            <span>Type</span>
+            <select id="reportTypeFilter">
+              <option value="all">All reports</option>
+              ${Object.entries(REPORT_TYPE_META).map(([type, meta]) => `<option value="${escapeAttr(type)}" ${reportPageState.typeFilter === type ? 'selected' : ''}>${escapeHTML(meta.title)}</option>`).join('')}
+            </select>
+          </label>
+        </div>
+        <div id="reportsList" class="reports-list" aria-live="polite">
+          <div class="report-list-loading"><span class="report-loading-ring"></span><span>Loading saved reports…</span></div>
+        </div>
+      </section>
+
+      <div id="reportViewerModal" class="modal hidden report-viewer-modal" data-modal-backdrop="static">
+        <div class="modal-content modal-xwide report-viewer-shell">
+          <div class="modal-header report-viewer-header">
+            <div class="report-viewer-title-group">
+              <span id="reportViewerEyebrow" class="modal-eyebrow">Saved snapshot</span>
+              <h3 id="reportViewerTitle">Report</h3>
+              <p id="reportViewerSubtitle" class="modal-subtitle"></p>
+            </div>
+            <div class="report-viewer-actions">
+              <button type="button" class="btn btn-secondary btn-sm" id="reportPrintButton">${reportIcon('print')} Print</button>
+              <a class="btn btn-secondary btn-sm" id="reportJsonDownload" href="#" download>${reportIcon('download')} JSON</a>
+              <a class="btn btn-secondary btn-sm" id="reportCsvDownload" href="#" download>${reportIcon('download')} CSV</a>
+              <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="reportViewerModal" aria-label="Close report viewer">×</button>
+            </div>
+          </div>
+          <div class="modal-body report-viewer-body" id="reportContent"></div>
+        </div>
+      </div>
+
+    </div>
+  `
+
+  updateReportSelectionUI(reportPageState.selectedType)
+
+  container.querySelectorAll('[data-report-type]').forEach(card => {
+    card.addEventListener('click', () => updateReportSelectionUI(card.dataset.reportType))
   })
-  
-  document.getElementById('btnGenerateReport')?.addEventListener('click', async () => {
-    const selected = document.querySelector('.report-type.selected')
-    const type = selected?.dataset.type || 'health'
-    
-    showToast('Generating report...', 'info')
-    
-    try {
-      const result = await api.generateReport(type)
-      showToast('Report generated', 'success')
-      loadReportsList()
-    } catch (e) {
-      showToast('Failed: ' + e.message, 'error')
-    }
+
+  container.querySelector('#btnGenerateReport')?.addEventListener('click', generateSelectedReport)
+  container.querySelector('#reportSearch')?.addEventListener('input', event => {
+    reportPageState.search = event.target.value || ''
+    renderReportsHistory()
   })
-  
-  document.getElementById('closeReportViewer')?.addEventListener('click', () => {
-    document.getElementById('reportViewer').style.display = 'none'
+  container.querySelector('#reportTypeFilter')?.addEventListener('change', event => {
+    reportPageState.typeFilter = event.target.value || 'all'
+    renderReportsHistory()
   })
-  
+  container.querySelector('#btnToggleCompare')?.addEventListener('click', toggleReportCompareMode)
+  container.querySelector('#btnRefreshReports')?.addEventListener('click', () => loadReportsList({ announce: true }))
+  container.querySelector('#reportPrintButton')?.addEventListener('click', () => window.print())
+
   loadReportsList()
 }
 
-async function loadReportsList() {
-  const container = document.getElementById('reportsList')
-  if (!container) return
-  
-  try {
-    const reports = await api.listReports()
-    
-    if (!reports || reports.length === 0) {
-      container.innerHTML = '<p class="text-muted">No reports generated yet.</p>'
-      return
-    }
-    
-    container.innerHTML = `
-      <div class="reports-compare-bar" style="display:none">
-        <span class="compare-info">Select 2 reports of the same type to compare</span>
-        <button class="btn btn-sm btn-compare-reports" disabled>Compare Selected</button>
-      </div>
-      <table class="reports-table">
-        <thead>
-          <tr>
-            <th><input type="checkbox" id="compareToggle" title="Enable comparison mode"></th>
-            <th>Type</th>
-            <th>Generated</th>
-            <th>Devices</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${reports.map(r => `
-            <tr>
-              <td><input type="checkbox" class="compare-checkbox" data-id="${r.id}" data-type="${r.type}" style="display:none"></td>
-              <td>${r.type}</td>
-              <td>${new Date(r.created_at).toLocaleString()}</td>
-              <td>${r.device_count || 0}</td>
-              <td class="report-actions">
-                <button class="btn btn-sm btn-view-report" data-id="${r.id}" data-type="${r.type}" title="View Report">View</button>
-                <a class="btn btn-sm btn-json-dl" href="/api/wavecontrol/reports/${r.id}/download" download title="Download JSON">JSON</a>
-                ${r.type === 'inventory' || r.type === 'performance' || r.type === 'chain' || r.type === 'rx_mismatch' ? `
-                  <a class="btn btn-sm btn-csv-dl" href="/api/wavecontrol/reports/${r.id}/download?format=csv" download title="Download CSV">CSV</a>
-                ` : ''}
-                <button class="btn btn-sm btn-delete-report btn-danger-subtle" data-id="${r.id}" title="Delete Report">🗑</button>
-              </td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    `
-    
-    // Compare mode toggle
-    const compareToggle = container.querySelector('#compareToggle')
-    const compareBar = container.querySelector('.reports-compare-bar')
-    const compareBtn = container.querySelector('.btn-compare-reports')
-    const checkboxes = container.querySelectorAll('.compare-checkbox')
-    
-    compareToggle.addEventListener('change', () => {
-      const enabled = compareToggle.checked
-      compareBar.style.display = enabled ? 'flex' : 'none'
-      checkboxes.forEach(cb => {
-        cb.style.display = enabled ? 'inline' : 'none'
-        cb.checked = false
-      })
-      compareBtn.disabled = true
-    })
-    
-    // Checkbox change - validate selection
-    checkboxes.forEach(cb => {
-      cb.addEventListener('change', () => {
-        const selected = Array.from(checkboxes).filter(c => c.checked)
-        
-        if (selected.length === 2) {
-          // Check if same type
-          const types = selected.map(c => c.dataset.type)
-          if (types[0] === types[1]) {
-            compareBtn.disabled = false
-            container.querySelector('.compare-info').textContent = `Compare ${types[0]} reports`
-          } else {
-            compareBtn.disabled = true
-            container.querySelector('.compare-info').textContent = 'Reports must be the same type'
-          }
-        } else {
-          compareBtn.disabled = true
-          container.querySelector('.compare-info').textContent = `Select 2 reports of the same type (${selected.length}/2)`
-        }
-        
-        // Limit to 2 selections
-        if (selected.length >= 2) {
-          checkboxes.forEach(c => {
-            if (!c.checked) c.disabled = true
-          })
-        } else {
-          checkboxes.forEach(c => c.disabled = false)
-        }
-      })
-    })
-    
-    // Compare button click
-    compareBtn.addEventListener('click', async () => {
-      const selected = Array.from(checkboxes).filter(c => c.checked)
-      if (selected.length !== 2) return
-      
-      const id1 = parseInt(selected[0].dataset.id)
-      const id2 = parseInt(selected[1].dataset.id)
-      const type = selected[0].dataset.type
-      
-      try {
-        showToast('Comparing reports...', 'info')
-        const comparison = await api.compareReports(id1, id2)
-        displayReportComparison(comparison, type)
-      } catch (e) {
-        showToast('Comparison failed: ' + e.message, 'error')
-      }
-    })
-    
-    // View report handlers
-    container.querySelectorAll('.btn-view-report').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const reportId = btn.dataset.id
-        const reportType = btn.dataset.type
-        try {
-          const report = await api.getReport(reportId)
-          displayReport(report, reportType)
-        } catch (e) {
-          showToast('Failed to load report: ' + e.message, 'error')
-        }
-      })
-    })
-    
-    // Delete report handlers
-    container.querySelectorAll('.btn-delete-report').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const reportId = btn.dataset.id
-        if (!confirm('Delete this report? This cannot be undone.')) return
-        
-        try {
-          await api.deleteReport(reportId)
-          showToast('Report deleted', 'success')
-          loadReportsList()
-        } catch (e) {
-          showToast('Failed to delete: ' + e.message, 'error')
-        }
-      })
-    })
-  } catch (e) {
-    container.innerHTML = `<p class="error">Error: ${escapeHTML(e.message)}</p>`
+function updateReportSelectionUI(type) {
+  if (!REPORT_TYPE_META[type]) type = 'health'
+  reportPageState.selectedType = type
+  document.querySelectorAll('[data-report-type]').forEach(card => {
+    const selected = card.dataset.reportType === type
+    card.classList.toggle('selected', selected)
+    card.setAttribute('aria-pressed', String(selected))
+  })
+  const meta = reportMeta(type)
+  const summary = document.getElementById('reportSelectionSummary')
+  if (summary) summary.innerHTML = `${reportIcon(type)}<span><strong>${escapeHTML(meta.title)}</strong><small>${escapeHTML(meta.description)}</small></span>`
+  const button = document.getElementById('btnGenerateReport')
+  if (button && !reportPageState.loading) {
+    const icon = button.querySelector('.report-button-icon')
+    const label = button.querySelector('.report-generate-label')
+    if (icon) icon.innerHTML = reportIcon(type)
+    if (label) label.textContent = `Generate ${meta.shortTitle} snapshot`
   }
 }
 
-// Display report comparison
-function displayReportComparison(comparison, type) {
-  const viewer = document.getElementById('reportViewer')
-  const title = document.getElementById('reportViewerTitle')
-  const content = document.getElementById('reportContent')
-  
-  title.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)} Report Comparison`
-  
-  const time1 = new Date(comparison.report_1_time).toLocaleString()
-  const time2 = new Date(comparison.report_2_time).toLocaleString()
-  
-  let html = `
-    <div class="report-header-strip">
-      <div class="report-scope">
-        <strong>Report #${comparison.report_1_id}</strong>: ${time1}
+function setReportGenerationBusy(busy) {
+  reportPageState.loading = busy
+  const button = document.getElementById('btnGenerateReport')
+  if (!button) return
+  button.disabled = busy || !reportCanEdit()
+  button.setAttribute('aria-busy', String(busy))
+  const icon = button.querySelector('.report-button-icon')
+  const label = button.querySelector('.report-generate-label')
+  if (busy) {
+    if (icon) icon.innerHTML = '<span class="report-loading-ring report-loading-ring-sm"></span>'
+    if (label) label.textContent = 'Capturing snapshot…'
+  } else {
+    updateReportSelectionUI(reportPageState.selectedType)
+  }
+}
+
+async function generateSelectedReport() {
+  if (!reportCanEdit() || reportPageState.loading) return
+  const type = reportPageState.selectedType
+  const meta = reportMeta(type)
+  setReportGenerationBusy(true)
+  try {
+    const result = await api.generateReport(type)
+    showToast(`${meta.title} snapshot generated`, 'success')
+    await loadReportsList()
+    if (result?.report_id) await openReportById(result.report_id)
+  } catch (error) {
+    showToast(`Report generation failed: ${error.message}`, 'error')
+  } finally {
+    setReportGenerationBusy(false)
+  }
+}
+
+async function loadReportsList(options = {}) {
+  const list = document.getElementById('reportsList')
+  if (!list) return
+  list.innerHTML = '<div class="report-list-loading"><span class="report-loading-ring"></span><span>Loading saved reports…</span></div>'
+  try {
+    const reports = await api.listReports({ limit: 200 })
+    reportPageState.reports = Array.isArray(reports) ? reports : []
+    const validIds = new Set(reportPageState.reports.map(report => Number(report.id)))
+    reportPageState.selectedIds = new Set([...reportPageState.selectedIds].filter(id => validIds.has(id)))
+    renderReportsHistory()
+    if (options.announce) showToast('Report history refreshed', 'success')
+  } catch (error) {
+    reportPageState.reports = []
+    list.innerHTML = `
+      <div class="report-list-error">
+        <strong>Could not load report history</strong>
+        <span>${escapeHTML(error.message)}</span>
+        <button type="button" class="btn btn-secondary btn-sm" id="reportListRetry">Try again</button>
       </div>
-      <div class="report-scope">
-        <strong>Report #${comparison.report_2_id}</strong>: ${time2}
+    `
+    document.getElementById('reportListRetry')?.addEventListener('click', () => loadReportsList())
+    const count = document.getElementById('reportHistoryCount')
+    if (count) count.textContent = 'Report history unavailable'
+  }
+}
+
+function filteredReports() {
+  const query = reportPageState.search.trim().toLowerCase()
+  return reportPageState.reports.filter(report => {
+    if (reportPageState.typeFilter !== 'all' && report.type !== reportPageState.typeFilter) return false
+    if (!query) return true
+    const searchable = [
+      report.id,
+      report.type,
+      report.type_label,
+      report.created_by_username,
+      report.created_at,
+      reportDate(report.created_at)
+    ].join(' ').toLowerCase()
+    return searchable.includes(query)
+  })
+}
+
+function renderReportsHistory() {
+  const list = document.getElementById('reportsList')
+  if (!list) return
+  const reports = filteredReports()
+  const total = reportPageState.reports.length
+  const count = document.getElementById('reportHistoryCount')
+  if (count) {
+    const filterSuffix = reports.length !== total ? ` · ${reports.length} shown` : ''
+    count.textContent = `${total.toLocaleString()} saved snapshot${total === 1 ? '' : 's'}${filterSuffix}`
+  }
+
+  const compareToggle = document.getElementById('btnToggleCompare')
+  if (compareToggle) {
+    compareToggle.classList.toggle('active', reportPageState.compareMode)
+    compareToggle.innerHTML = `${reportIcon('compare')} ${reportPageState.compareMode ? 'Exit compare' : 'Compare'}`
+  }
+
+  if (total === 0) {
+    list.innerHTML = reportEmptyState('No saved reports yet', 'Choose a report type above and generate the first network snapshot.', 'health')
+    return
+  }
+  if (reports.length === 0) {
+    list.innerHTML = reportEmptyState('No matching reports', 'Clear the search or type filter to see other saved snapshots.', 'search')
+    return
+  }
+
+  const selectedReports = reportPageState.reports.filter(report => reportPageState.selectedIds.has(Number(report.id)))
+  const compareReady = selectedReports.length === 2 && selectedReports[0].type === selectedReports[1].type
+  const comparisonBar = reportPageState.compareMode ? `
+    <div class="reports-compare-bar">
+      <div>
+        ${reportIcon('compare')}
+        <span><strong>${selectedReports.length}/2 selected</strong><small>${compareReady ? `${escapeHTML(reportMeta(selectedReports[0].type).title)} snapshots are ready to compare` : 'Select two snapshots of the same report type'}</small></span>
       </div>
+      <button type="button" class="btn btn-primary btn-sm" id="btnCompareSelected" ${compareReady ? '' : 'disabled'}>Compare selected</button>
     </div>
-    <div class="comparison-table-container">
+  ` : ''
+
+  const table = `
+    <table class="reports-table">
+      <thead><tr>
+        ${reportPageState.compareMode ? '<th class="report-select-column"><span class="sr-only">Select</span></th>' : ''}
+        <th>Report</th>
+        <th>Generated</th>
+        <th>Created by</th>
+        <th>Devices</th>
+        <th class="report-actions-column">Actions</th>
+      </tr></thead>
+      <tbody>
+        ${reports.map(report => {
+          const id = Number(report.id)
+          const selected = reportPageState.selectedIds.has(id)
+          const meta = reportMeta(report.type)
+          return `
+            <tr class="${selected ? 'report-row-selected' : ''}" data-report-row="${id}">
+              ${reportPageState.compareMode ? `<td class="report-select-column"><label class="report-select-box"><input type="checkbox" class="report-compare-checkbox" data-report-id="${id}" ${selected ? 'checked' : ''}><span></span></label></td>` : ''}
+              <td>
+                <button type="button" class="report-name-button" data-report-action="view" data-report-id="${id}">
+                  <span class="report-row-icon report-type-icon-${escapeAttr(meta.tone)}">${reportIcon(report.type)}</span>
+                  <span><strong>${escapeHTML(report.type_label || meta.title)}</strong><small>Snapshot #${id}</small></span>
+                </button>
+              </td>
+              <td><span class="report-date-primary">${escapeHTML(reportDate(report.created_at))}</span><span class="report-date-secondary">${escapeHTML(reportRelativeTime(report.created_at))}</span></td>
+              <td><span class="report-creator">${escapeHTML(report.created_by_username || 'System')}</span></td>
+              <td><span class="report-device-count">${reportInteger(report.device_count)}</span></td>
+              <td class="report-actions">
+                <button type="button" class="btn btn-secondary btn-sm report-action-view" data-report-action="view" data-report-id="${id}">${reportIcon('view')} View</button>
+                <a class="report-icon-action" href="/api/wavecontrol/reports/${id}/download" download title="Download JSON" aria-label="Download report ${id} as JSON">JSON</a>
+                <a class="report-icon-action" href="/api/wavecontrol/reports/${id}/download?format=csv" download title="Download CSV" aria-label="Download report ${id} as CSV">CSV</a>
+                ${reportCanEdit() ? `<button type="button" class="report-icon-action report-delete-action" data-report-action="delete" data-report-id="${id}" title="Delete report" aria-label="Delete report ${id}">${reportIcon('trash')}</button>` : ''}
+              </td>
+            </tr>
+          `
+        }).join('')}
+      </tbody>
+    </table>
   `
-  
-  // Render comparison tables based on type
-  if (comparison.summary) {
-    html += `
-      <h5>Summary Changes</h5>
-      <table class="report-table report-table-sm">
-        <thead><tr><th>Metric</th><th>Report #${comparison.report_1_id}</th><th>Report #${comparison.report_2_id}</th><th>Change</th></tr></thead>
-        <tbody>
-          ${Object.entries(comparison.summary).map(([key, val]) => {
-            const delta = val.delta || 0
-            const deltaClass = delta > 0 ? 'text-warning' : delta < 0 ? 'text-success' : ''
-            const deltaStr = delta > 0 ? `+${formatCompareValue(delta, key)}` : formatCompareValue(delta, key)
-            return `
-              <tr>
-                <td>${formatMetricName(key)}</td>
-                <td>${formatCompareValue(val.report_1, key)}</td>
-                <td>${formatCompareValue(val.report_2, key)}</td>
-                <td class="${deltaClass}">${deltaStr}</td>
-              </tr>
-            `
-          }).join('')}
-        </tbody>
-      </table>
-    `
+
+  list.innerHTML = `${comparisonBar}${reportTableWrap(table, 'reports-history-table-wrap')}`
+  list.querySelectorAll('[data-report-action="view"]').forEach(button => {
+    button.addEventListener('click', () => openReportById(button.dataset.reportId))
+  })
+  list.querySelectorAll('[data-report-action="delete"]').forEach(button => {
+    button.addEventListener('click', () => deleteSavedReport(button.dataset.reportId))
+  })
+  list.querySelectorAll('.report-compare-checkbox').forEach(checkbox => {
+    checkbox.addEventListener('change', () => updateReportComparisonSelection(checkbox))
+  })
+  list.querySelector('#btnCompareSelected')?.addEventListener('click', compareSelectedReports)
+}
+
+function toggleReportCompareMode() {
+  reportPageState.compareMode = !reportPageState.compareMode
+  reportPageState.selectedIds.clear()
+  renderReportsHistory()
+}
+
+function updateReportComparisonSelection(checkbox) {
+  const id = Number(checkbox.dataset.reportId)
+  const report = reportPageState.reports.find(item => Number(item.id) === id)
+  if (!report) return
+  if (!checkbox.checked) {
+    reportPageState.selectedIds.delete(id)
+    renderReportsHistory()
+    return
   }
-  
-  if (comparison.link_quality) {
-    html += `
-      <h5>Link Quality Changes</h5>
-      <table class="report-table report-table-sm">
-        <thead><tr><th>Quality</th><th>Report #${comparison.report_1_id}</th><th>Report #${comparison.report_2_id}</th><th>Change</th></tr></thead>
-        <tbody>
-          ${Object.entries(comparison.link_quality).map(([key, val]) => {
-            const delta = val.delta || 0
-            const isGood = key === 'good'
-            const deltaClass = isGood ? (delta > 0 ? 'text-success' : delta < 0 ? 'text-danger' : '') 
-                                      : (delta > 0 ? 'text-danger' : delta < 0 ? 'text-success' : '')
-            const deltaStr = delta > 0 ? `+${delta}` : `${delta}`
-            return `
-              <tr>
-                <td>${key.charAt(0).toUpperCase() + key.slice(1)}</td>
-                <td>${val.report_1}</td>
-                <td>${val.report_2}</td>
-                <td class="${deltaClass}">${deltaStr}</td>
-              </tr>
-            `
-          }).join('')}
-        </tbody>
-      </table>
-    `
+
+  const selectedReports = reportPageState.reports.filter(item => reportPageState.selectedIds.has(Number(item.id)))
+  if (selectedReports.length > 0 && selectedReports[0].type !== report.type) {
+    checkbox.checked = false
+    showToast('Select two reports of the same type', 'warning')
+    return
   }
-  
-  if (comparison.signal_quality) {
-    html += `
-      <h5>Signal Quality Changes</h5>
-      <table class="report-table report-table-sm">
-        <thead><tr><th>Quality</th><th>Report #${comparison.report_1_id}</th><th>Report #${comparison.report_2_id}</th><th>Change</th></tr></thead>
-        <tbody>
-          ${Object.entries(comparison.signal_quality).map(([key, val]) => {
-            const delta = val.delta || 0
-            const isGood = key === 'good'
-            const deltaClass = isGood ? (delta > 0 ? 'text-success' : delta < 0 ? 'text-danger' : '') 
-                                      : (delta > 0 ? 'text-danger' : delta < 0 ? 'text-success' : '')
-            const deltaStr = delta > 0 ? `+${delta}` : `${delta}`
-            return `
-              <tr>
-                <td>${key.charAt(0).toUpperCase() + key.slice(1)}</td>
-                <td>${val.report_1}</td>
-                <td>${val.report_2}</td>
-                <td class="${deltaClass}">${deltaStr}</td>
-              </tr>
-            `
-          }).join('')}
-        </tbody>
-      </table>
-    `
+  if (reportPageState.selectedIds.size >= 2) {
+    checkbox.checked = false
+    showToast('Only two reports can be compared at once', 'warning')
+    return
   }
-  
-  if (comparison.system_health) {
-    html += `
-      <h5>System Health Changes</h5>
-      <table class="report-table report-table-sm">
-        <thead><tr><th>Metric</th><th>Report #${comparison.report_1_id}</th><th>Report #${comparison.report_2_id}</th><th>Change</th></tr></thead>
-        <tbody>
-          ${Object.entries(comparison.system_health).map(([key, val]) => {
-            const delta = val.delta || 0
-            const deltaClass = delta > 0 ? 'text-danger' : delta < 0 ? 'text-success' : ''
-            const deltaStr = delta > 0 ? `+${delta}` : `${delta}`
-            return `
-              <tr>
-                <td>${formatMetricName(key)}</td>
-                <td>${val.report_1}</td>
-                <td>${val.report_2}</td>
-                <td class="${deltaClass}">${deltaStr}</td>
-              </tr>
-            `
-          }).join('')}
-        </tbody>
-      </table>
-    `
+  reportPageState.selectedIds.add(id)
+  renderReportsHistory()
+}
+
+async function compareSelectedReports() {
+  const selected = reportPageState.reports
+    .filter(report => reportPageState.selectedIds.has(Number(report.id)))
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+  if (selected.length !== 2 || selected[0].type !== selected[1].type) return
+  const button = document.getElementById('btnCompareSelected')
+  if (button) {
+    button.disabled = true
+    button.textContent = 'Comparing…'
   }
-  
-  html += '</div>'
-  
-  content.innerHTML = html
-  initSortableReportTables(content)
-  viewer.style.display = 'block'
+  try {
+    const comparison = await api.compareReports(Number(selected[0].id), Number(selected[1].id))
+    displayReportComparison(comparison, selected[0].type)
+  } catch (error) {
+    showToast(`Comparison failed: ${error.message}`, 'error')
+  } finally {
+    renderReportsHistory()
+  }
+}
+
+async function openReportById(reportId) {
+  const id = Number(reportId)
+  if (!Number.isSafeInteger(id) || id <= 0) return
+  try {
+    const report = await api.getReport(id)
+    displayReport(report, report.type)
+  } catch (error) {
+    showToast(`Failed to load report: ${error.message}`, 'error')
+  }
+}
+
+function showReportConfirm({ title, message, confirmText = 'Delete report' }) {
+  return showConfirmDialog(message, {
+    title,
+    eyebrow: 'Delete saved snapshot',
+    confirmText,
+    tone: 'danger',
+    calloutTitle: 'This cannot be undone.'
+  })
+}
+
+async function deleteSavedReport(reportId) {
+  if (!reportCanEdit()) return
+  const id = Number(reportId)
+  const report = reportPageState.reports.find(item => Number(item.id) === id)
+  if (!report) return
+  const confirmed = await showReportConfirm({
+    title: `Delete ${reportMeta(report.type).shortTitle} snapshot?`,
+    message: `Snapshot #${id}, generated ${reportDate(report.created_at)}, will be permanently removed.`,
+    confirmText: 'Delete snapshot'
+  })
+  if (!confirmed) return
+  try {
+    await api.deleteReport(id)
+    reportPageState.selectedIds.delete(id)
+    showToast('Report deleted', 'success')
+    await loadReportsList()
+  } catch (error) {
+    showToast(`Failed to delete report: ${error.message}`, 'error')
+  }
+}
+
+function parseReportData(report) {
+  if (report?.data && typeof report.data === 'object') return report.data
+  if (typeof report?.data === 'string') {
+    try { return JSON.parse(report.data) } catch (_) { return {} }
+  }
+  return {}
+}
+
+function displayReport(report, reportType) {
+  const type = reportType || report?.type || 'health'
+  const meta = reportMeta(type)
+  const data = parseReportData(report)
+  const content = document.getElementById('reportContent')
+  const title = document.getElementById('reportViewerTitle')
+  const eyebrow = document.getElementById('reportViewerEyebrow')
+  const subtitle = document.getElementById('reportViewerSubtitle')
+  const jsonLink = document.getElementById('reportJsonDownload')
+  const csvLink = document.getElementById('reportCsvDownload')
+  if (!content || !title) return
+
+  reportPageState.activeReport = report
+  reportPageState.chartSamples = null
+  title.textContent = meta.title
+  if (eyebrow) eyebrow.textContent = `${meta.caption} · Snapshot #${report.id}`
+  if (subtitle) {
+    const parts = [reportDate(report.created_at), `${reportInteger(report.device_count)} inventory devices`]
+    if (report.created_by_username) parts.push(`Created by ${report.created_by_username}`)
+    subtitle.textContent = parts.join(' · ')
+  }
+  if (jsonLink) {
+    jsonLink.href = `/api/wavecontrol/reports/${Number(report.id)}/download`
+    jsonLink.classList.remove('hidden')
+  }
+  if (csvLink) {
+    csvLink.href = `/api/wavecontrol/reports/${Number(report.id)}/download?format=csv`
+    csvLink.classList.remove('hidden')
+  }
+
+  try {
+    content.innerHTML = formatReportData(type, data)
+  } catch (error) {
+    console.error('Report rendering failed', error)
+    content.innerHTML = `<div class="report-render-error"><strong>Could not render this report.</strong><span>${escapeHTML(error.message)}</span></div>`
+  }
+
+  openModalElement('reportViewerModal')
+  initReportInteractions(content)
+
+  if (type === 'performance') {
+    const hasSnapshot = Object.prototype.hasOwnProperty.call(data, 'throughput_history')
+    reportPageState.chartSamples = Array.isArray(data.throughput_history) ? data.throughput_history : null
+    reportPageState.chartLegacy = !hasSnapshot
+    requestAnimationFrame(() => loadThroughputChart(reportPageState.chartSamples, !hasSnapshot))
+  }
+}
+
+function formatReportData(type, data) {
+  switch (type) {
+    case 'health': return formatHealthReport(data)
+    case 'inventory': return formatInventoryReport(data)
+    case 'performance': return formatPerformanceReport(data)
+    case 'chain': return formatChainReport(data)
+    case 'rx_mismatch': return formatRxMismatchReport(data)
+    default: return reportEmptyState('Unsupported report', `The report type “${type}” is not supported by this viewer.`)
+  }
+}
+
+function displayReportComparison(comparison, type) {
+  const meta = reportMeta(type)
+  const content = document.getElementById('reportContent')
+  const title = document.getElementById('reportViewerTitle')
+  const eyebrow = document.getElementById('reportViewerEyebrow')
+  const subtitle = document.getElementById('reportViewerSubtitle')
+  const jsonLink = document.getElementById('reportJsonDownload')
+  const csvLink = document.getElementById('reportCsvDownload')
+  if (!content || !title) return
+
+  const report1 = `#${comparison.report_1_id}`
+  const report2 = `#${comparison.report_2_id}`
+  title.textContent = `${meta.title} comparison`
+  if (eyebrow) eyebrow.textContent = 'Before / after comparison'
+  if (subtitle) subtitle.textContent = `${report1} · ${reportDate(comparison.report_1_time)} → ${report2} · ${reportDate(comparison.report_2_time)} · Change is newer minus older`
+  jsonLink?.classList.add('hidden')
+  csvLink?.classList.add('hidden')
+
+  const preferredOrder = ['summary', 'coverage', 'link_quality', 'signal_quality', 'system_health', 'stability']
+  const sections = preferredOrder
+    .filter(key => comparison[key] && typeof comparison[key] === 'object')
+    .map(key => formatComparisonSection(key, comparison[key], comparison.report_1_id, comparison.report_2_id))
+    .join('')
+
+  content.innerHTML = `
+    <div class="report-comparison-banner">
+      <div class="report-comparison-point"><span>Earlier</span><strong>Snapshot ${escapeHTML(report1)}</strong><small>${escapeHTML(reportDate(comparison.report_1_time))}</small></div>
+      <div class="report-comparison-arrow">${reportIcon('compare')}</div>
+      <div class="report-comparison-point"><span>Later</span><strong>Snapshot ${escapeHTML(report2)}</strong><small>${escapeHTML(reportDate(comparison.report_2_time))}</small></div>
+    </div>
+    ${sections || reportEmptyState('Nothing comparable', 'These snapshots do not contain overlapping comparison metrics.', 'compare')}
+  `
+  openModalElement('reportViewerModal')
+  initReportInteractions(content)
+}
+
+function formatComparisonSection(section, values, firstId, secondId) {
+  const entries = Object.entries(values || {})
+  if (entries.length === 0) return ''
+  const table = `
+    <table class="report-table report-sortable report-comparison-table">
+      <thead><tr><th data-sort-type="text">Metric</th><th data-sort-type="number">Snapshot #${Number(firstId)}</th><th data-sort-type="number">Snapshot #${Number(secondId)}</th><th data-sort-type="number">Change</th></tr></thead>
+      <tbody>${entries.map(([key, value]) => {
+        const before = reportSafeNumber(value?.report_1)
+        const after = reportSafeNumber(value?.report_2)
+        const delta = reportSafeNumber(value?.delta)
+        const tone = reportDeltaTone(key, delta)
+        return `
+          <tr>
+            <td><strong>${escapeHTML(formatMetricName(key))}</strong></td>
+            <td data-sort-value="${before}">${escapeHTML(formatCompareValue(before, key))}</td>
+            <td data-sort-value="${after}">${escapeHTML(formatCompareValue(after, key))}</td>
+            <td data-sort-value="${delta}"><span class="report-delta report-delta-${tone}">${delta > 0 ? '+' : ''}${escapeHTML(formatCompareValue(delta, key))}</span></td>
+          </tr>
+        `
+      }).join('')}</tbody>
+    </table>
+  `
+  return reportSection(formatMetricName(section), 'Snapshot-to-snapshot change', reportTableWrap(table), 'report-comparison-section')
 }
 
 function formatMetricName(key) {
-  return key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+  const names = {
+    total: 'Total devices', online: 'Online', offline: 'Offline', unknown: 'Unknown', uptime: 'Availability',
+    ap_count: 'APs', sta_count: 'STAs', ap_online: 'APs online', sta_online: 'STAs online',
+    inventory_devices: 'Inventory devices', metrics_devices: 'Devices with metrics', metrics_device_count: 'Devices with metrics',
+    missing_metrics: 'Missing metrics', signal_samples: 'Signal samples', coverage_pct: 'Metric coverage',
+    good: 'Good signal', fair: 'Fair signal', poor: 'Poor signal', no_signal: 'No signal',
+    high_cpu: 'High CPU', high_mem: 'High memory', high_temp: 'High temperature',
+    flaps_1h: 'Flaps (1h)', flaps_24h: 'Flaps (24h)', reboots_1h: 'Reboots (1h)', reboots_24h: 'Reboots (24h)',
+    total_tx_rate: 'Aggregate TX', total_rx_rate: 'Aggregate RX', ap_tx_rate: 'AP TX', ap_rx_rate: 'AP RX', sta_tx_rate: 'STA TX', sta_rx_rate: 'STA RX',
+    avg_signal: 'Average signal', device_count: 'Inventory devices', inventory_ap_count: 'Inventory APs', inventory_sta_count: 'Inventory STAs',
+    site_count: 'Sites', region_count: 'Regions', unassigned_site: 'Unassigned site', firmware_versions: 'Firmware versions', platform_families: 'Platform families',
+    total_issues: 'Total findings', device_issues: 'Device-radio findings', peer_issues: 'Peer findings', both_issues: 'Both sides', ap_only_issues: 'AP side only', sta_only_issues: 'STA side only',
+    ap_stronger_issues: 'AP RX stronger', sta_stronger_issues: 'STA RX stronger',
+    summary: 'Summary', coverage: 'Data coverage', link_quality: 'Link quality', signal_quality: 'Signal quality', system_health: 'System health', stability: 'Stability'
+  }
+  if (names[key]) return names[key]
+  return String(key || '').replace(/_/g, ' ').replace(/\b\w/g, character => character.toUpperCase())
 }
 
-function formatCompareValue(val, key) {
-  if (key.includes('rate')) {
-    return formatRate(val)
-  }
-  if (key === 'uptime') {
-    return val.toFixed(1) + '%'
-  }
-  return val
+function formatCompareValue(value, key) {
+  const number = reportSafeNumber(value)
+  if (key.includes('rate')) return formatRate(number)
+  if (key.includes('pct') || key === 'uptime') return `${number.toFixed(1)}%`
+  if (key.includes('signal')) return `${number.toFixed(1)} dBm`
+  if (Number.isInteger(number)) return number.toLocaleString()
+  return number.toFixed(2)
 }
 
-
+function reportDeltaTone(key, delta) {
+  if (delta === 0) return 'neutral'
+  const negativeWhenIncreasing = new Set([
+    'offline', 'unknown', 'missing_metrics', 'poor', 'no_signal', 'high_cpu', 'high_mem', 'high_temp',
+    'flaps_1h', 'flaps_24h', 'reboots_1h', 'reboots_24h', 'unassigned_site', 'total_issues',
+    'device_issues', 'peer_issues', 'both_issues', 'ap_only_issues', 'sta_only_issues', 'ap_stronger_issues', 'sta_stronger_issues'
+  ])
+  const positiveWhenIncreasing = new Set(['online', 'uptime', 'coverage_pct', 'metrics_devices', 'signal_samples', 'good', 'avg_signal'])
+  if (negativeWhenIncreasing.has(key)) return delta > 0 ? 'bad' : 'good'
+  if (positiveWhenIncreasing.has(key)) return delta > 0 ? 'good' : 'bad'
+  return 'neutral'
+}
 
 function parseSortableIP(value) {
   const text = String(value || '').trim()
-  if (!text) return null
-  const m = text.match(/^(\d{1,3})(?:\.(\d{1,3}))(?:\.(\d{1,3}))(?:\.(\d{1,3}))$/)
-  if (!m) return null
-  const octets = m.slice(1).map(v => Number(v))
-  if (octets.some(v => Number.isNaN(v) || v < 0 || v > 255)) return null
-  return octets.reduce((acc, v) => acc * 256 + v, 0)
+  const ipv4 = text.split('.').map(Number)
+  if (ipv4.length === 4 && ipv4.every(part => Number.isInteger(part) && part >= 0 && part <= 255)) {
+    return ipv4.reduce((total, part) => total * 256 + part, 0)
+  }
+  return text.toLowerCase()
 }
 
-function compareSortableValues(a, b, type) {
-  if (type === 'number') {
-    const an = Number(a)
-    const bn = Number(b)
-    const aBad = Number.isNaN(an)
-    const bBad = Number.isNaN(bn)
-    if (aBad && bBad) return 0
-    if (aBad) return 1
-    if (bBad) return -1
-    return an - bn
-  }
+function compareSortableValues(left, right, type) {
+  if (type === 'number') return reportSafeNumber(left) - reportSafeNumber(right)
   if (type === 'ip') {
-    const ai = parseSortableIP(a)
-    const bi = parseSortableIP(b)
-    if (ai != null && bi != null) return ai - bi
-    if (ai != null) return -1
-    if (bi != null) return 1
+    const parsedLeft = parseSortableIP(left)
+    const parsedRight = parseSortableIP(right)
+    if (typeof parsedLeft === 'number' && typeof parsedRight === 'number') return parsedLeft - parsedRight
+    return String(parsedLeft).localeCompare(String(parsedRight), undefined, { numeric: true, sensitivity: 'base' })
   }
-  return String(a || '').localeCompare(String(b || ''), undefined, { numeric: true, sensitivity: 'base' })
+  if (type === 'date') return new Date(left).getTime() - new Date(right).getTime()
+  return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' })
 }
 
-function initSortableReportTables(root) {
-  if (!root) return
-  root.querySelectorAll('table.report-sortable').forEach(table => {
-    const headers = Array.from(table.querySelectorAll('thead th[data-sort-type]'))
-    const tbody = table.querySelector('tbody')
-    if (!tbody || !headers.length) return
-    headers.forEach((th, index) => {
-      if (th.dataset.sortInit === '1') return
-      th.dataset.sortInit = '1'
-      th.classList.add('report-sort-header')
-      th.tabIndex = 0
-      const activate = () => {
-        const prevIndex = Number(table.dataset.sortIndex || '-1')
-        const prevDir = table.dataset.sortDir || 'desc'
-        const nextDir = prevIndex === index && prevDir === 'asc' ? 'desc' : 'asc'
-        table.dataset.sortIndex = String(index)
-        table.dataset.sortDir = nextDir
-        headers.forEach((h, i) => {
-          h.dataset.sortDir = i === index ? nextDir : ''
+function initSortableReportTables(root = document) {
+  root.querySelectorAll('.report-sortable').forEach(table => {
+    table.querySelectorAll('thead th[data-sort-type]').forEach((header, columnIndex) => {
+      if (header.dataset.sortBound === 'true') return
+      header.dataset.sortBound = 'true'
+      header.tabIndex = 0
+      header.setAttribute('role', 'button')
+      header.setAttribute('aria-sort', 'none')
+      header.insertAdjacentHTML('beforeend', '<span class="report-sort-indicator" aria-hidden="true"></span>')
+      const sort = () => {
+        const direction = header.dataset.sortDirection === 'asc' ? 'desc' : 'asc'
+        table.querySelectorAll('thead th').forEach(item => {
+          item.dataset.sortDirection = ''
+          item.setAttribute('aria-sort', 'none')
         })
-        const rows = Array.from(tbody.querySelectorAll('tr'))
-        rows.sort((rowA, rowB) => {
-          const cellA = rowA.children[index]
-          const cellB = rowB.children[index]
-          const valA = cellA?.dataset.sortValue ?? cellA?.textContent?.trim() ?? ''
-          const valB = cellB?.dataset.sortValue ?? cellB?.textContent?.trim() ?? ''
-          const cmp = compareSortableValues(valA, valB, th.dataset.sortType || 'text')
-          return nextDir === 'asc' ? cmp : -cmp
+        header.dataset.sortDirection = direction
+        header.setAttribute('aria-sort', direction === 'asc' ? 'ascending' : 'descending')
+        const body = table.tBodies[0]
+        if (!body) return
+        const rows = Array.from(body.rows)
+        const type = header.dataset.sortType || 'text'
+        rows.sort((a, b) => {
+          const leftCell = a.cells[columnIndex]
+          const rightCell = b.cells[columnIndex]
+          const left = leftCell?.dataset.sortValue ?? leftCell?.textContent
+          const right = rightCell?.dataset.sortValue ?? rightCell?.textContent
+          const result = compareSortableValues(left, right, type)
+          return direction === 'asc' ? result : -result
         })
-        rows.forEach(row => tbody.appendChild(row))
+        rows.forEach(row => body.appendChild(row))
       }
-      th.addEventListener('click', activate)
-      th.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter' || ev.key === ' ') {
-          ev.preventDefault()
-          activate()
+      header.addEventListener('click', sort)
+      header.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          sort()
         }
       })
     })
   })
 }
 
-function displayReport(report, type) {
-  const viewer = document.getElementById('reportViewer')
-  const title = document.getElementById('reportViewerTitle')
-  const content = document.getElementById('reportContent')
-  
-  const reportTitleMap = {
-    health: 'Health Report',
-    inventory: 'Inventory Report',
-    performance: 'Performance Report',
-    chain: 'Chain Imbalance Report',
-    rx_mismatch: 'RX Level Mismatch Report'
-  }
-  title.textContent = reportTitleMap[type] || `${type.charAt(0).toUpperCase() + type.slice(1)} Report`
-  
-  // Format report content based on type
-  let html = ''
-  if (report.data) {
-    const data = typeof report.data === 'string' ? JSON.parse(report.data) : report.data
-    
-    if (type === 'health') {
-      html = formatHealthReport(data)
-    } else if (type === 'inventory') {
-      html = formatInventoryReport(data)
-    } else if (type === 'performance') {
-      html = formatPerformanceReport(data)
-    } else if (type === 'chain') {
-      html = formatChainReport(data)
-    } else if (type === 'rx_mismatch') {
-      html = formatRxMismatchReport(data)
-    } else {
-      html = `<pre>${JSON.stringify(data, null, 2)}</pre>`
-    }
-  } else {
-    html = '<p class="text-muted">No report data available.</p>'
-  }
-  
-  content.innerHTML = html
-  initSortableReportTables(content)
-  viewer.style.display = 'block'
-  
-  // Wire up report tab switching
-  content.querySelectorAll('.report-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      // Update active tab
-      content.querySelectorAll('.report-tab').forEach(t => t.classList.remove('active'))
-      tab.classList.add('active')
-      
-      // Show/hide content
-      const tabName = tab.dataset.tab
-      content.querySelectorAll('.report-tab-content').forEach(c => {
-        c.classList.toggle('hidden', c.id !== `tab-${tabName}`)
+function initReportTabs(root = document) {
+  root.querySelectorAll('.report-tabset').forEach(tabset => {
+    const buttons = Array.from(tabset.querySelectorAll('[data-report-tab]'))
+    const panels = Array.from(tabset.querySelectorAll('[data-report-panel]'))
+    buttons.forEach(button => {
+      button.addEventListener('click', () => {
+        const target = button.dataset.reportTab
+        buttons.forEach(item => {
+          const active = item === button
+          item.classList.toggle('active', active)
+          item.setAttribute('aria-selected', String(active))
+        })
+        panels.forEach(panel => panel.classList.toggle('hidden', panel.dataset.reportPanel !== target))
       })
     })
   })
-  
-  // Load throughput chart for performance reports
-  if (type === 'performance') {
-    loadThroughputChart()
-  }
 }
 
-// Load and render throughput history chart
-async function loadThroughputChart() {
-  const container = document.getElementById('throughputChartContainer')
+function initReportTableFilters(root = document) {
+  root.querySelectorAll('[data-report-filter-target]').forEach(input => {
+    const targetId = input.dataset.reportFilterTarget
+    const table = root.querySelector(`#${CSS.escape(targetId)}`)
+    if (!table) return
+    const rows = Array.from(table.querySelectorAll('tbody tr'))
+    const countNode = root.querySelector(`[data-report-filter-count="${CSS.escape(targetId)}"]`)
+    const apply = () => {
+      const query = input.value.trim().toLowerCase()
+      let visible = 0
+      rows.forEach(row => {
+        const show = !query || row.textContent.toLowerCase().includes(query)
+        row.classList.toggle('hidden', !show)
+        if (show) visible++
+      })
+      if (countNode) countNode.textContent = `${visible.toLocaleString()} of ${rows.length.toLocaleString()} rows`
+    }
+    input.addEventListener('input', apply)
+    apply()
+  })
+}
+
+function initReportInteractions(root = document) {
+  initSortableReportTables(root)
+  initReportTabs(root)
+  initReportTableFilters(root)
+}
+
+async function loadThroughputChart(samples = null, allowLegacyFallback = false) {
+  const container = document.getElementById('reportThroughputChart')
+  const note = document.getElementById('reportThroughputNote')
   if (!container) return
-  
-  try {
-    const data = await api.getThroughputHistory()
-    const samples = data.samples || []
-    
-    if (samples.length < 2) {
-      container.innerHTML = '<div class="chart-empty">Not enough data yet. Chart populates over time.</div>'
+
+  let data = Array.isArray(samples) ? samples : null
+  if (data === null && allowLegacyFallback) {
+    container.innerHTML = '<div class="chart-loading"><span class="report-loading-ring"></span><span>Loading current history for this legacy snapshot…</span></div>'
+    if (note) {
+      note.classList.add('report-legacy-note')
+      note.textContent = 'Legacy report: throughput history was not stored when this snapshot was created. The chart below is current data and is not part of the saved report.'
+    }
+    try {
+      data = await api.getThroughputHistory()
+    } catch (error) {
+      container.innerHTML = `<div class="chart-error">Could not load current throughput history: ${escapeHTML(error.message)}</div>`
       return
     }
-    
-    // Render chart without a third-party runtime dependency
-    renderThroughputChart(container, samples)
-  } catch (e) {
-    container.innerHTML = `<div class="chart-error">Failed to load chart: ${escapeHTML(e.message)}</div>`
   }
+
+  if (!Array.isArray(data) || data.length === 0) {
+    container.innerHTML = '<div class="chart-empty">No throughput history had accumulated when this snapshot was captured.</div>'
+    return
+  }
+  if (note && !allowLegacyFallback) note.textContent = `${data.length.toLocaleString()} aggregate samples captured with this report.`
+  renderThroughputChart(container, data)
 }
 
-// Render throughput history without a third-party chart runtime.
 function renderThroughputChart(container, samples) {
   const ns = 'http://www.w3.org/2000/svg'
-  const createSVG = (name, attrs = {}, text = '') => {
+  const createSVG = (name, attributes = {}, text = '') => {
     const node = document.createElementNS(ns, name)
-    for (const [key, value] of Object.entries(attrs)) {
-      node.setAttribute(key, String(value))
-    }
+    Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, String(value)))
     if (text) node.textContent = text
     return node
   }
-
-  const data = samples
+  const data = (Array.isArray(samples) ? samples : [])
     .map(sample => ({
       time: new Date(sample.timestamp),
-      tx: Number.isFinite(Number(sample.tx_rate)) ? Math.max(0, Number(sample.tx_rate)) : 0,
-      rx: Number.isFinite(Number(sample.rx_rate)) ? Math.max(0, Number(sample.rx_rate)) : 0
+      tx: Math.max(0, reportSafeNumber(sample.tx_rate)),
+      rx: Math.max(0, reportSafeNumber(sample.rx_rate)),
+      online: Math.max(0, reportSafeNumber(sample.online)),
+      offline: Math.max(0, reportSafeNumber(sample.offline))
     }))
     .filter(sample => Number.isFinite(sample.time.getTime()))
     .sort((a, b) => a.time - b.time)
 
   if (data.length < 2) {
-    container.innerHTML = '<div class="chart-empty">Not enough valid data to draw the chart.</div>'
+    container.innerHTML = '<div class="chart-empty">At least two valid samples are needed to draw the throughput chart.</div>'
     return
   }
 
-  const margin = { top: 20, right: 80, bottom: 30, left: 60 }
-  const outerWidth = Math.max(container.clientWidth || 720, 360)
-  const outerHeight = 200
-  const width = Math.max(outerWidth - margin.left - margin.right, 180)
+  const margin = { top: 24, right: 26, bottom: 42, left: 68 }
+  const outerWidth = Math.max(container.clientWidth || 760, 420)
+  const outerHeight = 280
+  const width = outerWidth - margin.left - margin.right
   const height = outerHeight - margin.top - margin.bottom
   const startTime = data[0].time.getTime()
   const endTime = data[data.length - 1].time.getTime()
-  const timeSpan = Math.max(endTime - startTime, 1)
-  const maxRate = Math.max(1, ...data.flatMap(sample => [sample.tx, sample.rx])) * 1.1
-  const x = time => ((time.getTime() - startTime) / timeSpan) * width
-  const y = rate => height - (rate / maxRate) * height
+  const span = Math.max(1, endTime - startTime)
+  const maxRate = Math.max(1, ...data.flatMap(sample => [sample.tx, sample.rx])) * 1.12
+  const x = time => (time.getTime() - startTime) / span * width
+  const y = rate => height - rate / maxRate * height
+  const pathFor = key => data.map((sample, index) => `${index ? 'L' : 'M'}${x(sample.time).toFixed(2)},${y(sample[key]).toFixed(2)}`).join(' ')
 
   container.replaceChildren()
   const svg = createSVG('svg', {
-    width: outerWidth,
-    height: outerHeight,
     viewBox: `0 0 ${outerWidth} ${outerHeight}`,
-    role: 'img',
-    'aria-label': 'Transmit and receive throughput history'
+    width: '100%', height: outerHeight,
+    role: 'img', 'aria-label': 'Aggregate transmit and receive throughput captured with this report'
   })
+  const defs = createSVG('defs')
+  const txGradient = createSVG('linearGradient', { id: 'reportTxGradient', x1: '0', y1: '0', x2: '0', y2: '1' })
+  txGradient.appendChild(createSVG('stop', { offset: '0%', 'stop-color': 'var(--cyan)', 'stop-opacity': '.24' }))
+  txGradient.appendChild(createSVG('stop', { offset: '100%', 'stop-color': 'var(--cyan)', 'stop-opacity': '0' }))
+  defs.appendChild(txGradient)
+  svg.appendChild(defs)
   const plot = createSVG('g', { transform: `translate(${margin.left},${margin.top})` })
   svg.appendChild(plot)
-  container.appendChild(svg)
 
-  const axis = createSVG('g', { class: 'chart-axis' })
-  axis.appendChild(createSVG('line', { x1: 0, y1: height, x2: width, y2: height }))
-  axis.appendChild(createSVG('line', { x1: 0, y1: 0, x2: 0, y2: height }))
-
-  const xTicks = Math.min(6, data.length)
-  for (let index = 0; index < xTicks; index += 1) {
-    const fraction = xTicks === 1 ? 0 : index / (xTicks - 1)
-    const tickX = fraction * width
-    const tickTime = new Date(startTime + fraction * timeSpan)
-    axis.appendChild(createSVG('line', { x1: tickX, y1: height, x2: tickX, y2: height + 5 }))
-    axis.appendChild(createSVG('text', {
-      x: tickX,
-      y: height + 18,
-      'text-anchor': index === 0 ? 'start' : index === xTicks - 1 ? 'end' : 'middle'
-    }, tickTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })))
-  }
-
-  const yTicks = 5
-  for (let index = 0; index <= yTicks; index += 1) {
-    const fraction = index / yTicks
+  for (let index = 0; index <= 4; index++) {
+    const fraction = index / 4
     const tickY = height - fraction * height
     const rate = fraction * maxRate
-    axis.appendChild(createSVG('line', { x1: -5, y1: tickY, x2: 0, y2: tickY }))
-    axis.appendChild(createSVG('text', {
-      x: -9,
-      y: tickY + 4,
-      'text-anchor': 'end'
-    }, formatRateShort(rate)))
+    plot.appendChild(createSVG('line', { class: 'report-chart-grid', x1: 0, y1: tickY, x2: width, y2: tickY }))
+    plot.appendChild(createSVG('text', { class: 'report-chart-label', x: -12, y: tickY + 4, 'text-anchor': 'end' }, formatRateShort(rate)))
   }
-  plot.appendChild(axis)
 
-  const linePath = key => data
-    .map((sample, index) => `${index === 0 ? 'M' : 'L'}${x(sample.time).toFixed(2)},${y(sample[key]).toFixed(2)}`)
-    .join(' ')
-
-  plot.appendChild(createSVG('path', {
-    d: linePath('tx'),
-    fill: 'none',
-    stroke: 'var(--cyan)',
-    'stroke-width': 2,
-    'vector-effect': 'non-scaling-stroke'
-  }))
-  plot.appendChild(createSVG('path', {
-    d: linePath('rx'),
-    fill: 'none',
-    stroke: 'var(--green)',
-    'stroke-width': 2,
-    'vector-effect': 'non-scaling-stroke'
-  }))
-
-  const legend = createSVG('g', { transform: `translate(${Math.max(width - 60, 0)},0)` })
-  const addLegendEntry = (offset, label, stroke) => {
-    legend.appendChild(createSVG('line', { x1: 0, x2: 20, y1: offset, y2: offset, stroke, 'stroke-width': 2 }))
-    legend.appendChild(createSVG('text', { x: 25, y: offset + 4, fill: 'var(--text-2)', 'font-size': 12 }, label))
+  const tickCount = Math.min(6, data.length)
+  for (let index = 0; index < tickCount; index++) {
+    const fraction = tickCount === 1 ? 0 : index / (tickCount - 1)
+    const tickX = fraction * width
+    const time = new Date(startTime + fraction * span)
+    plot.appendChild(createSVG('text', {
+      class: 'report-chart-label', x: tickX, y: height + 28,
+      'text-anchor': index === 0 ? 'start' : index === tickCount - 1 ? 'end' : 'middle'
+    }, time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })))
   }
-  addLegendEntry(0, 'TX', 'var(--cyan)')
-  addLegendEntry(15, 'RX', 'var(--green)')
+
+  const txPath = pathFor('tx')
+  plot.appendChild(createSVG('path', { d: `${txPath} L${width},${height} L0,${height} Z`, fill: 'url(#reportTxGradient)' }))
+  plot.appendChild(createSVG('path', { d: txPath, class: 'report-chart-line report-chart-line-tx', fill: 'none', 'vector-effect': 'non-scaling-stroke' }))
+  plot.appendChild(createSVG('path', { d: pathFor('rx'), class: 'report-chart-line report-chart-line-rx', fill: 'none', 'vector-effect': 'non-scaling-stroke' }))
+
+  const last = data[data.length - 1]
+  const legend = createSVG('g', { class: 'report-chart-legend', transform: 'translate(12,12)' })
+  const legendItems = [
+    ['TX', last.tx, 'report-chart-swatch-tx'],
+    ['RX', last.rx, 'report-chart-swatch-rx']
+  ]
+  legendItems.forEach(([label, value, className], index) => {
+    const group = createSVG('g', { transform: `translate(${index * 142},0)` })
+    group.appendChild(createSVG('circle', { class: className, cx: 0, cy: 0, r: 4 }))
+    group.appendChild(createSVG('text', { class: 'report-chart-legend-text', x: 10, y: 4 }, `${label} ${formatRateShort(value)}`))
+    legend.appendChild(group)
+  })
   plot.appendChild(legend)
+  container.appendChild(svg)
 }
 
 function formatRateShort(bps) {
-  if (!bps) return '0'
-  if (bps >= 1e9) return (bps / 1e9).toFixed(1) + 'G'
-  if (bps >= 1e6) return (bps / 1e6).toFixed(0) + 'M'
-  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + 'K'
-  return bps + ''
+  const value = reportSafeNumber(bps)
+  if (value >= 1e9) return `${(value / 1e9).toFixed(value >= 10e9 ? 0 : 1)}G`
+  if (value >= 1e6) return `${(value / 1e6).toFixed(value >= 10e6 ? 0 : 1)}M`
+  if (value >= 1e3) return `${(value / 1e3).toFixed(value >= 10e3 ? 0 : 1)}K`
+  return `${Math.round(value)}`
 }
 
 function formatHealthReport(data) {
-  // Data structure: { summary, link_quality, system_health, stability, firmware_distribution, top_offenders, generated_at }
-  const summary = data.summary || data
-  const online = summary.online || 0
-  const offline = summary.offline || 0
-  const total = summary.total || (online + offline)
-  const uptime = summary.uptime || (total > 0 ? (online / total * 100) : 0)
-  const apCount = summary.ap_count || 0
-  const staCount = summary.sta_count || 0
-  const apOnline = summary.ap_online || 0
-  const staOnline = summary.sta_online || 0
-  
+  const summary = data.summary || data || {}
+  const coverage = data.coverage || {}
   const linkQuality = data.link_quality || {}
-  const goodSignal = linkQuality.good || 0
-  const fairSignal = linkQuality.fair || 0
-  const poorSignal = linkQuality.poor || 0
-  const totalSignal = goodSignal + fairSignal + poorSignal
-  const poorPct = totalSignal > 0 ? Math.round(poorSignal / totalSignal * 100) : 0
-  
-  const systemHealth = data.system_health || {}
-  const highCPU = systemHealth.high_cpu || 0
-  const highMem = systemHealth.high_mem || 0
-  const highTemp = systemHealth.high_temp || 0
-  
+  const system = data.system_health || {}
   const stability = data.stability || {}
-  const flaps1h = stability.flaps_1h || 0
-  const flaps24h = stability.flaps_24h || 0
-  const reboots1h = stability.reboots_1h || 0
-  const reboots24h = stability.reboots_24h || 0
-  
-  const topOffenders = data.top_offenders || {}
-  const offlineDevices = topOffenders.offline || []
-  const poorSignalDevices = topOffenders.poor_signal || []
-  const highCPUDevices = topOffenders.high_cpu || []
-  const flappingDevices = topOffenders.flapping || []
-  const rebootingDevices = topOffenders.rebooting || []
-  
-  const fwDist = data.firmware_distribution || {}
-  const fwVersions = Object.entries(fwDist).sort((a, b) => b[1] - a[1]).slice(0, 5)
-  
-  // Report header strip
-  const headerHtml = `
-    <div class="report-header-strip">
-      <div class="report-scope">
-        <strong>Scope:</strong> All Devices
-        <span class="report-breakdown">APs: ${apCount} | STAs: ${staCount}</span>
-      </div>
-      <div class="report-coverage">
-        <strong>Data Coverage:</strong> ${online}/${total} devices online (${uptime.toFixed(1)}%)
-      </div>
-      <div class="report-time">
-        <strong>Generated:</strong> ${data.generated_at ? new Date(data.generated_at).toLocaleString() : 'Unknown'}
-      </div>
+  const offenders = data.top_offenders || {}
+  const total = reportSafeNumber(summary.total, reportSafeNumber(summary.online) + reportSafeNumber(summary.offline) + reportSafeNumber(summary.unknown))
+  const online = reportSafeNumber(summary.online)
+  const offline = reportSafeNumber(summary.offline)
+  const unknown = reportSafeNumber(summary.unknown)
+  const uptime = reportSafeNumber(summary.uptime, total ? online / total * 100 : 0)
+  const apCount = reportSafeNumber(summary.ap_count)
+  const staCount = reportSafeNumber(summary.sta_count)
+  const exceptionCount = offline + unknown + reportSafeNumber(linkQuality.poor) + reportSafeNumber(system.high_cpu) + reportSafeNumber(stability.flaps_1h) + reportSafeNumber(stability.reboots_1h)
+
+  const metrics = `
+    <div class="report-metric-grid">
+      ${reportMetricCard('Fleet availability', reportPercent(uptime), `${reportInteger(online)} online · ${reportInteger(offline)} offline · ${reportInteger(unknown)} unknown`, uptime >= 99 ? 'good' : offline > 0 ? 'bad' : 'warning')}
+      ${reportMetricCard('Inventory scope', reportInteger(total), `${reportInteger(apCount)} APs · ${reportInteger(staCount)} STAs`, 'neutral')}
+      ${reportMetricCard('Metric coverage', reportPercent(coverage.coverage_pct), `${reportInteger(coverage.metrics_devices)} measured · ${reportInteger(coverage.missing_metrics)} missing`, reportSafeNumber(coverage.coverage_pct) >= 95 ? 'good' : 'warning')}
+      ${reportMetricCard('Attention queue', reportInteger(exceptionCount), 'Availability, RF, CPU, flap, and reboot exceptions', exceptionCount > 0 ? 'warning' : 'good')}
     </div>
   `
-  
-  // 6 Scorecards (added Stability)
-  const scorecardsHtml = `
-    <div class="report-scorecards">
-      <div class="report-scorecard">
-        <h5>Availability</h5>
-        <div class="scorecard-stats">
-          <div class="scorecard-stat">
-            <span class="stat-value online">${online}</span>
-            <span class="stat-label">Online</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value ${offline > 0 ? 'offline' : ''}">${offline}</span>
-            <span class="stat-label">Offline</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value">${uptime.toFixed(1)}%</span>
-            <span class="stat-label">Uptime</span>
-          </div>
+
+  const healthDetails = `
+    <div class="report-detail-grid">
+      <div class="report-detail-panel">
+        <span class="report-detail-label">System pressure</span>
+        <div class="report-detail-stats">
+          <span><strong class="${reportSafeNumber(system.high_cpu) ? 'report-count-bad' : ''}">${reportInteger(system.high_cpu)}</strong> high CPU</span>
+          <span><strong class="${reportSafeNumber(system.high_mem) ? 'report-count-bad' : ''}">${reportInteger(system.high_mem)}</strong> high memory</span>
+          <span><strong class="${reportSafeNumber(system.high_temp) ? 'report-count-bad' : ''}">${reportInteger(system.high_temp)}</strong> high temperature</span>
         </div>
       </div>
-      
-      <div class="report-scorecard">
-        <h5>Link Quality (STAs)</h5>
-        <div class="scorecard-stats">
-          <div class="scorecard-stat">
-            <span class="stat-value good">${goodSignal}</span>
-            <span class="stat-label">Good</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value fair">${fairSignal}</span>
-            <span class="stat-label">Fair</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value ${poorSignal > 0 ? 'poor' : ''}">${poorSignal}</span>
-            <span class="stat-label">Poor</span>
-          </div>
-        </div>
-        ${totalSignal > 0 ? `<div class="scorecard-footer">${poorPct}% of STAs have poor signal</div>` : ''}
-      </div>
-      
-      <div class="report-scorecard">
-        <h5>Stability</h5>
-        <div class="scorecard-stats">
-          <div class="scorecard-stat">
-            <span class="stat-value ${flaps1h > 0 ? 'warning' : ''}">${flaps1h}</span>
-            <span class="stat-label">Flaps (1h)</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value">${flaps24h}</span>
-            <span class="stat-label">Flaps (24h)</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value ${reboots1h > 0 ? 'warning' : ''}">${reboots1h}</span>
-            <span class="stat-label">Reboots (1h)</span>
-          </div>
-        </div>
-      </div>
-      
-      <div class="report-scorecard">
-        <h5>System Health</h5>
-        <div class="scorecard-stats">
-          <div class="scorecard-stat">
-            <span class="stat-value ${highCPU > 0 ? 'warning' : ''}">${highCPU}</span>
-            <span class="stat-label">High CPU</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value ${highMem > 0 ? 'warning' : ''}">${highMem}</span>
-            <span class="stat-label">High Memory</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value ${highTemp > 0 ? 'warning' : ''}">${highTemp}</span>
-            <span class="stat-label">High Temp</span>
-          </div>
-        </div>
-      </div>
-      
-      <div class="report-scorecard">
-        <h5>AP/STA Breakdown</h5>
-        <div class="scorecard-stats">
-          <div class="scorecard-stat">
-            <span class="stat-value">${apOnline}/${apCount}</span>
-            <span class="stat-label">APs Online</span>
-          </div>
-          <div class="scorecard-stat">
-            <span class="stat-value">${staOnline}/${staCount}</span>
-            <span class="stat-label">STAs Online</span>
-          </div>
-        </div>
-      </div>
-      
-      <div class="report-scorecard">
-        <h5>Firmware Versions</h5>
-        <div class="scorecard-list">
-          ${fwVersions.length > 0 ? fwVersions.map(([fw, count]) => `
-            <div class="scorecard-list-item">
-              <span>${escapeHTML(fw || 'Unknown')}</span>
-              <span>${count}</span>
-            </div>
-          `).join('') : '<span class="text-muted">No data</span>'}
+      <div class="report-detail-panel">
+        <span class="report-detail-label">Stability</span>
+        <div class="report-detail-stats">
+          <span><strong>${reportInteger(stability.flaps_1h)}</strong> flaps / 1h</span>
+          <span><strong>${reportInteger(stability.flaps_24h)}</strong> flaps / 24h</span>
+          <span><strong>${reportInteger(stability.reboots_1h)}</strong> reboots / 1h</span>
+          <span><strong>${reportInteger(stability.reboots_24h)}</strong> reboots / 24h</span>
         </div>
       </div>
     </div>
   `
-  
-  // Top Offenders tables
-  let offendersHtml = '<div class="report-offenders">'
-  
-  if (offlineDevices.length > 0) {
-    offendersHtml += `
-      <div class="report-offender-section">
-        <h5>Offline Devices (${offlineDevices.length})</h5>
-        <table class="report-table report-table-sm">
-          <thead><tr><th>Device</th><th>Site</th><th>Last Seen</th></tr></thead>
-          <tbody>
-            ${offlineDevices.slice(0, 10).map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.site || '-')}</td>
-                <td>${d.last_seen ? new Date(d.last_seen).toLocaleString() : '-'}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+
+  const offlineRows = Array.isArray(offenders.offline) ? offenders.offline : []
+  const poorRows = Array.isArray(offenders.poor_signal) ? offenders.poor_signal : []
+  const cpuRows = Array.isArray(offenders.high_cpu) ? offenders.high_cpu : []
+  const flapRows = Array.isArray(offenders.flapping) ? offenders.flapping : []
+  const rebootRows = Array.isArray(offenders.rebooting) ? offenders.rebooting : []
+
+  const offlineTable = offlineRows.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">Device</th><th data-sort-type="ip">IP</th><th data-sort-type="text">Site</th><th data-sort-type="text">Status</th><th data-sort-type="date">Last seen</th></tr></thead>
+    <tbody>${offlineRows.map(item => `<tr><td><strong>${escapeHTML(item.hostname || item.ip || 'Unknown')}</strong>${item.is_sta ? '<small class="report-row-subtitle">STA</small>' : '<small class="report-row-subtitle">AP</small>'}</td><td data-sort-value="${escapeAttr(item.ip || '')}">${escapeHTML(item.ip || '—')}</td><td>${escapeHTML(item.site || 'Unassigned')}</td><td>${reportStatusPill(item.status)}</td><td data-sort-value="${escapeAttr(item.last_seen || '')}">${escapeHTML(reportLastSeen(item.last_seen))}</td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('No unavailable devices', 'Every inventory device was online when this report was captured.', 'health')
+
+  const signalTable = poorRows.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">STA</th><th data-sort-type="ip">IP</th><th data-sort-type="text">Parent AP</th><th data-sort-type="text">Site</th><th data-sort-type="number">Signal</th><th data-sort-type="text">Band</th></tr></thead>
+    <tbody>${poorRows.map(item => `<tr><td><strong>${escapeHTML(item.hostname || item.ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(item.ip || '')}">${escapeHTML(item.ip || '—')}</td><td>${escapeHTML(item.parent_hostname || '—')}</td><td>${escapeHTML(item.site || 'Unassigned')}</td><td data-sort-value="${reportSafeNumber(item.signal)}">${reportQualityPill('poor', item.signal, item.band)}</td><td>${escapeHTML(item.band || '—')}</td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('No poor-signal STAs', 'No measured subscriber radio crossed the poor-signal threshold.', 'performance')
+
+  const cpuTable = cpuRows.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">Device</th><th data-sort-type="ip">IP</th><th data-sort-type="text">Site</th><th data-sort-type="number">CPU</th></tr></thead>
+    <tbody>${cpuRows.map(item => `<tr><td><strong>${escapeHTML(item.hostname || item.ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(item.ip || '')}">${escapeHTML(item.ip || '—')}</td><td>${escapeHTML(item.site || 'Unassigned')}</td><td data-sort-value="${reportSafeNumber(item.cpu)}"><span class="report-value-bad">${reportInteger(item.cpu)}%</span></td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('No high-CPU devices', 'No measured device exceeded the high-CPU threshold.', 'health')
+
+  const stabilityRows = new Map()
+  flapRows.forEach(item => stabilityRows.set(item.ip || item.hostname, { ...item }))
+  rebootRows.forEach(item => {
+    const key = item.ip || item.hostname
+    stabilityRows.set(key, { ...(stabilityRows.get(key) || {}), ...item })
+  })
+  const stabilityList = Array.from(stabilityRows.values())
+  const stabilityTable = stabilityList.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">Device</th><th data-sort-type="ip">IP</th><th data-sort-type="text">Site</th><th data-sort-type="number">Flaps 1h</th><th data-sort-type="number">Flaps 24h</th><th data-sort-type="number">Reboots 1h</th><th data-sort-type="number">Reboots 24h</th></tr></thead>
+    <tbody>${stabilityList.map(item => `<tr><td><strong>${escapeHTML(item.hostname || item.ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(item.ip || '')}">${escapeHTML(item.ip || '—')}</td><td>${escapeHTML(item.site || 'Unassigned')}</td><td data-sort-value="${reportSafeNumber(item.flaps_1h)}">${reportInteger(item.flaps_1h)}</td><td data-sort-value="${reportSafeNumber(item.flaps_24h)}">${reportInteger(item.flaps_24h)}</td><td data-sort-value="${reportSafeNumber(item.reboots_1h)}">${reportInteger(item.reboots_1h)}</td><td data-sort-value="${reportSafeNumber(item.reboots_24h)}">${reportInteger(item.reboots_24h)}</td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('No stability events', 'No flaps or reboots were recorded in the one-hour or 24-hour windows.', 'health')
+
+  const exceptions = `
+    <div class="report-tabset">
+      <div class="report-tabs" role="tablist">
+        <button type="button" class="report-tab active" data-report-tab="health-offline" aria-selected="true">Unavailable <span>${offlineRows.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="health-signal" aria-selected="false">Poor signal <span>${poorRows.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="health-cpu" aria-selected="false">High CPU <span>${cpuRows.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="health-stability" aria-selected="false">Stability <span>${stabilityList.length}</span></button>
       </div>
-    `
+      <div data-report-panel="health-offline">${offlineTable}</div>
+      <div class="hidden" data-report-panel="health-signal">${signalTable}</div>
+      <div class="hidden" data-report-panel="health-cpu">${cpuTable}</div>
+      <div class="hidden" data-report-panel="health-stability">${stabilityTable}</div>
+    </div>
+  `
+
+  return `
+    ${reportMetaStrip(data)}
+    ${metrics}
+    <div class="report-two-column">
+      ${reportSection('Subscriber signal quality', 'Measured STAs grouped using band-aware thresholds.', reportSignalDistribution(linkQuality))}
+      ${reportSection('Health detail', 'Current pressure and stability counters captured with the snapshot.', healthDetails)}
+    </div>
+    ${reportSection('Sites', 'Inventory status, metric coverage, and operational exceptions by site.', reportSiteSummaryTable(data.site_summary, { metrics: true, rf: true }))}
+    <div class="report-two-column report-two-column-uneven">
+      ${reportSection('Ranked exceptions', 'Worst conditions first so the report is immediately actionable.', exceptions, 'report-section-wide')}
+      ${reportSection('Firmware concentration', 'Most common firmware versions in the inventory snapshot.', reportDistribution(data.firmware_distribution, value => value, 12))}
+    </div>
+  `
+}
+
+function reportPlatformLabel(value) {
+  const labels = {
+    wave60: 'Wave 60 GHz', wavemlo: 'Wave MLO', wave: 'Wave', ltu: 'LTU / AF5XHD',
+    airmaxac: 'airMAX AC', airmaxm: 'airMAX M', airmax: 'airMAX', af11: 'airFiber 11',
+    af24: 'airFiber 24', af2x: 'airFiber 2/3', af5x: 'airFiber 5', other: 'Other'
   }
-  
-  if (flappingDevices.length > 0) {
-    offendersHtml += `
-      <div class="report-offender-section">
-        <h5>Flapping Devices (${flappingDevices.length})</h5>
-        <table class="report-table report-table-sm">
-          <thead><tr><th>Device</th><th>Flaps (1h)</th><th>Flaps (24h)</th></tr></thead>
-          <tbody>
-            ${flappingDevices.slice(0, 10).map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td class="text-warning">${d.flaps_1h}</td>
-                <td>${d.flaps_24h}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    `
-  }
-  
-  if (rebootingDevices.length > 0) {
-    offendersHtml += `
-      <div class="report-offender-section">
-        <h5>Rebooting Devices (${rebootingDevices.length})</h5>
-        <table class="report-table report-table-sm">
-          <thead><tr><th>Device</th><th>Reboots (1h)</th><th>Reboots (24h)</th></tr></thead>
-          <tbody>
-            ${rebootingDevices.slice(0, 10).map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td class="text-warning">${d.reboots_1h}</td>
-                <td>${d.reboots_24h}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    `
-  }
-  
-  if (poorSignalDevices.length > 0) {
-    offendersHtml += `
-      <div class="report-offender-section">
-        <h5>Worst Signal STAs (${poorSignalDevices.length})</h5>
-        <table class="report-table report-table-sm">
-          <thead><tr><th>Device</th><th>Site</th><th>Signal</th></tr></thead>
-          <tbody>
-            ${poorSignalDevices.slice(0, 10).map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.site || '-')}</td>
-                <td class="text-danger">${d.signal} dBm</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    `
-  }
-  
-  if (highCPUDevices.length > 0) {
-    offendersHtml += `
-      <div class="report-offender-section">
-        <h5>High CPU Devices (${highCPUDevices.length})</h5>
-        <table class="report-table report-table-sm">
-          <thead><tr><th>Device</th><th>Site</th><th>CPU</th></tr></thead>
-          <tbody>
-            ${highCPUDevices.slice(0, 10).map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.site || '-')}</td>
-                <td class="text-warning">${d.cpu}%</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    `
-  }
-  
-  offendersHtml += '</div>'
-  
-  return headerHtml + scorecardsHtml + offendersHtml
+  return labels[value] || formatMetricName(value || 'other')
 }
 
 function formatInventoryReport(data) {
-  if (!data.devices) return '<p>No device data</p>'
-  return `
-    <table class="report-table">
-      <thead>
-        <tr>
-          <th>Device</th>
-          <th>IP</th>
-          <th>MAC</th>
-          <th>Model</th>
-          <th>Flavor</th>
-          <th>Firmware</th>
-          <th>Type</th>
-          <th>Parent</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${data.devices.map(d => `
-          <tr>
-            <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-            <td>${escapeHTML(d.ip || '-')}</td>
-            <td>${escapeHTML(d.mac || '-')}</td>
-            <td>${escapeHTML(d.product || '-')}</td>
-            <td>${escapeHTML(d.flavor || '-')}</td>
-            <td>${escapeHTML(d.firmware || '-')}</td>
-            <td>${d.is_sta ? 'STA' : 'AP'}</td>
-            <td>${escapeHTML(d.parent_hostname || d.parent_ip || '-')}</td>
-            <td><span class="status-dot ${d.status === 'online' ? 'online' : 'offline'}"></span> ${escapeHTML(d.status || '-')}</td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>
+  const devices = Array.isArray(data.devices) ? data.devices : []
+  const summary = data.summary || {}
+  const total = reportSafeNumber(summary.total, devices.length)
+  const status = data.status_distribution || {
+    online: summary.online || 0, offline: summary.offline || 0, unknown: summary.unknown || 0
+  }
+
+  const metrics = `
+    <div class="report-metric-grid">
+      ${reportMetricCard('Inventory devices', reportInteger(total), `${reportInteger(summary.ap_count)} APs · ${reportInteger(summary.sta_count)} STAs`, 'neutral')}
+      ${reportMetricCard('Online now', reportInteger(status.online), `${reportInteger(status.offline)} offline · ${reportInteger(status.unknown)} unknown`, reportSafeNumber(status.offline) > 0 ? 'warning' : 'good')}
+      ${reportMetricCard('Physical scope', reportInteger(summary.site_count), `${reportInteger(summary.region_count)} regions · ${reportInteger(summary.unassigned_site)} unassigned`, reportSafeNumber(summary.unassigned_site) > 0 ? 'warning' : 'neutral')}
+      ${reportMetricCard('Software diversity', reportInteger(summary.firmware_versions), `${reportInteger(summary.platform_families)} platform families`, 'neutral')}
+    </div>
   `
+
+  const deviceTable = devices.length ? `
+    <div class="report-table-toolbar">
+      <label class="report-search-field report-search-field-compact">${reportIcon('search')}<span class="sr-only">Filter inventory rows</span><input type="search" placeholder="Filter devices, IP, firmware, site…" data-report-filter-target="reportInventoryTable"></label>
+      <span data-report-filter-count="reportInventoryTable"></span>
+    </div>
+    ${reportTableWrap(`
+      <table class="report-table report-sortable report-table-dense" id="reportInventoryTable">
+        <thead><tr>
+          <th data-sort-type="text">Status</th><th data-sort-type="text">Device</th><th data-sort-type="ip">IP</th><th data-sort-type="text">MAC</th><th data-sort-type="text">Role</th><th data-sort-type="text">Product</th><th data-sort-type="text">Platform</th><th data-sort-type="text">Firmware</th><th data-sort-type="text">Region</th><th data-sort-type="text">Site</th><th data-sort-type="text">Parent AP</th><th data-sort-type="date">Last seen</th>
+        </tr></thead>
+        <tbody>${devices.map(device => `
+          <tr>
+            <td data-sort-value="${escapeAttr(device.status || 'unknown')}">${reportStatusPill(device.status)}</td>
+            <td><strong>${escapeHTML(device.hostname || device.ip || device.mac || 'Unknown')}</strong><small class="report-row-subtitle">${escapeHTML(device.flavor || '')}</small></td>
+            <td data-sort-value="${escapeAttr(device.ip || '')}">${escapeHTML(device.ip || '—')}</td>
+            <td class="report-mono">${escapeHTML(device.mac || '—')}</td>
+            <td><span class="report-role-pill">${device.is_sta ? 'STA' : 'AP'}</span></td>
+            <td>${escapeHTML(device.product || '—')}</td>
+            <td>${escapeHTML(reportPlatformLabel(device.platform_family || device.platform))}</td>
+            <td>${escapeHTML(device.firmware || 'Unknown')}</td>
+            <td>${escapeHTML(device.region || '—')}</td>
+            <td>${escapeHTML(device.site || 'Unassigned')}</td>
+            <td>${escapeHTML(device.parent_hostname || device.parent_ip || '—')}</td>
+            <td data-sort-value="${escapeAttr(device.last_seen || '')}">${escapeHTML(reportLastSeen(device.last_seen))}</td>
+          </tr>
+        `).join('')}</tbody>
+      </table>
+    `, 'report-table-wrap-tall')}
+  ` : reportEmptyState('No inventory devices', 'The inventory was empty when this report was generated.', 'inventory')
+
+  return `
+    ${reportMetaStrip(data)}
+    ${metrics}
+    <div class="report-two-column">
+      ${reportSection('Platform families', 'Hardware and API families represented in this snapshot.', reportDistribution(data.platform_distribution, reportPlatformLabel, 12))}
+      ${reportSection('Firmware versions', 'Version concentration across APs and STAs.', reportDistribution(data.firmware_distribution, value => value, 14))}
+    </div>
+    ${reportSection('Site allocation', 'Authoritative inventory and status distribution by assigned site.', reportSiteSummaryTable(data.site_summary, { metrics: false }))}
+    ${reportSection('Complete device inventory', 'Search and sort every AP and STA captured in the report.', deviceTable, 'report-section-inventory')}
+  `
+}
+
+function performanceSignalQuality(device) {
+  if (device?.signal_quality) return device.signal_quality
+  const band = String(device?.band || '').includes('60') ? '60ghz' : '5ghz'
+  return getSignalQuality(reportSafeNumber(device?.signal), band) || 'no_signal'
+}
+
+function performanceDeviceTable(devices, role) {
+  if (!devices.length) return reportEmptyState(`No ${role} metrics`, `No ${role} metric rows were captured in this report.`, 'performance')
+  const isSTA = role === 'STA'
+  return reportTableWrap(`
+    <table class="report-table report-sortable report-table-dense">
+      <thead><tr>
+        <th data-sort-type="text">${role}</th>
+        <th data-sort-type="ip">IP</th>
+        ${isSTA ? '<th data-sort-type="text">Parent AP</th>' : '<th data-sort-type="number">Clients</th>'}
+        <th data-sort-type="text">Site</th>
+        <th data-sort-type="text">Platform</th>
+        <th data-sort-type="text">Band</th>
+        ${isSTA ? '<th data-sort-type="number">Signal</th>' : '<th data-sort-type="number">Poor clients</th>'}
+        <th data-sort-type="number">TX</th>
+        <th data-sort-type="number">RX</th>
+        <th data-sort-type="number">Capacity</th>
+        <th data-sort-type="number">CPU</th>
+      </tr></thead>
+      <tbody>${devices.map(device => {
+        const quality = performanceSignalQuality(device)
+        return `
+          <tr>
+            <td><strong>${escapeHTML(device.hostname || device.ip || 'Unknown')}</strong><small class="report-row-subtitle">${escapeHTML(device.product || device.flavor || '')}</small></td>
+            <td data-sort-value="${escapeAttr(device.ip || '')}">${escapeHTML(device.ip || '—')}</td>
+            ${isSTA ? `<td>${escapeHTML(device.parent_hostname || '—')}</td>` : `<td data-sort-value="${reportSafeNumber(device.client_count)}">${reportInteger(device.client_count)}</td>`}
+            <td>${escapeHTML(device.site || 'Unassigned')}</td>
+            <td>${escapeHTML(reportPlatformLabel(device.platform))}</td>
+            <td>${escapeHTML(device.band || '—')}</td>
+            ${isSTA ? `<td data-sort-value="${reportSafeNumber(device.signal)}">${reportQualityPill(quality, device.signal, device.band)}</td>` : `<td data-sort-value="${reportSafeNumber(device.poor_pct)}"><span class="${reportSafeNumber(device.poor_pct) >= 20 ? 'report-value-bad' : ''}">${reportInteger(device.poor_clients)} / ${reportInteger(device.measured_clients)} · ${reportPercent(device.poor_pct)}</span></td>`}
+            <td data-sort-value="${reportSafeNumber(device.tx_rate)}">${escapeHTML(formatRate(device.tx_rate))}</td>
+            <td data-sort-value="${reportSafeNumber(device.rx_rate)}">${escapeHTML(formatRate(device.rx_rate))}</td>
+            <td data-sort-value="${reportSafeNumber(device.capacity)}">${escapeHTML(formatRate(device.capacity))}</td>
+            <td data-sort-value="${reportSafeNumber(device.cpu)}">${reportInteger(device.cpu)}%</td>
+          </tr>
+        `
+      }).join('')}</tbody>
+    </table>
+  `, 'report-table-wrap-tall')
 }
 
 function formatPerformanceReport(data) {
-  const summary = data.summary || data
-  const txRate = summary.total_tx_rate || 0
-  const rxRate = summary.total_rx_rate || 0
-  const apTx = summary.ap_tx_rate || 0
-  const apRx = summary.ap_rx_rate || 0
-  const staTx = summary.sta_tx_rate || 0
-  const staRx = summary.sta_rx_rate || 0
-  const avgSignal = summary.avg_signal || 0
-  const deviceCount = summary.device_count || 0
-  const apCount = summary.ap_count || 0
-  const staCount = summary.sta_count || 0
-  
-  const signalQuality = data.signal_quality || {}
-  const goodSignal = signalQuality.good || 0
-  const fairSignal = signalQuality.fair || 0
-  const poorSignal = signalQuality.poor || 0
-  const totalSignal = goodSignal + fairSignal + poorSignal
-  const poorPct = totalSignal > 0 ? Math.round(poorSignal / totalSignal * 100) : 0
-  
-  // Get device lists - support both old and new format
-  const apDevices = data.ap_devices || []
-  const staDevices = data.sta_devices || []
-  const capacityRisk = data.capacity_risk || []
-  const oldDevices = data.devices || []
-  
-  // Report header strip
-  const headerHtml = `
-    <div class="report-header-strip">
-      <div class="report-scope">
-        <strong>Scope:</strong> All Devices
-        <span class="report-breakdown">APs: ${apCount} | STAs: ${staCount}</span>
-      </div>
-      <div class="report-coverage">
-        <strong>Data Coverage:</strong> ${deviceCount} devices with metrics
-      </div>
-      <div class="report-time">
-        <strong>Generated:</strong> ${data.generated_at ? new Date(data.generated_at).toLocaleString() : 'Unknown'}
-      </div>
+  const summary = data.summary || {}
+  const coverage = data.coverage || {}
+  const signal = data.signal_quality || data.link_quality || {}
+  const apDevices = Array.isArray(data.ap_devices) ? data.ap_devices : []
+  const staDevices = Array.isArray(data.sta_devices) ? data.sta_devices : []
+  const legacyDevices = Array.isArray(data.devices) ? data.devices : []
+  if (apDevices.length === 0 && staDevices.length === 0 && legacyDevices.length) {
+    legacyDevices.forEach(device => (device.is_sta ? staDevices : apDevices).push(device))
+  }
+  const missing = Array.isArray(data.missing_devices) ? data.missing_devices : []
+  const capacityRisk = Array.isArray(data.capacity_risk) ? data.capacity_risk : []
+  const topAPs = [...apDevices].sort((a, b) => (reportSafeNumber(b.tx_rate) + reportSafeNumber(b.rx_rate)) - (reportSafeNumber(a.tx_rate) + reportSafeNumber(a.rx_rate)))
+  const topSTAs = [...staDevices].sort((a, b) => (reportSafeNumber(b.tx_rate) + reportSafeNumber(b.rx_rate)) - (reportSafeNumber(a.tx_rate) + reportSafeNumber(a.rx_rate)))
+  const weakSTAs = [...staDevices].filter(device => reportSafeNumber(device.signal) < 0).sort((a, b) => reportSafeNumber(a.signal) - reportSafeNumber(b.signal))
+
+  const metrics = `
+    <div class="report-metric-grid">
+      ${reportMetricCard('Aggregate TX', formatRate(summary.total_tx_rate), `${formatRate(summary.ap_tx_rate)} AP · ${formatRate(summary.sta_tx_rate)} STA`, 'performance')}
+      ${reportMetricCard('Aggregate RX', formatRate(summary.total_rx_rate), `${formatRate(summary.ap_rx_rate)} AP · ${formatRate(summary.sta_rx_rate)} STA`, 'performance')}
+      ${reportMetricCard('Metric coverage', reportPercent(coverage.coverage_pct), `${reportInteger(coverage.metrics_devices)} measured · ${reportInteger(coverage.missing_metrics)} missing`, reportSafeNumber(coverage.coverage_pct) >= 95 ? 'good' : 'warning')}
+      ${reportMetricCard('Average STA signal', reportSafeNumber(summary.avg_signal) < 0 ? `${reportSafeNumber(summary.avg_signal).toFixed(0)} dBm` : 'No sample', `${reportInteger(coverage.signal_samples)} signal samples`, reportSafeNumber(signal.poor) > 0 ? 'warning' : 'good')}
     </div>
   `
-  
-  // No network-wide summary - stats are per-platform only since Wave reports throughput while LTU/airMAX report capacity
-  const summaryHtml = ''
-  
-  // Signal quality bar (still makes sense network-wide)
-  let signalBarHtml = ''
-  if (totalSignal > 0) {
-    signalBarHtml = `
-      <div class="report-signal-bar">
-        <div class="signal-bar-label">STA Signal Distribution:</div>
-        <div class="signal-bar">
-          <div class="signal-seg good" style="width:${(goodSignal/totalSignal)*100}%" title="${goodSignal} good"></div>
-          <div class="signal-seg fair" style="width:${(fairSignal/totalSignal)*100}%" title="${fairSignal} fair"></div>
-          <div class="signal-seg poor" style="width:${(poorSignal/totalSignal)*100}%" title="${poorSignal} poor"></div>
-        </div>
-        <div class="signal-bar-legend">
-          <span class="legend-item"><span class="legend-dot good"></span> Good: ${goodSignal}</span>
-          <span class="legend-item"><span class="legend-dot fair"></span> Fair: ${fairSignal}</span>
-          <span class="legend-item"><span class="legend-dot poor"></span> Poor: ${poorSignal} (${poorPct}%)</span>
-        </div>
+
+  const platformRows = Array.isArray(data.platforms) ? data.platforms : Object.entries(data.platform_breakdown || {}).map(([key, value]) => ({ key, ...value }))
+  const platformTable = platformRows.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">Platform</th><th data-sort-type="text">Metric</th><th data-sort-type="number">APs</th><th data-sort-type="number">STAs</th><th data-sort-type="number">TX</th><th data-sort-type="number">RX</th><th data-sort-type="number">Avg signal</th><th data-sort-type="number">Poor / no signal</th></tr></thead>
+    <tbody>${platformRows.map(platform => `<tr><td><strong>${escapeHTML(platform.name || reportPlatformLabel(platform.key))}</strong></td><td>${escapeHTML(formatMetricName(platform.metric_type || 'unknown'))}</td><td data-sort-value="${reportSafeNumber(platform.ap_count)}">${reportInteger(platform.ap_count)}</td><td data-sort-value="${reportSafeNumber(platform.sta_count)}">${reportInteger(platform.sta_count)}</td><td data-sort-value="${reportSafeNumber(platform.tx_rate)}">${escapeHTML(formatRate(platform.tx_rate))}</td><td data-sort-value="${reportSafeNumber(platform.rx_rate)}">${escapeHTML(formatRate(platform.rx_rate))}</td><td data-sort-value="${reportSafeNumber(platform.avg_signal)}">${reportSafeNumber(platform.avg_signal) < 0 ? `${reportInteger(platform.avg_signal)} dBm` : '—'}</td><td data-sort-value="${reportSafeNumber(platform.poor) + reportSafeNumber(platform.no_signal)}"><span class="${reportSafeNumber(platform.poor) + reportSafeNumber(platform.no_signal) > 0 ? 'report-value-bad' : ''}">${reportInteger(platform.poor)} / ${reportInteger(platform.no_signal)}</span></td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('No platform metrics', 'No platform aggregate rows were captured.', 'performance')
+
+  const riskTable = capacityRisk.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">AP</th><th data-sort-type="ip">IP</th><th data-sort-type="text">Site</th><th data-sort-type="number">Clients</th><th data-sort-type="number">Measured</th><th data-sort-type="number">Poor</th><th data-sort-type="number">Poor %</th><th data-sort-type="number">TX</th><th data-sort-type="number">RX</th></tr></thead>
+    <tbody>${capacityRisk.map(device => `<tr><td><strong>${escapeHTML(device.hostname || device.ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(device.ip || '')}">${escapeHTML(device.ip || '—')}</td><td>${escapeHTML(device.site || 'Unassigned')}</td><td data-sort-value="${reportSafeNumber(device.client_count)}">${reportInteger(device.client_count)}</td><td data-sort-value="${reportSafeNumber(device.measured_clients)}">${reportInteger(device.measured_clients)}</td><td data-sort-value="${reportSafeNumber(device.poor_clients)}"><span class="report-value-bad">${reportInteger(device.poor_clients)}</span></td><td data-sort-value="${reportSafeNumber(device.poor_pct)}"><span class="report-value-bad">${reportPercent(device.poor_pct)}</span></td><td data-sort-value="${reportSafeNumber(device.tx_rate)}">${escapeHTML(formatRate(device.tx_rate))}</td><td data-sort-value="${reportSafeNumber(device.rx_rate)}">${escapeHTML(formatRate(device.rx_rate))}</td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('No capacity-risk APs', 'No AP had at least 20% poor measured subscriber signals.', 'performance')
+
+  const missingTable = missing.length ? reportTableWrap(`
+    <table class="report-table report-sortable"><thead><tr><th data-sort-type="text">Device</th><th data-sort-type="ip">IP</th><th data-sort-type="text">Role</th><th data-sort-type="text">Site</th><th data-sort-type="text">Inventory status</th></tr></thead>
+    <tbody>${missing.map(device => `<tr><td><strong>${escapeHTML(device.hostname || device.ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(device.ip || '')}">${escapeHTML(device.ip || '—')}</td><td>${device.is_sta ? 'STA' : 'AP'}</td><td>${escapeHTML(device.site || 'Unassigned')}</td><td>${reportStatusPill(device.status)}</td></tr>`).join('')}</tbody></table>
+  `) : reportEmptyState('Complete metric coverage', 'Every inventory device had a live metric snapshot.', 'performance')
+
+  const weakTable = weakSTAs.length ? performanceDeviceTable(weakSTAs, 'STA') : reportEmptyState('No measured STA signal', 'No subscriber signal samples were present.', 'performance')
+  const tabset = `
+    <div class="report-tabset">
+      <div class="report-tabs" role="tablist">
+        <button type="button" class="report-tab active" data-report-tab="performance-aps" aria-selected="true">APs <span>${apDevices.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="performance-stas" aria-selected="false">STAs <span>${staDevices.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="performance-weak" aria-selected="false">Weakest signal <span>${weakSTAs.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="performance-risk" aria-selected="false">Capacity risk <span>${capacityRisk.length}</span></button>
+        <button type="button" class="report-tab" data-report-tab="performance-missing" aria-selected="false">Missing metrics <span>${missing.length}</span></button>
       </div>
-    `
-  }
-  
-  // Platform breakdown table with per-platform stats
-  const platformBreakdown = data.platform_breakdown || {}
-  const platformOrder = ['wave60', 'wavemlo', 'ltu', 'airmaxac', 'airmaxm', 'af11', 'af24', 'af2x', 'af5x', 'other']
-  let platformHtml = ''
-  const platforms = platformOrder.filter(p => platformBreakdown[p])
-  if (platforms.length > 0) {
-    platformHtml = `
-      <div class="report-platform-breakdown">
-        <h5>Performance by Platform</h5>
-        <p class="report-note" style="font-size: 0.85em; color: var(--text-2); margin: 0.5em 0 1em 0; font-style: italic;">Wave reports actual throughput. LTU/airMAX report link capacity.</p>
-        <table class="platform-table">
-          <thead>
-            <tr>
-              <th>Platform</th>
-              <th>APs</th>
-              <th>STAs</th>
-              <th>Total TX</th>
-              <th>Total RX</th>
-              <th>Avg Signal</th>
-              <th>Poor STAs</th>
-              <th>Signal Distribution</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${platforms.map(p => {
-              const pb = platformBreakdown[p]
-              const total = (pb.good || 0) + (pb.fair || 0) + (pb.poor || 0)
-              const goodPct = total > 0 ? Math.round((pb.good || 0) / total * 100) : 0
-              const fairPct = total > 0 ? Math.round((pb.fair || 0) / total * 100) : 0
-              const poorPct = total > 0 ? Math.round((pb.poor || 0) / total * 100) : 0
-              const metricLabel = pb.metric_type === 'throughput' ? '' : ' (cap)'
-              return `
-                <tr>
-                  <td><strong>${pb.name || p}</strong></td>
-                  <td>${pb.ap_count || 0}</td>
-                  <td>${pb.sta_count || 0}</td>
-                  <td>${formatRate(pb.tx_rate || 0)}${metricLabel}</td>
-                  <td>${formatRate(pb.rx_rate || 0)}${metricLabel}</td>
-                  <td>${pb.avg_signal ? pb.avg_signal + ' dBm' : '-'}</td>
-                  <td class="${(pb.poor || 0) > 0 ? 'warning' : ''}">${pb.poor || 0}</td>
-                  <td>
-                    ${total > 0 ? `
-                      <div class="mini-signal-bar">
-                        <div class="signal-seg good" style="width:${goodPct}%" title="${pb.good || 0} good"></div>
-                        <div class="signal-seg fair" style="width:${fairPct}%" title="${pb.fair || 0} fair"></div>
-                        <div class="signal-seg poor" style="width:${poorPct}%" title="${pb.poor || 0} poor"></div>
-                      </div>
-                    ` : '<span class="text-muted">-</span>'}
-                  </td>
-                </tr>
-              `
-            }).join('')}
-          </tbody>
-        </table>
-      </div>
-    `
-  }
-  
-  // Throughput chart removed - would mix Wave throughput with LTU/airMAX capacity
-  const throughputChartHtml = ''
-  
-  // Build tabs content
-  let tabsHtml = ''
-  
-  // If we have new-format data with separate AP/STA lists
-  if (apDevices.length > 0 || staDevices.length > 0) {
-    // Sort APs by throughput
-    const topAPs = [...apDevices]
-      .sort((a, b) => ((b.tx_rate || 0) + (b.rx_rate || 0)) - ((a.tx_rate || 0) + (a.rx_rate || 0)))
-      .slice(0, 50)
-    
-    // Sort STAs by throughput
-    const topSTAs = [...staDevices]
-      .sort((a, b) => ((b.tx_rate || 0) + (b.rx_rate || 0)) - ((a.tx_rate || 0) + (a.rx_rate || 0)))
-      .slice(0, 50)
-    
-    // Worst signal STAs
-    const worstSTAs = [...staDevices]
-      .filter(d => d.signal && d.signal < 0 && d.signal > -100)
-      .sort((a, b) => (a.signal || 0) - (b.signal || 0))
-      .slice(0, 50)
-    
-    tabsHtml = `
-      <div class="report-tabs">
-        <button class="report-tab active" data-tab="apPerf">AP Performance (${topAPs.length})</button>
-        <button class="report-tab" data-tab="staPerf">STA Performance (${topSTAs.length})</button>
-        <button class="report-tab" data-tab="worstSignal">Worst Signal (${worstSTAs.length})</button>
-        ${capacityRisk.length > 0 ? `<button class="report-tab" data-tab="capacityRisk">Capacity Risk (${capacityRisk.length})</button>` : ''}
-      </div>
-      
-      <div class="report-tab-content" id="tab-apPerf">
-        <p class="report-tab-desc">Top APs by link capacity (Wave: throughput, LTU/airMAX: capacity)</p>
-        <table class="report-table">
-          <thead>
-            <tr>
-              <th>AP</th>
-              <th>Site</th>
-              <th>Clients</th>
-              <th>Poor %</th>
-              <th>TX Rate</th>
-              <th>RX Rate</th>
-              <th>CPU</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${topAPs.map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.site || '-')}</td>
-                <td>${d.client_count || 0}</td>
-                <td class="${(d.poor_pct || 0) > 20 ? 'text-danger' : ''}">${d.poor_pct || 0}%</td>
-                <td>${d.tx_rate ? formatRate(d.tx_rate) : '-'}</td>
-                <td>${d.rx_rate ? formatRate(d.rx_rate) : '-'}</td>
-                <td>${d.cpu ? d.cpu + '%' : '-'}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-      
-      <div class="report-tab-content hidden" id="tab-staPerf">
-        <p class="report-tab-desc">Top STAs by link rate</p>
-        <table class="report-table">
-          <thead>
-            <tr>
-              <th>STA</th>
-              <th>Parent AP</th>
-              <th>Site</th>
-              <th>Signal</th>
-              <th>TX Rate</th>
-              <th>RX Rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${topSTAs.map(d => {
-              const quality = getSignalQuality(d.signal, d.band || '5ghz')
-              const signalClass = quality === 'poor' ? 'text-danger' : quality === 'fair' ? 'text-warning' : ''
-              return `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.parent_hostname || '-')}</td>
-                <td>${escapeHTML(d.site || '-')}</td>
-                <td class="${signalClass}">${d.signal && d.signal > -100 ? d.signal + ' dBm' : '-'}</td>
-                <td>${d.tx_rate ? formatRate(d.tx_rate) : '-'}</td>
-                <td>${d.rx_rate ? formatRate(d.rx_rate) : '-'}</td>
-              </tr>
-            `}).join('')}
-          </tbody>
-        </table>
-      </div>
-      
-      <div class="report-tab-content hidden" id="tab-worstSignal">
-        <p class="report-tab-desc">STAs with weakest signal</p>
-        <table class="report-table">
-          <thead>
-            <tr>
-              <th>STA</th>
-              <th>Parent AP</th>
-              <th>Site</th>
-              <th>Signal</th>
-              <th>TX Rate</th>
-              <th>RX Rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${worstSTAs.map(d => {
-              const quality = getSignalQuality(d.signal, d.band || '5ghz')
-              const signalClass = quality === 'poor' ? 'text-danger' : quality === 'fair' ? 'text-warning' : ''
-              return `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.parent_hostname || '-')}</td>
-                <td>${escapeHTML(d.site || '-')}</td>
-                <td class="${signalClass}">${d.signal ? d.signal + ' dBm' : '-'}</td>
-                <td>${d.tx_rate ? formatRate(d.tx_rate) : '-'}</td>
-                <td>${d.rx_rate ? formatRate(d.rx_rate) : '-'}</td>
-              </tr>
-            `}).join('')}
-          </tbody>
-        </table>
-      </div>
-      
-      ${capacityRisk.length > 0 ? `
-        <div class="report-tab-content hidden" id="tab-capacityRisk">
-          <p class="report-tab-desc">APs with &gt;20% poor signal clients - may need attention</p>
-          <table class="report-table">
-            <thead>
-              <tr>
-                <th>AP</th>
-                <th>Site</th>
-                <th>Clients</th>
-                <th>Poor Clients</th>
-                <th>Poor %</th>
-                <th>TX Rate</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${capacityRisk.map(d => `
-                <tr>
-                  <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                  <td>${escapeHTML(d.site || '-')}</td>
-                  <td>${d.client_count || 0}</td>
-                  <td class="text-danger">${d.poor_clients || 0}</td>
-                  <td class="text-danger">${d.poor_pct || 0}%</td>
-                  <td>${d.tx_rate ? formatRate(d.tx_rate) : '-'}</td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>
-      ` : ''}
-    `
-  } else if (oldDevices.length > 0) {
-    // Fall back to old format (for existing reports)
-    const topTalkers = [...oldDevices]
-      .filter(d => d.tx_rate || d.rx_rate)
-      .sort((a, b) => ((b.tx_rate || 0) + (b.rx_rate || 0)) - ((a.tx_rate || 0) + (a.rx_rate || 0)))
-      .slice(0, 50)
-    
-    const worstSignal = [...oldDevices]
-      .filter(d => d.signal && d.signal < 0 && d.signal > -100)
-      .sort((a, b) => (a.signal || 0) - (b.signal || 0))
-      .slice(0, 50)
-    
-    tabsHtml = `
-      <div class="report-tabs">
-        <button class="report-tab active" data-tab="topTalkers">Top 50 Talkers</button>
-        <button class="report-tab" data-tab="worstSignal">Worst 50 Signal</button>
-      </div>
-      
-      <div class="report-tab-content" id="tab-topTalkers">
-        <p class="report-tab-desc">${topTalkers.length} devices with highest link rate</p>
-        <table class="report-table">
-          <thead>
-            <tr>
-              <th>Device</th>
-              <th>IP</th>
-              <th>Type</th>
-              <th>TX Rate</th>
-              <th>RX Rate</th>
-              <th>Signal</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${topTalkers.map(d => `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.ip || '-')}</td>
-                <td>${d.is_sta ? 'STA' : 'AP'}</td>
-                <td>${d.tx_rate ? formatRate(d.tx_rate) : '-'}</td>
-                <td>${d.rx_rate ? formatRate(d.rx_rate) : '-'}</td>
-                <td class="${getSignalQuality(d.signal, '5ghz') === 'poor' ? 'text-danger' : ''}">${d.signal && d.signal > -100 ? d.signal + ' dBm' : '-'}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-      
-      <div class="report-tab-content hidden" id="tab-worstSignal">
-        <p class="report-tab-desc">${worstSignal.length} devices with weakest signal</p>
-        <table class="report-table">
-          <thead>
-            <tr>
-              <th>Device</th>
-              <th>IP</th>
-              <th>Type</th>
-              <th>Signal</th>
-              <th>TX Rate</th>
-              <th>RX Rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${worstSignal.map(d => {
-              const quality = getSignalQuality(d.signal, '5ghz')
-              const signalClass = quality === 'poor' ? 'text-danger' : quality === 'fair' ? 'text-warning' : ''
-              return `
-              <tr>
-                <td>${escapeHTML(d.hostname || d.ip || '-')}</td>
-                <td>${escapeHTML(d.ip || '-')}</td>
-                <td>${d.is_sta ? 'STA' : 'AP'}</td>
-                <td class="${signalClass}">${d.signal ? d.signal + ' dBm' : '-'}</td>
-                <td>${d.tx_rate ? formatRate(d.tx_rate) : '-'}</td>
-                <td>${d.rx_rate ? formatRate(d.rx_rate) : '-'}</td>
-              </tr>
-            `}).join('')}
-          </tbody>
-        </table>
-      </div>
-    `
-  }
-  
-  return headerHtml + summaryHtml + signalBarHtml + platformHtml + throughputChartHtml + tabsHtml
+      <div data-report-panel="performance-aps">${performanceDeviceTable(topAPs, 'AP')}</div>
+      <div class="hidden" data-report-panel="performance-stas">${performanceDeviceTable(topSTAs, 'STA')}</div>
+      <div class="hidden" data-report-panel="performance-weak">${weakTable}</div>
+      <div class="hidden" data-report-panel="performance-risk">${riskTable}</div>
+      <div class="hidden" data-report-panel="performance-missing">${missingTable}</div>
+    </div>
+  `
+
+  return `
+    ${reportMetaStrip(data, [['Inventory split', `${reportInteger(summary.inventory_ap_count || summary.ap_count)} APs · ${reportInteger(summary.inventory_sta_count || summary.sta_count)} STAs`]])}
+    ${metrics}
+    ${reportSection('Captured throughput history', 'Aggregate network rate samples stored inside this report—not fetched from the current dashboard.', '<div id="reportThroughputNote" class="report-chart-note"></div><div id="reportThroughputChart" class="throughput-chart-container"><div class="chart-loading"><span class="report-loading-ring"></span><span>Rendering captured history…</span></div></div>', 'report-section-chart')}
+    <div class="report-two-column">
+      ${reportSection('Subscriber signal distribution', 'Band-aware quality categories across measured STAs.', reportSignalDistribution(signal))}
+      ${reportSection('Platform performance', 'Throughput and capacity aggregates remain labeled by metric type.', platformTable)}
+    </div>
+    ${reportSection('Site performance', 'Metric coverage, radio exceptions, and aggregate rates by site.', reportSiteSummaryTable(data.site_summary, { metrics: true, rf: true, rates: true }))}
+    ${reportSection('Device-level performance', 'Sort the complete measured AP/STA snapshot or isolate risk and coverage gaps.', tabset, 'report-section-performance')}
+  `
 }
-
-
-
-
 
 function formatChainReport(data) {
   const summary = data.summary || {}
+  const coverage = data.coverage || {}
   const issues = Array.isArray(data.issues) ? data.issues : []
-  const threshold = summary.threshold_db || 5
-  const totalIssues = summary.total_issues || issues.length || 0
-  const deviceIssues = summary.device_issues || 0
-  const peerIssues = summary.peer_issues || 0
-  const bothIssues = summary.both_issues || 0
-  const apOnlyIssues = summary.ap_only_issues || 0
-  const staOnlyIssues = summary.sta_only_issues || 0
-
-  const scorecards = `
-    <div class="report-scorecards">
-      <div class="report-scorecard">
-        <h5>Threshold</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value">${threshold} dB</span><span class="stat-label">Spread trigger</span></div></div>
-      </div>
-      <div class="report-scorecard">
-        <h5>Total Findings</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value ${totalIssues > 0 ? 'warning' : ''}">${totalIssues}</span><span class="stat-label">Rows</span></div></div>
-      </div>
-      <div class="report-scorecard">
-        <h5>Device Radios</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value">${deviceIssues}</span><span class="stat-label">Imbalanced</span></div></div>
-      </div>
-      <div class="report-scorecard">
-        <h5>Peer Sides</h5>
-        <div class="scorecard-stats">
-          <div class="scorecard-stat"><span class="stat-value">${bothIssues}</span><span class="stat-label">Both</span></div>
-          <div class="scorecard-stat"><span class="stat-value">${apOnlyIssues}</span><span class="stat-label">AP only</span></div>
-          <div class="scorecard-stat"><span class="stat-value">${staOnlyIssues}</span><span class="stat-label">STA only</span></div>
-        </div>
-      </div>
+  const threshold = reportSafeNumber(summary.threshold_db, 5)
+  const total = reportSafeNumber(summary.total_issues, issues.length)
+  const metrics = `
+    <div class="report-metric-grid">
+      ${reportMetricCard('Threshold', `${threshold} dB`, 'Maximum acceptable chain spread', 'neutral')}
+      ${reportMetricCard('Total findings', reportInteger(total), `${reportInteger(summary.device_issues)} device · ${reportInteger(summary.peer_issues)} peer`, total > 0 ? 'warning' : 'good')}
+      ${reportMetricCard('Affected side', reportInteger(summary.both_issues), `${reportInteger(summary.ap_only_issues)} AP-only · ${reportInteger(summary.sta_only_issues)} STA-only`, reportSafeNumber(summary.both_issues) > 0 ? 'bad' : 'neutral')}
+      ${reportMetricCard('Metric coverage', reportPercent(coverage.coverage_pct), `${reportInteger(coverage.metrics_devices)} of ${reportInteger(coverage.inventory_devices)} inventory devices`, reportSafeNumber(coverage.coverage_pct) >= 95 ? 'good' : 'warning')}
     </div>
   `
-
-  const table = `
-    <table class="report-table report-sortable">
-      <thead>
-        <tr>
-          <th data-sort-type="text">Scope</th>
-          <th data-sort-type="text">Band</th>
-          <th data-sort-type="text">Device / Link</th>
-          <th data-sort-type="ip">Affected IP</th>
-          <th data-sort-type="text">Parent AP</th>
-          <th data-sort-type="text">Site</th>
-          <th data-sort-type="text">Side</th>
-          <th data-sort-type="number">AP Spread</th>
-          <th data-sort-type="number">STA Spread</th>
-          <th data-sort-type="text">AP Chains</th>
-          <th data-sort-type="text">STA Chains</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${issues.map(issue => {
-          const apChains = Array.isArray(issue.ap_chains) ? issue.ap_chains.join(' / ') : '-'
-          const staChains = Array.isArray(issue.sta_chains) ? issue.sta_chains.join(' / ') : '-'
-          const deviceLabel = escapeHTML(issue.hostname || issue.ip || '-')
-          const affectedIp = issue.affected_ip || issue.ip || issue.parent_ip || '-'
-          const parentLabel = issue.parent_hostname || issue.parent_ip ? escapeHTML(issue.parent_hostname || issue.parent_ip) : '—'
-          const side = issue.mismatch_side || issue.scope || '-'
-          const sidePretty = side === 'ap_only' ? 'AP only' : side === 'sta_only' ? 'STA only' : side === 'both' ? 'Both' : side
-          const apSpread = issue.ap_spread_db || 0
-          const staSpread = issue.sta_spread_db || 0
-          return `
-            <tr>
-              <td>${escapeHTML(issue.scope || '-')}</td>
-              <td>${escapeHTML(issue.band || '-')}</td>
-              <td>${deviceLabel}</td>
-              <td data-sort-value="${escapeHTML(affectedIp)}">${escapeHTML(affectedIp)}</td>
-              <td>${parentLabel}</td>
-              <td>${escapeHTML(issue.site || '-')}</td>
-              <td>${escapeHTML(sidePretty)}</td>
-              <td class="${apSpread > threshold ? 'text-warning' : ''}" data-sort-value="${apSpread}">${apSpread} dB</td>
-              <td class="${staSpread > threshold ? 'text-warning' : ''}" data-sort-value="${staSpread}">${staSpread} dB</td>
-              <td>${escapeHTML(apChains)}</td>
-              <td>${escapeHTML(staChains)}</td>
-            </tr>
-          `
-        }).join('')}
-      </tbody>
-    </table>
-  `
-
-  const generatedAt = data.generated_at ? new Date(data.generated_at).toLocaleString() : 'Unknown'
-  return `
-    <div class="report-header-strip">
-      <div class="report-scope"><strong>Threshold:</strong> ${threshold} dB</div>
-      <div class="report-coverage"><strong>Peer findings:</strong> ${peerIssues}</div>
-      <div class="report-time"><strong>Generated:</strong> ${generatedAt}</div>
-    </div>
-    ${scorecards}
-    ${issues.length ? table : '<p class="text-muted">No chain imbalances above threshold.</p>'}
-  `
+  const table = issues.length ? reportTableWrap(`
+    <table class="report-table report-sortable report-table-dense"><thead><tr><th data-sort-type="text">Scope</th><th data-sort-type="text">Band</th><th data-sort-type="text">Device / link</th><th data-sort-type="ip">Affected IP</th><th data-sort-type="text">Parent AP</th><th data-sort-type="text">Site</th><th data-sort-type="text">Side</th><th data-sort-type="number">AP spread</th><th data-sort-type="number">STA spread</th><th data-sort-type="number">Max spread</th><th data-sort-type="text">AP chains</th><th data-sort-type="text">STA chains</th></tr></thead>
+    <tbody>${issues.map(issue => {
+      const apChains = Array.isArray(issue.ap_chains) ? issue.ap_chains.join(' / ') : '—'
+      const staChains = Array.isArray(issue.sta_chains) ? issue.sta_chains.join(' / ') : '—'
+      const side = issue.mismatch_side === 'ap_only' ? 'AP only' : issue.mismatch_side === 'sta_only' ? 'STA only' : issue.mismatch_side === 'both' ? 'Both sides' : formatMetricName(issue.mismatch_side || issue.scope)
+      return `<tr><td>${escapeHTML(formatMetricName(issue.scope || '—'))}</td><td>${escapeHTML(issue.band || '—')}</td><td><strong>${escapeHTML(issue.hostname || issue.ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(issue.affected_ip || issue.ip || '')}">${escapeHTML(issue.affected_ip || issue.ip || '—')}</td><td>${escapeHTML(issue.parent_hostname || issue.parent_ip || '—')}</td><td>${escapeHTML(issue.site || 'Unassigned')}</td><td><span class="report-diagnostic-pill">${escapeHTML(side)}</span></td><td data-sort-value="${reportSafeNumber(issue.ap_spread_db)}" class="${reportSafeNumber(issue.ap_spread_db) > threshold ? 'report-value-bad' : ''}">${reportInteger(issue.ap_spread_db)} dB</td><td data-sort-value="${reportSafeNumber(issue.sta_spread_db)}" class="${reportSafeNumber(issue.sta_spread_db) > threshold ? 'report-value-bad' : ''}">${reportInteger(issue.sta_spread_db)} dB</td><td data-sort-value="${reportSafeNumber(issue.spread_db)}"><strong class="report-value-bad">${reportInteger(issue.spread_db)} dB</strong></td><td class="report-mono">${escapeHTML(apChains)}</td><td class="report-mono">${escapeHTML(staChains)}</td></tr>`
+    }).join('')}</tbody></table>
+  `, 'report-table-wrap-tall') : reportEmptyState('No chain imbalance found', `No device or peer-side chain spread exceeded ${threshold} dB.`, 'chain')
+  return `${reportMetaStrip(data, [['Threshold', `${threshold} dB`]])}${metrics}${reportSection('Ranked chain findings', 'Largest maximum spread appears first; sort any column for alternate triage.', table, 'report-section-diagnostic')}`
 }
-
-
 
 function formatRxMismatchReport(data) {
   const summary = data.summary || {}
+  const coverage = data.coverage || {}
   const issues = Array.isArray(data.issues) ? data.issues : []
-  const threshold = summary.threshold_db || 8
-  const totalIssues = summary.total_issues || issues.length || 0
-  const apStronger = summary.ap_stronger_issues || 0
-  const staStronger = summary.sta_stronger_issues || 0
-
-  const scorecards = `
-    <div class="report-scorecards">
-      <div class="report-scorecard">
-        <h5>Threshold</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value">${threshold} dB</span><span class="stat-label">Delta trigger</span></div></div>
-      </div>
-      <div class="report-scorecard">
-        <h5>Total Links</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value ${totalIssues > 0 ? 'warning' : ''}">${totalIssues}</span><span class="stat-label">Mismatched</span></div></div>
-      </div>
-      <div class="report-scorecard">
-        <h5>AP RX Stronger</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value">${apStronger}</span><span class="stat-label">Links</span></div></div>
-      </div>
-      <div class="report-scorecard">
-        <h5>STA RX Stronger</h5>
-        <div class="scorecard-stats"><div class="scorecard-stat"><span class="stat-value">${staStronger}</span><span class="stat-label">Links</span></div></div>
-      </div>
+  const threshold = reportSafeNumber(summary.threshold_db, 8)
+  const total = reportSafeNumber(summary.total_issues, issues.length)
+  const metrics = `
+    <div class="report-metric-grid">
+      ${reportMetricCard('Threshold', `${threshold} dB`, 'Maximum AP/STA RX disagreement', 'neutral')}
+      ${reportMetricCard('Mismatched links', reportInteger(total), 'Ranked by absolute RX delta', total > 0 ? 'warning' : 'good')}
+      ${reportMetricCard('AP RX stronger', reportInteger(summary.ap_stronger_issues), `${reportInteger(summary.sta_stronger_issues)} links favor STA RX`, reportSafeNumber(summary.ap_stronger_issues) > 0 ? 'neutral' : 'good')}
+      ${reportMetricCard('Metric coverage', reportPercent(coverage.coverage_pct), `${reportInteger(coverage.metrics_devices)} of ${reportInteger(coverage.inventory_devices)} inventory devices`, reportSafeNumber(coverage.coverage_pct) >= 95 ? 'good' : 'warning')}
     </div>
   `
-
-  const table = `
-    <table class="report-table report-sortable">
-      <thead>
-        <tr>
-          <th data-sort-type="text">Band</th>
-          <th data-sort-type="text">AP</th>
-          <th data-sort-type="text">STA</th>
-          <th data-sort-type="ip">Affected IP</th>
-          <th data-sort-type="text">Site</th>
-          <th data-sort-type="number">AP RX</th>
-          <th data-sort-type="number">STA RX</th>
-          <th data-sort-type="number">Delta</th>
-          <th data-sort-type="text">Stronger Side</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${issues.map(issue => {
-          const affectedIp = issue.affected_ip || issue.sta_ip || issue.ap_ip || '-'
-          const apRx = issue.ap_rx || 0
-          const staRx = issue.sta_rx || 0
-          const delta = issue.delta_db || 0
-          const stronger = issue.stronger_side === 'ap_rx' ? 'AP RX' : issue.stronger_side === 'sta_rx' ? 'STA RX' : '-'
-          return `
-            <tr>
-              <td>${escapeHTML(issue.band || '-')}</td>
-              <td>${escapeHTML(issue.ap_hostname || issue.ap_ip || '-')}</td>
-              <td>${escapeHTML(issue.sta_hostname || issue.sta_ip || '-')}</td>
-              <td data-sort-value="${escapeHTML(affectedIp)}">${escapeHTML(affectedIp)}</td>
-              <td>${escapeHTML(issue.site || '-')}</td>
-              <td data-sort-value="${apRx}">${apRx} dBm</td>
-              <td data-sort-value="${staRx}">${staRx} dBm</td>
-              <td class="text-warning" data-sort-value="${delta}">${delta} dB</td>
-              <td>${stronger}</td>
-            </tr>
-          `
-        }).join('')}
-      </tbody>
-    </table>
-  `
-
-  const generatedAt = data.generated_at ? new Date(data.generated_at).toLocaleString() : 'Unknown'
-  return `
-    <div class="report-header-strip">
-      <div class="report-scope"><strong>Threshold:</strong> ${threshold} dB</div>
-      <div class="report-coverage"><strong>Findings:</strong> ${totalIssues}</div>
-      <div class="report-time"><strong>Generated:</strong> ${generatedAt}</div>
-    </div>
-    ${scorecards}
-    ${issues.length ? table : '<p class="text-muted">No AP/STA RX mismatches above threshold.</p>'}
-  `
+  const table = issues.length ? reportTableWrap(`
+    <table class="report-table report-sortable report-table-dense"><thead><tr><th data-sort-type="text">Band</th><th data-sort-type="text">AP</th><th data-sort-type="ip">AP IP</th><th data-sort-type="text">STA</th><th data-sort-type="ip">STA IP</th><th data-sort-type="text">Site</th><th data-sort-type="number">AP RX</th><th data-sort-type="number">STA RX</th><th data-sort-type="number">Delta</th><th data-sort-type="text">Stronger side</th></tr></thead>
+    <tbody>${issues.map(issue => `<tr><td>${escapeHTML(issue.band || '—')}</td><td><strong>${escapeHTML(issue.ap_hostname || issue.ap_ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(issue.ap_ip || '')}">${escapeHTML(issue.ap_ip || '—')}</td><td><strong>${escapeHTML(issue.sta_hostname || issue.sta_ip || 'Unknown')}</strong></td><td data-sort-value="${escapeAttr(issue.sta_ip || '')}">${escapeHTML(issue.sta_ip || '—')}</td><td>${escapeHTML(issue.site || 'Unassigned')}</td><td data-sort-value="${reportSafeNumber(issue.ap_rx)}">${reportInteger(issue.ap_rx)} dBm</td><td data-sort-value="${reportSafeNumber(issue.sta_rx)}">${reportInteger(issue.sta_rx)} dBm</td><td data-sort-value="${reportSafeNumber(issue.delta_db)}"><strong class="report-value-bad">${reportInteger(issue.delta_db)} dB</strong></td><td><span class="report-diagnostic-pill">${issue.stronger_side === 'ap_rx' ? 'AP RX' : issue.stronger_side === 'sta_rx' ? 'STA RX' : 'Equal'}</span></td></tr>`).join('')}</tbody></table>
+  `, 'report-table-wrap-tall') : reportEmptyState('No RX mismatch found', `No AP/STA receive-level delta exceeded ${threshold} dB.`, 'rx_mismatch')
+  return `${reportMetaStrip(data, [['Threshold', `${threshold} dB`]])}${metrics}${reportSection('Ranked receive-level mismatches', 'Largest absolute AP/STA difference appears first.', table, 'report-section-diagnostic')}`
 }
-
 
 function formatRate(bps) {
   if (!bps) return '-'
@@ -11233,10 +11712,16 @@ window.rebootDevice = async function(deviceId) {
 
   const name = device.hostname || device.ip_address || device.mac || 'device'
   const platform = String(device.platform || device.flavor || 'unknown').toUpperCase()
-  const ok = window.confirm(`Reboot ${name}?
-
-This sends the platform-specific reboot command directly to the remote radio.
-Platform/flavor: ${platform}`)
+  const ok = await showConfirmDialog(
+    `WaveControl will send the platform-specific reboot command directly to ${name}.\n\nPlatform/flavor: ${platform}`,
+    {
+      title: `Reboot ${name}?`,
+      eyebrow: 'Remote device action',
+      confirmText: 'Reboot device',
+      tone: 'warning',
+      calloutTitle: 'The device and connected subscribers may briefly go offline.'
+    }
+  )
   if (!ok) return
 
   try {
@@ -11283,7 +11768,18 @@ window.learnReplacementMAC = async function(deviceId) {
 
     let selectedMac = observed[0]
     if (observed.length > 1) {
-      const entered = window.prompt(`Observed replacement MACs:\n${observed.join('\n')}\n\nEnter the MAC to learn:`, observed[0])
+      const entered = await showInputDialog({
+        title: 'Select the replacement MAC',
+        eyebrow: 'Device identity repair',
+        message: `WaveControl observed multiple MAC addresses at the device IP:\n${observed.join('\n')}`,
+        label: 'MAC address to learn',
+        value: observed[0],
+        placeholder: 'aa:bb:cc:dd:ee:ff',
+        required: true,
+        confirmText: 'Use this MAC',
+        helpText: 'Choose only the address that belongs to the physical replacement radio.',
+        validate: value => /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$/i.test(value.trim()) || 'Enter a valid six-octet MAC address.'
+      })
       if (!entered) return
       selectedMac = entered.trim()
     }
@@ -11297,12 +11793,16 @@ window.learnReplacementMAC = async function(deviceId) {
     const actionCopy = isAP
       ? 'This will replace the AP inventory MAC, update child station parent references, clear mac_mismatch, and audit the change.'
       : 'This will replace the station inventory MAC, keep the AP association unchanged, clear mac_mismatch, and audit the change.'
-    const ok = window.confirm(`Learn replacement MAC for ${roleLabel} ${device.hostname || device.ip_address || 'device'}?
-
-Expected/current MAC: ${expected}
-Observed at ${observedIP}: ${selectedMac}
-
-${actionCopy}`)
+    const ok = await showConfirmDialog(
+      `Expected/current MAC: ${expected}\nObserved at ${observedIP}: ${selectedMac}\n\n${actionCopy}`,
+      {
+        title: `Learn replacement MAC for this ${roleLabel}?`,
+        eyebrow: 'Device identity repair',
+        confirmText: 'Learn replacement MAC',
+        tone: 'warning',
+        calloutTitle: 'This changes the authoritative inventory identity.'
+      }
+    )
     if (!ok) return
 
     const resp = await api.learnDeviceMAC(deviceId, selectedMac, reason)
@@ -11353,7 +11853,18 @@ window.updateDeviceAlerting = async function(deviceId, patch) {
 window.editDeviceAlertNotes = async function(deviceId) {
   const device = store.devices.find(d => d.id === deviceId)
   if (!device) return
-  const notes = window.prompt('Alert notes for this device:', device.alert_notes || '')
+  const notes = await showInputDialog({
+    title: 'Edit device alert notes',
+    eyebrow: 'Alert context',
+    message: 'These notes appear with device alerting controls and help operators understand exceptions or escalation details.',
+    label: 'Operator notes',
+    value: device.alert_notes || '',
+    placeholder: 'Add maintenance, escalation, or customer-impact context…',
+    multiline: true,
+    rows: 6,
+    confirmText: 'Save notes',
+    helpText: 'Leave blank to remove the current notes.'
+  })
   if (notes === null) return
   await window.updateDeviceAlerting(deviceId, { alert_notes: notes })
 }
@@ -11903,7 +12414,16 @@ contextMenu?.querySelectorAll('.context-item').forEach(item => {
       }
       break
       case 'delete':
-        if (confirm(`Delete ${device.hostname || device.ip_address}?`)) {
+        if (await showConfirmDialog(
+          `The inventory record for ${device.hostname || device.ip_address || 'this device'} will be permanently removed.`,
+          {
+            title: 'Delete device?',
+            eyebrow: 'Inventory deletion',
+            confirmText: 'Delete device',
+            tone: 'danger',
+            calloutTitle: 'Polling history and device relationships may no longer be available.'
+          }
+        )) {
           try {
             await api.deleteDevice(contextDeviceId)
             const devices = await api.devices()
@@ -11999,8 +12519,19 @@ document.getElementById('bulkUpgrade')?.addEventListener('click', async () => {
     return
   }
   
-  // For bulk, use auto-selection (empty firmware = auto-select by flavor)
-  const force = confirm('Force upgrade even if same version?')
+  // For bulk, use auto-selection (empty firmware = auto-select by flavor).
+  // Choosing the safer option still starts the job with normal version checks.
+  const force = await showConfirmDialog(
+    `WaveControl will auto-select firmware by device flavor for ${ids.length} selected device${ids.length === 1 ? '' : 's'}.`,
+    {
+      title: 'Force firmware upgrade?',
+      eyebrow: 'Bulk upgrade options',
+      confirmText: 'Force upgrade',
+      cancelText: 'Use normal checks',
+      tone: 'warning',
+      calloutTitle: 'Forced mode also upgrades devices already on the selected version.'
+    }
+  )
   
   try {
     // Use async job system for bulk upgrades
@@ -12047,7 +12578,22 @@ document.getElementById('bulkMarkAlertable')?.addEventListener('click', async ()
 document.getElementById('bulkMuteAlerts')?.addEventListener('click', async () => {
   const ids = getSelectedDeviceIds()
   if (ids.length === 0) return
-  const choice = window.prompt('Mute selected devices for how many hours? Use 0 to mark not alertable permanently.', '24')
+  const choice = await showInputDialog({
+    title: 'Mute alerts for selected devices',
+    eyebrow: 'Bulk alert policy',
+    message: `Apply an alert silence to ${ids.length} selected device${ids.length === 1 ? '' : 's'}. Enter 0 to mark them not alertable until changed manually.`,
+    label: 'Mute duration in hours',
+    value: '24',
+    inputType: 'number',
+    min: 0,
+    required: true,
+    confirmText: 'Apply alert policy',
+    helpText: 'Fractional hours are allowed. A value of 0 is persistent, not a timed mute.',
+    validate: value => {
+      const hours = Number(value)
+      return (Number.isFinite(hours) && hours >= 0) || 'Enter a non-negative number of hours.'
+    }
+  })
   if (choice === null) return
   const hours = Number(choice)
   if (!Number.isFinite(hours) || hours < 0) {
@@ -12080,7 +12626,17 @@ document.getElementById('bulkDelete')?.addEventListener('click', async () => {
   const ids = getSelectedDeviceIds()
   if (ids.length === 0) return
   
-  if (!confirm(`Delete ${ids.length} devices? This cannot be undone.`)) return
+  const confirmed = await showConfirmDialog(
+    `${ids.length} selected inventory device${ids.length === 1 ? '' : 's'} will be permanently removed from WaveControl.`,
+    {
+      title: `Delete ${ids.length} device${ids.length === 1 ? '' : 's'}?`,
+      eyebrow: 'Bulk inventory deletion',
+      confirmText: 'Delete selected devices',
+      tone: 'danger',
+      calloutTitle: 'This cannot be undone from the application.'
+    }
+  )
+  if (!confirmed) return
   
   let deleted = 0
   for (const id of ids) {
@@ -12232,7 +12788,16 @@ async function loadScheduledJobs(jobsOverride = null) {
         const msg = status === 'running'
           ? 'Cancel this running job? It will stop as soon as possible.'
           : 'Cancel this scheduled job?'
-        if (!confirm(msg)) return
+        const confirmed = await showConfirmDialog(msg, {
+          title: status === 'running' ? 'Cancel running job?' : 'Cancel scheduled job?',
+          eyebrow: 'Scheduler action',
+          confirmText: 'Cancel job',
+          tone: 'warning',
+          calloutTitle: status === 'running'
+            ? 'Devices already being processed may complete their current operation.'
+            : 'The job will not run at its scheduled time.'
+        })
+        if (!confirmed) return
 
         try {
           await api.cancelJob(jobId)
@@ -12264,116 +12829,165 @@ function showJobDetailsModal(job) {
     modal.id = 'jobDetailsModal'
     modal.className = 'modal hidden'
     modal.innerHTML = `
-      <div class="modal-content modal-wide">
+      <div class="modal-content modal-large job-details-shell">
         <div class="modal-header">
-          <h3>Scheduled Job Details</h3>
-          <button class="modal-close" aria-label="Close">&times;</button>
+          <div class="modal-heading">
+            <span class="modal-eyebrow">Scheduler job</span>
+            <h3 id="jobDetailsTitle">Scheduled job details</h3>
+            <p id="jobDetailsSubtitle" class="modal-subtitle"></p>
+          </div>
+          <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="jobDetailsModal" aria-label="Close job details">&times;</button>
         </div>
         <div class="modal-body" id="jobDetailsBody"></div>
-        <div class="modal-footer" id="jobDetailsFooter">
-          <button class="btn btn-secondary" id="jobDetailsClose">Close</button>
-        </div>
+        <div class="modal-footer" id="jobDetailsFooter"></div>
       </div>
     `
     document.body.appendChild(modal)
-
-    // Close handlers
-    modal.querySelector('.modal-close')?.addEventListener('click', () => modal.classList.add('hidden'))
-    modal.querySelector('#jobDetailsClose')?.addEventListener('click', () => modal.classList.add('hidden'))
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) modal.classList.add('hidden')
-    })
   }
 
   const isCancellable = ['pending', 'blocked', 'running'].includes(String(job.status || ''))
   const isEditable = ['pending', 'blocked'].includes(String(job.status || ''))
+  const jobID = String(job.id ?? '')
+  const status = String(job.status || 'unknown')
+  const typeLabel = String(job.job_type || 'job').replaceAll('_', ' ')
+  const scheduled = formatJobTime(job.scheduled_at, job.next_run)
 
-  // Pretty params
   let paramsText = ''
   try {
-    const p = job.parameters ?? {}
-    paramsText = JSON.stringify(p, null, 2)
+    paramsText = JSON.stringify(job.parameters ?? {}, null, 2)
   } catch {
     paramsText = String(job.parameters || '')
   }
 
-  // Device list
   const ids = Array.isArray(job.device_ids) ? job.device_ids : []
-  const deviceLines = ids.map(id => {
-    const d = store.getDeviceById(id)
-    const name = d?.hostname || d?.ip_address || d?.mac || `Device ${id}`
-    const extra = []
-    if (d?.ip_address) extra.push(d.ip_address)
-    if (d?.product) extra.push(d.product)
-    if (d?.site_name) extra.push(d.site_name)
-    return `#${id} - ${name}${extra.length ? ' (' + extra.join(' · ') + ')' : ''}`
+  const devices = ids.map(id => {
+    const device = store.getDeviceById(id)
+    return {
+      id,
+      name: device?.hostname || device?.ip_address || device?.mac || `Device ${id}`,
+      ip: device?.ip_address || '—',
+      product: device?.product || 'Unknown',
+      site: device?.site_name || 'Unassigned'
+    }
   })
 
+  const title = modal.querySelector('#jobDetailsTitle')
+  const subtitle = modal.querySelector('#jobDetailsSubtitle')
+  if (title) title.textContent = `Job #${jobID}`
+  if (subtitle) subtitle.textContent = `${typeLabel} · ${devices.length} target${devices.length === 1 ? '' : 's'} · ${scheduled}`
+
+  const progress = Math.max(0, Math.min(100, Number(job.progress) || 0))
   const body = modal.querySelector('#jobDetailsBody')
   if (body) {
     body.innerHTML = `
-      <div class="job-details-grid">
-        <div><strong>ID:</strong> #${escapeHTML(String(job.id))}</div>
-        <div><strong>Type:</strong> ${escapeHTML(String(job.job_type || ''))}</div>
-        <div><strong>Status:</strong> <span class="job-status ${escapeAttr(job.status)}">${escapeHTML(String(job.status || ''))}</span></div>
-        <div><strong>Scheduled:</strong> ${escapeHTML(formatJobTime(job.scheduled_at, job.next_run))}</div>
-        <div><strong>Repeat:</strong> ${job.repeat_cron ? escapeHTML(String(job.repeat_cron)) : '-'}</div>
-        <div><strong>Created By:</strong> ${escapeHTML(String(job.created_by ?? '-'))}</div>
-        <div><strong>Created At:</strong> ${job.created_at ? escapeHTML(new Date(job.created_at).toLocaleString()) : '-'}</div>
+      <div class="modal-summary job-details-summary">
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Status</span>
+          <span class="modal-summary-value"><span class="job-status ${escapeAttr(status)}">${escapeHTML(status)}</span></span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Job type</span>
+          <span class="modal-summary-value">${escapeHTML(typeLabel)}</span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Next run</span>
+          <span class="modal-summary-value">${escapeHTML(scheduled)}</span>
+        </div>
+        <div class="modal-summary-item">
+          <span class="modal-summary-label">Repeat</span>
+          <span class="modal-summary-value">${job.repeat_cron ? escapeHTML(String(job.repeat_cron)) : 'One time'}</span>
+        </div>
       </div>
 
-      ${job.status === 'running' ? `
-        <div class="job-details-progress">
-          <div class="progress-bar">
-            <div class="progress-fill" style="width: ${job.progress || 0}%"></div>
-            <span class="progress-text">${job.completed_devices || 0}/${job.total_devices || 0}</span>
+      ${status === 'running' ? `
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Execution progress</span><span>${job.completed_devices || 0}/${job.total_devices || devices.length} devices</span></div>
+          <div class="progress-bar job-details-progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}">
+            <div class="progress-fill" style="width:${progress}%"></div>
+            <span class="progress-text">${progress.toFixed(0)}%</span>
           </div>
+        </section>
+      ` : ''}
+
+      ${job.error_message ? `
+        <div class="modal-callout danger">
+          <span class="modal-callout-icon" aria-hidden="true">!</span>
+          <div><strong>Job reported an error.</strong><p>${escapeHTML(String(job.error_message))}</p></div>
         </div>
       ` : ''}
 
-      ${job.error_message ? `<div class="job-details-error">${escapeHTML(String(job.error_message))}</div>` : ''}
+      <section class="modal-section">
+        <div class="modal-section-title"><span>Target devices</span><span>${devices.length}</span></div>
+        ${devices.length ? `
+          <div class="modal-table-wrap">
+            <table class="data-table job-target-table">
+              <thead><tr><th>ID</th><th>Device</th><th>IP</th><th>Product</th><th>Site</th></tr></thead>
+              <tbody>${devices.map(device => `
+                <tr>
+                  <td>#${escapeHTML(String(device.id))}</td>
+                  <td><strong>${escapeHTML(device.name)}</strong></td>
+                  <td><code>${escapeHTML(device.ip)}</code></td>
+                  <td>${escapeHTML(device.product)}</td>
+                  <td>${escapeHTML(device.site)}</td>
+                </tr>
+              `).join('')}</tbody>
+            </table>
+          </div>
+        ` : '<div class="modal-empty modal-empty-compact">No target devices are attached to this job.</div>'}
+      </section>
 
-      <h4>Targets</h4>
-      <div class="job-details-targets">
-        ${deviceLines.length ? `<pre class="job-details-pre">${escapeHTML(deviceLines.join('\n'))}</pre>` : '<p class="muted">No devices</p>'}
+      <section class="modal-section">
+        <div class="modal-section-title"><span>Execution parameters</span><span>JSON</span></div>
+        <pre class="job-details-pre">${escapeHTML(paramsText || '{}')}</pre>
+      </section>
+
+      <div class="job-details-audit">
+        <span>Created by ${escapeHTML(String(job.created_by ?? 'unknown'))}</span>
+        <span>${job.created_at ? escapeHTML(new Date(job.created_at).toLocaleString()) : 'Creation time unavailable'}</span>
       </div>
-
-      <h4>Parameters</h4>
-      <pre class="job-details-pre">${escapeHTML(paramsText)}</pre>
     `
   }
 
   const footer = modal.querySelector('#jobDetailsFooter')
   if (footer) {
     footer.innerHTML = `
-      <button class="btn btn-secondary" id="jobDetailsClose">Close</button>
-      ${isEditable ? `<button class="btn btn-secondary" id="jobDetailsEdit">Edit</button>` : ''}
-      ${isCancellable ? `<button class="btn btn-danger-subtle" id="jobDetailsCancel">Cancel Job</button>` : ''}
+      <span class="modal-footer-note">Job changes are recorded by the scheduler.</span>
+      <button type="button" class="btn btn-secondary" data-job-details-close>Close</button>
+      ${isEditable ? '<button type="button" class="btn btn-secondary" data-job-details-edit>Edit schedule</button>' : ''}
+      ${isCancellable ? '<button type="button" class="btn btn-danger-subtle" data-job-details-cancel>Cancel job</button>' : ''}
     `
-    footer.querySelector('#jobDetailsEdit')?.addEventListener('click', () => {
-      modal.classList.add('hidden')
+    footer.querySelector('[data-job-details-close]')?.addEventListener('click', () => closeModalElement(modal))
+    footer.querySelector('[data-job-details-edit]')?.addEventListener('click', () => {
+      closeModalElement(modal)
       showJobEditModal(job)
     })
-
-    footer.querySelector('#jobDetailsClose')?.addEventListener('click', () => modal.classList.add('hidden'))
-    footer.querySelector('#jobDetailsCancel')?.addEventListener('click', async () => {
-      const status = String(job.status || '')
-      const msg = status === 'running'
-        ? 'Cancel this running job? It will stop as soon as possible.'
-        : 'Cancel this scheduled job?'
-      if (!confirm(msg)) return
+    footer.querySelector('[data-job-details-cancel]')?.addEventListener('click', async () => {
+      const running = status === 'running'
+      const confirmed = await showConfirmDialog(
+        running ? 'The scheduler will stop dispatching additional device work as soon as possible.' : 'The scheduled job will be cancelled before it runs.',
+        {
+          title: running ? 'Cancel running job?' : 'Cancel scheduled job?',
+          eyebrow: 'Scheduler action',
+          confirmText: 'Cancel job',
+          tone: 'warning',
+          calloutTitle: running
+            ? 'Devices already processing may finish their current operation.'
+            : 'The job will not run at its scheduled time.'
+        }
+      )
+      if (!confirmed) return
       try {
         await api.cancelJob(job.id)
         showToast('Job cancelled', 'success')
-        modal.classList.add('hidden')
+        closeModalElement(modal)
         loadScheduledJobs()
-      } catch (e) {
-        showToast('Failed: ' + e.message, 'error')
+      } catch (error) {
+        showToast('Failed: ' + error.message, 'error')
       }
     })
   }
 
-  modal.classList.remove('hidden')
+  openModalElement(modal)
 }
 
 function toDatetimeLocalValue(d) {
@@ -12393,79 +13007,82 @@ function showJobEditModal(job) {
     modal.id = 'jobEditModal'
     modal.className = 'modal hidden'
     modal.innerHTML = `
-      <div class="modal-content modal-wide">
+      <div class="modal-content modal-wide job-edit-shell">
         <div class="modal-header">
-          <h3>Edit Scheduled Job</h3>
-          <button class="modal-close" aria-label="Close">&times;</button>
+          <div class="modal-heading">
+            <span class="modal-eyebrow">Scheduler job</span>
+            <h3>Edit scheduled job</h3>
+            <p class="modal-subtitle">Change the next execution time or recurrence without recreating the job.</p>
+          </div>
+          <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="jobEditModal" aria-label="Close job editor">&times;</button>
         </div>
         <div class="modal-body" id="jobEditBody"></div>
         <div class="modal-footer" id="jobEditFooter"></div>
       </div>
     `
     document.body.appendChild(modal)
-    modal.querySelector('.modal-close')?.addEventListener('click', () => modal.classList.add('hidden'))
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) modal.classList.add('hidden')
-    })
   }
 
   const nextTime = job.next_run || job.scheduled_at
-  const currentRepeat = job.repeat_cron || ''
+  const currentRepeat = String(job.repeat_cron || '')
   const common = ['', '@hourly', '@daily', '@weekly', '12h', '24h', '168h']
   const isCommon = common.includes(currentRepeat)
-
   const body = modal.querySelector('#jobEditBody')
   if (body) {
     body.innerHTML = `
-      <div class="form-group">
-        <label>Job</label>
-        <div class="muted">#${escapeHTML(String(job.id))} • ${escapeHTML(String(job.job_type || ''))} • ${escapeHTML(String(job.status || ''))}</div>
+      <div class="modal-callout">
+        <span class="modal-callout-icon" aria-hidden="true">i</span>
+        <div>
+          <strong>Editing job #${escapeHTML(String(job.id))}</strong>
+          <p>${escapeHTML(String(job.job_type || 'job').replaceAll('_', ' '))} · current status ${escapeHTML(String(job.status || 'unknown'))}</p>
+        </div>
       </div>
-      <div class="form-group">
-        <label>Next Run Time</label>
-        <input type="datetime-local" id="jobEditTime" />
-        <small class="form-hint">This sets the next time the job will run.</small>
-      </div>
-      <div class="form-group">
-        <label>Repeat Schedule</label>
-        <select id="jobEditRepeat">
-          <option value="">One-time (no repeat)</option>
-          <option value="@hourly">Hourly</option>
-          <option value="@daily">Daily</option>
-          <option value="@weekly">Weekly</option>
-          <option value="12h">Every 12 hours</option>
-          <option value="24h">Every 24 hours</option>
-          <option value="168h">Every week</option>
-          <option value="custom">Custom…</option>
-        </select>
-        <input type="text" id="jobEditRepeatCustom" class="hidden" placeholder="e.g. 6h, 30m" />
-        <small class="form-hint">Use @hourly/@daily/@weekly or a Go duration like 12h, 30m.</small>
-      </div>
+      <section class="modal-section">
+        <div class="modal-section-title"><span>Schedule</span><span>Local browser time</span></div>
+        <div class="modal-field-grid">
+          <div class="form-group">
+            <label for="jobEditTime">Next run time</label>
+            <input type="datetime-local" id="jobEditTime" required />
+            <small class="form-hint">The browser converts this local time to an absolute UTC timestamp.</small>
+          </div>
+          <div class="form-group">
+            <label for="jobEditRepeat">Repeat schedule</label>
+            <select id="jobEditRepeat">
+              <option value="">One-time (no repeat)</option>
+              <option value="@hourly">Hourly</option>
+              <option value="@daily">Daily</option>
+              <option value="@weekly">Weekly</option>
+              <option value="12h">Every 12 hours</option>
+              <option value="24h">Every 24 hours</option>
+              <option value="168h">Every week</option>
+              <option value="custom">Custom duration…</option>
+            </select>
+            <input type="text" id="jobEditRepeatCustom" class="hidden" placeholder="e.g. 6h, 30m" autocomplete="off" />
+            <small class="form-hint">Custom recurrence accepts @hourly/@daily/@weekly or a Go duration such as 12h or 30m.</small>
+          </div>
+        </div>
+      </section>
     `
 
-    const timeEl = body.querySelector('#jobEditTime')
-    if (timeEl) timeEl.value = toDatetimeLocalValue(nextTime)
+    const timeInput = body.querySelector('#jobEditTime')
+    if (timeInput) timeInput.value = toDatetimeLocalValue(nextTime)
 
-    const sel = body.querySelector('#jobEditRepeat')
-    const custom = body.querySelector('#jobEditRepeatCustom')
-    if (sel && custom) {
+    const repeatSelect = body.querySelector('#jobEditRepeat')
+    const customInput = body.querySelector('#jobEditRepeatCustom')
+    if (repeatSelect && customInput) {
       if (currentRepeat && !isCommon) {
-        sel.value = 'custom'
-        custom.value = currentRepeat
-        custom.classList.remove('hidden')
+        repeatSelect.value = 'custom'
+        customInput.value = currentRepeat
+        customInput.classList.remove('hidden')
       } else {
-        sel.value = currentRepeat
-        custom.classList.add('hidden')
-        custom.value = ''
+        repeatSelect.value = currentRepeat
+        customInput.value = ''
+        customInput.classList.add('hidden')
       }
-
-      sel.addEventListener('change', () => {
-        if (sel.value === 'custom') {
-          custom.classList.remove('hidden')
-          custom.focus()
-        } else {
-          custom.classList.add('hidden')
-        }
+      repeatSelect.addEventListener('change', () => {
+        const custom = repeatSelect.value === 'custom'
+        customInput.classList.toggle('hidden', !custom)
+        if (custom) customInput.focus()
       })
     }
   }
@@ -12473,339 +13090,583 @@ function showJobEditModal(job) {
   const footer = modal.querySelector('#jobEditFooter')
   if (footer) {
     footer.innerHTML = `
-      <button class="btn btn-secondary" id="jobEditCancel">Cancel</button>
-      <button class="btn btn-primary" id="jobEditSave">Save</button>
+      <span class="modal-footer-note">Only pending or blocked jobs can be edited.</span>
+      <button type="button" class="btn btn-secondary" data-job-edit-cancel>Cancel</button>
+      <button type="button" class="btn btn-primary" data-job-edit-save>Save schedule</button>
     `
-
-    footer.querySelector('#jobEditCancel')?.addEventListener('click', () => modal.classList.add('hidden'))
-    footer.querySelector('#jobEditSave')?.addEventListener('click', async () => {
-      const timeVal = modal.querySelector('#jobEditTime')?.value
-      if (!timeVal) {
+    footer.querySelector('[data-job-edit-cancel]')?.addEventListener('click', () => closeModalElement(modal))
+    footer.querySelector('[data-job-edit-save]')?.addEventListener('click', async event => {
+      const button = event.currentTarget
+      const timeValue = modal.querySelector('#jobEditTime')?.value
+      if (!timeValue) {
         showToast('Select a next run time', 'error')
+        modal.querySelector('#jobEditTime')?.focus()
+        return
+      }
+      const nextRun = new Date(timeValue)
+      if (Number.isNaN(nextRun.getTime())) {
+        showToast('Enter a valid next run time', 'error')
         return
       }
 
-      const repeatSel = modal.querySelector('#jobEditRepeat')?.value || ''
-      const repeatCustom = modal.querySelector('#jobEditRepeatCustom')?.value || ''
-      const repeat = (repeatSel === 'custom') ? repeatCustom.trim() : repeatSel
+      const repeatSelection = modal.querySelector('#jobEditRepeat')?.value || ''
+      const repeatCustom = modal.querySelector('#jobEditRepeatCustom')?.value?.trim() || ''
+      const repeat = repeatSelection === 'custom' ? repeatCustom : repeatSelection
+      if (repeatSelection === 'custom' && !repeat) {
+        showToast('Enter a custom repeat duration', 'error')
+        modal.querySelector('#jobEditRepeatCustom')?.focus()
+        return
+      }
 
+      button.disabled = true
+      const originalText = button.textContent
+      button.textContent = 'Saving…'
       try {
-        const iso = new Date(timeVal).toISOString()
-        await api.updateJob(job.id, { scheduled_at: iso, repeat_cron: repeat })
+        await api.updateJob(job.id, { scheduled_at: nextRun.toISOString(), repeat_cron: repeat })
         showToast('Job updated', 'success')
-        modal.classList.add('hidden')
+        closeModalElement(modal)
         await loadScheduledJobs()
-      } catch (e) {
-        showToast('Failed: ' + e.message, 'error')
+      } catch (error) {
+        showToast('Failed: ' + error.message, 'error')
+      } finally {
+        button.disabled = false
+        button.textContent = originalText
       }
     })
   }
 
-  modal.classList.remove('hidden')
+  openModalElement(modal)
 }
 
 function showScheduleJobModal() {
-  // Create modal if it doesn't exist
-  let modal = document.getElementById('scheduleJobModal')
-  if (!modal) {
-    modal = document.createElement('div')
-    modal.id = 'scheduleJobModal'
-    modal.className = 'modal'
-    modal.innerHTML = `
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>Schedule Job</h3>
-          <button class="modal-close" data-wc-action="close-modal" data-modal-id="scheduleJobModal">&times;</button>
+  document.getElementById('scheduleJobModal')?.remove()
+
+  const modal = document.createElement('div')
+  modal.id = 'scheduleJobModal'
+  modal.className = 'modal hidden'
+  modal.innerHTML = `
+    <div class="modal-content modal-large schedule-job-shell">
+      <div class="modal-header">
+        <div class="modal-heading">
+          <span class="modal-eyebrow">Job scheduler</span>
+          <h3>Schedule device work</h3>
+          <p class="modal-subtitle">Queue a firmware upgrade or reboot for one or more devices, with an optional recurrence.</p>
         </div>
-        <div class="modal-body">
-          <div class="form-group">
-            <label>Job Type</label>
-            <select id="schedJobType">
-              <option value="upgrade">Firmware Upgrade</option>
-              <option value="reboot">Reboot</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>Devices</label>
-            <select id="schedDevices" multiple size="8"></select>
-            <small>Hold Ctrl/Cmd to select multiple</small>
-          </div>
-          <div class="form-group">
-            <label>Schedule Time</label>
-            <input type="datetime-local" id="schedTime" />
-          </div>
-          <div class="form-group">
-            <label>Repeat</label>
-            <select id="schedRepeat">
-              <option value="">One-time</option>
-              <option value="@hourly">Hourly</option>
-              <option value="@daily">Daily</option>
-              <option value="@weekly">Weekly</option>
-            </select>
-          </div>
-          <div id="schedUpgradeOptions">
-            <div class="form-check">
-              <input type="checkbox" id="schedForce" />
-              <label for="schedForce">Force upgrade</label>
-            </div>
-            <div class="form-check">
-              <input type="checkbox" id="schedFanout" />
-              <label for="schedFanout">Fanout (include connected STAs)</label>
-            </div>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="scheduleJobModal">Cancel</button>
-          <button class="btn btn-primary" id="confirmScheduleJob">Schedule</button>
-        </div>
+        <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="scheduleJobModal" aria-label="Close scheduler">&times;</button>
       </div>
-    `
-    document.body.appendChild(modal)
-    
-    // Populate device list
-    const select = modal.querySelector('#schedDevices')
-    store.devices.forEach(d => {
-      const opt = document.createElement('option')
-      opt.value = d.id
-      opt.textContent = `${d.hostname || d.ip_address} (${d.product || 'Unknown'})`
-      select.appendChild(opt)
-    })
-    
-    // Set default time to now + 1 hour
-    const now = new Date()
-    now.setHours(now.getHours() + 1)
-    now.setMinutes(0)
-    modal.querySelector('#schedTime').value = now.toISOString().slice(0, 16)
-    
-    // Toggle upgrade options
-    modal.querySelector('#schedJobType').addEventListener('change', e => {
-      modal.querySelector('#schedUpgradeOptions').style.display = 
-        e.target.value === 'upgrade' ? 'block' : 'none'
-    })
-    
-    // Handle submit
-    modal.querySelector('#confirmScheduleJob').addEventListener('click', async () => {
-      const jobType = modal.querySelector('#schedJobType').value
-      const deviceSelect = modal.querySelector('#schedDevices')
-      const deviceIds = Array.from(deviceSelect.selectedOptions).map(o => parseInt(o.value))
-      const schedTime = modal.querySelector('#schedTime').value
-      const repeat = modal.querySelector('#schedRepeat').value
-      const force = modal.querySelector('#schedForce').checked
-      const fanout = modal.querySelector('#schedFanout').checked
-      
-      if (deviceIds.length === 0) {
-        showToast('Select at least one device', 'error')
-        return
-      }
-      
-      const params = jobType === 'upgrade' ? { force, fanout } : {}
-      
-      try {
-        await api.createJob(jobType, deviceIds, params, new Date(schedTime).toISOString(), repeat)
-        showToast('Job scheduled', 'success')
-        modal.classList.add('hidden')
-        loadScheduledJobs()
-      } catch (e) {
-        showToast('Failed: ' + e.message, 'error')
-      }
-    })
+      <div class="modal-body">
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Job definition</span><span>Step 1</span></div>
+          <div class="modal-field-grid">
+            <div class="form-group">
+              <label for="schedJobType">Job type</label>
+              <select id="schedJobType">
+                <option value="upgrade">Firmware upgrade</option>
+                <option value="reboot">Device reboot</option>
+              </select>
+              <small class="form-hint">WaveControl uses the appropriate API for each device platform.</small>
+            </div>
+            <div class="form-group">
+              <label for="schedRepeat">Repeat</label>
+              <select id="schedRepeat">
+                <option value="">One-time</option>
+                <option value="@hourly">Hourly</option>
+                <option value="@daily">Daily</option>
+                <option value="@weekly">Weekly</option>
+              </select>
+              <small class="form-hint">Recurring jobs calculate their next run after each execution.</small>
+            </div>
+            <div class="form-group field-span-2">
+              <label for="schedTime">First run time</label>
+              <input type="datetime-local" id="schedTime" required />
+              <small class="form-hint">Shown in this browser’s local timezone and stored as an absolute UTC time.</small>
+            </div>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title">
+            <span>Target devices</span>
+            <span id="schedSelectionCount" class="modal-section-badge">0 selected</span>
+          </div>
+          <div class="modal-select-toolbar">
+            <label class="modal-search-field">
+              <span class="sr-only">Filter devices</span>
+              <input type="search" id="schedDeviceFilter" placeholder="Filter by hostname, IP, product, site, or role" autocomplete="off" />
+            </label>
+            <div class="modal-select-actions">
+              <button type="button" class="btn btn-sm btn-secondary" id="schedSelectVisible">Select visible</button>
+              <button type="button" class="btn btn-sm btn-secondary" id="schedClearDevices">Clear</button>
+            </div>
+          </div>
+          <select id="schedDevices" class="modal-device-select" multiple size="11" aria-describedby="schedDeviceHint"></select>
+          <small id="schedDeviceHint" class="form-hint">Use Shift or Ctrl/Cmd for manual multi-selection. Filtered-out devices keep their selection.</small>
+        </section>
+
+        <section id="schedUpgradeOptions" class="modal-section">
+          <div class="modal-section-title"><span>Upgrade behavior</span><span>Firmware only</span></div>
+          <div class="modal-choice-grid">
+            <label class="modal-choice">
+              <input type="checkbox" id="schedForce" />
+              <span><strong>Force upgrade</strong><small>Run even when the device already reports the selected firmware version.</small></span>
+            </label>
+            <label class="modal-choice">
+              <input type="checkbox" id="schedFanout" />
+              <span><strong>Include connected STAs</strong><small>Expand selected APs to eligible subscriber radios at execution time.</small></span>
+            </label>
+          </div>
+        </section>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-footer-note">Maintenance-window policy is evaluated when the job becomes due.</span>
+        <button type="button" class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="scheduleJobModal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="confirmScheduleJob">Schedule job</button>
+      </div>
+    </div>
+  `
+  document.body.appendChild(modal)
+
+  const deviceSelect = modal.querySelector('#schedDevices')
+  const devices = [...store.devices].sort((a, b) => {
+    const aName = a.hostname || a.ip_address || a.mac || ''
+    const bName = b.hostname || b.ip_address || b.mac || ''
+    return aName.localeCompare(bName, undefined, { numeric: true, sensitivity: 'base' })
+  })
+  devices.forEach(device => {
+    const option = document.createElement('option')
+    const role = device.parent_id ? 'STA' : 'AP'
+    const status = typeof store.getStatus === 'function' ? store.getStatus(device) : (device.status || 'unknown')
+    const name = device.hostname || device.ip_address || device.mac || `Device ${device.id}`
+    const details = [role, status, device.product || 'Unknown product', device.site_name || 'Unassigned'].join(' · ')
+    option.value = String(device.id)
+    option.textContent = `${name} — ${details}`
+    option.dataset.search = [name, device.ip_address, device.mac, device.product, device.site_name, role, status]
+      .filter(Boolean).join(' ').toLowerCase()
+    deviceSelect.appendChild(option)
+  })
+
+  const now = new Date()
+  now.setHours(now.getHours() + 1, 0, 0, 0)
+  const timeInput = modal.querySelector('#schedTime')
+  timeInput.value = toDatetimeLocalValue(now)
+  timeInput.min = toDatetimeLocalValue(new Date())
+
+  const selectionCount = modal.querySelector('#schedSelectionCount')
+  const updateSelectionCount = () => {
+    const count = deviceSelect.selectedOptions.length
+    selectionCount.textContent = `${count} selected`
+    selectionCount.classList.toggle('active', count > 0)
   }
-  
-  modal.classList.remove('hidden')
+  deviceSelect.addEventListener('change', updateSelectionCount)
+
+  const filterInput = modal.querySelector('#schedDeviceFilter')
+  filterInput.addEventListener('input', () => {
+    const query = filterInput.value.trim().toLowerCase()
+    Array.from(deviceSelect.options).forEach(option => {
+      option.hidden = Boolean(query) && !option.dataset.search.includes(query)
+    })
+  })
+  modal.querySelector('#schedSelectVisible').addEventListener('click', () => {
+    Array.from(deviceSelect.options).forEach(option => {
+      if (!option.hidden) option.selected = true
+    })
+    updateSelectionCount()
+  })
+  modal.querySelector('#schedClearDevices').addEventListener('click', () => {
+    Array.from(deviceSelect.options).forEach(option => { option.selected = false })
+    updateSelectionCount()
+  })
+
+  const jobType = modal.querySelector('#schedJobType')
+  const upgradeOptions = modal.querySelector('#schedUpgradeOptions')
+  const syncUpgradeOptions = () => upgradeOptions.classList.toggle('hidden', jobType.value !== 'upgrade')
+  jobType.addEventListener('change', syncUpgradeOptions)
+  syncUpgradeOptions()
+
+  modal.querySelector('#confirmScheduleJob').addEventListener('click', async event => {
+    const button = event.currentTarget
+    const deviceIds = Array.from(deviceSelect.selectedOptions).map(option => Number.parseInt(option.value, 10)).filter(Number.isSafeInteger)
+    if (deviceIds.length === 0) {
+      showToast('Select at least one device', 'error')
+      deviceSelect.focus()
+      return
+    }
+
+    const scheduleValue = timeInput.value
+    const scheduleTime = new Date(scheduleValue)
+    if (!scheduleValue || Number.isNaN(scheduleTime.getTime())) {
+      showToast('Select a valid schedule time', 'error')
+      timeInput.focus()
+      return
+    }
+
+    const selectedType = jobType.value
+    const repeat = modal.querySelector('#schedRepeat').value
+    const params = selectedType === 'upgrade'
+      ? {
+          force: modal.querySelector('#schedForce').checked,
+          fanout: modal.querySelector('#schedFanout').checked
+        }
+      : {}
+
+    button.disabled = true
+    const originalText = button.textContent
+    button.textContent = 'Scheduling…'
+    try {
+      await api.createJob(selectedType, deviceIds, params, scheduleTime.toISOString(), repeat)
+      showToast(`Job scheduled for ${deviceIds.length} device${deviceIds.length === 1 ? '' : 's'}`, 'success')
+      closeModalElement(modal)
+      loadScheduledJobs()
+    } catch (error) {
+      showToast('Failed: ' + error.message, 'error')
+    } finally {
+      button.disabled = false
+      button.textContent = originalText
+    }
+  })
+
+  openModalElement(modal)
 }
 
 // ===== Maintenance Windows =====
 async function loadMaintenanceWindows() {
   const container = document.getElementById('maintenanceList')
   if (!container) return
-  
+
+  container.innerHTML = '<div class="modal-empty modal-empty-compact">Loading maintenance windows…</div>'
   try {
-    const windows = await api.get('/maintenance-windows')
-    
-    if (!windows || windows.length === 0) {
-      container.innerHTML = '<p class="empty-state">No maintenance windows configured. Jobs will run anytime.</p>'
+    const [windowsResult, regionsResult, sitesResult] = await Promise.all([
+      api.get('/maintenance-windows'),
+      api.regions(),
+      api.sites()
+    ])
+    const windows = Array.isArray(windowsResult) ? windowsResult : []
+    const regions = Array.isArray(regionsResult) ? regionsResult : []
+    const sites = Array.isArray(sitesResult) ? sitesResult : []
+    const regionNames = new Map(regions.map(region => [Number(region.id), region.name]))
+    const siteNames = new Map(sites.map(site => [Number(site.id), site.name]))
+    window.__maintenanceWindowsById = new Map(windows.map(windowItem => [Number(windowItem.id), windowItem]))
+
+    if (windows.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state scheduler-empty-state">
+          <strong>No maintenance windows configured</strong>
+          <p>Jobs may run whenever they become due unless another scheduler policy blocks them.</p>
+        </div>
+      `
       return
     }
-    
+
     const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-    
+    const scopeLabel = mw => {
+      if (mw.scope === 'region') return `Region · ${regionNames.get(Number(mw.region_id)) || `#${mw.region_id}`}`
+      if (mw.scope === 'site') return `Site · ${siteNames.get(Number(mw.site_id)) || `#${mw.site_id}`}`
+      return 'Global · all devices'
+    }
+
     container.innerHTML = `
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Scope</th>
-            <th>Days</th>
-            <th>Time</th>
-            <th>Job Types</th>
-            <th>Status</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${windows.map(mw => `
+      <div class="table-responsive maintenance-table-wrap">
+        <table class="data-table maintenance-table">
+          <thead>
             <tr>
-              <td>${escapeHTML(mw.name)}</td>
-              <td>${escapeHTML(mw.scope)}${mw.region_id ? ' (Region ' + mw.region_id + ')' : ''}${mw.site_id ? ' (Site ' + mw.site_id + ')' : ''}</td>
-              <td>${mw.day_of_week?.length ? mw.day_of_week.map(d => dayNames[d]).join(', ') : 'Any'}</td>
-              <td>${escapeHTML(mw.start_time)} - ${escapeHTML(mw.end_time)} ${escapeHTML(mw.timezone)}</td>
-              <td>${mw.allow_jobs?.join(', ') || 'All'}</td>
-              <td><span class="badge ${mw.enabled ? 'success' : 'muted'}">${mw.enabled ? 'Active' : 'Disabled'}</span></td>
-              <td>
-                <button class="btn btn-sm btn-edit-mw" data-id="${mw.id}">Edit</button>
-                <button class="btn btn-sm btn-danger-subtle btn-delete-mw" data-id="${mw.id}" title="Delete">🗑</button>
-              </td>
+              <th>Window</th>
+              <th>Scope</th>
+              <th>Schedule</th>
+              <th>Allowed jobs</th>
+              <th>Status</th>
+              <th class="table-actions-column">Actions</th>
             </tr>
-          `).join('')}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            ${windows.map(mw => {
+              const days = Array.isArray(mw.day_of_week) && mw.day_of_week.length
+                ? mw.day_of_week.map(day => dayNames[Number(day)] || String(day)).join(', ')
+                : 'Every day'
+              const jobs = Array.isArray(mw.allow_jobs) && mw.allow_jobs.length
+                ? mw.allow_jobs.map(job => String(job).replaceAll('_', ' ')).join(', ')
+                : 'All scheduler jobs'
+              const start = String(mw.start_time || '').slice(0, 5)
+              const end = String(mw.end_time || '').slice(0, 5)
+              return `
+                <tr>
+                  <td>
+                    <strong>${escapeHTML(mw.name || `Window #${mw.id}`)}</strong>
+                    <small class="table-secondary">Created ${mw.created_at ? escapeHTML(new Date(mw.created_at).toLocaleDateString()) : 'date unavailable'}</small>
+                  </td>
+                  <td>${escapeHTML(scopeLabel(mw))}</td>
+                  <td>
+                    <strong>${escapeHTML(days)}</strong>
+                    <small class="table-secondary">${escapeHTML(start)}–${escapeHTML(end)} · ${escapeHTML(mw.timezone || 'UTC')}</small>
+                  </td>
+                  <td>${escapeHTML(jobs)}</td>
+                  <td><span class="maintenance-status ${mw.enabled ? 'enabled' : 'disabled'}">${mw.enabled ? 'Active' : 'Disabled'}</span></td>
+                  <td class="table-actions">
+                    <button type="button" class="btn btn-sm btn-secondary btn-edit-mw" data-id="${escapeAttr(mw.id)}">Edit</button>
+                    <button type="button" class="btn btn-sm btn-danger-subtle btn-delete-mw" data-id="${escapeAttr(mw.id)}">Delete</button>
+                  </td>
+                </tr>
+              `
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
     `
-    
-    // Delete handlers
-    container.querySelectorAll('.btn-delete-mw').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        if (!confirm('Delete this maintenance window?')) return
+
+    container.querySelectorAll('.btn-edit-mw').forEach(button => {
+      button.addEventListener('click', () => {
+        const maintenanceWindow = window.__maintenanceWindowsById?.get(Number(button.dataset.id))
+        if (maintenanceWindow) showMaintenanceWindowModal(maintenanceWindow)
+      })
+    })
+
+    container.querySelectorAll('.btn-delete-mw').forEach(button => {
+      button.addEventListener('click', async () => {
+        const maintenanceWindow = window.__maintenanceWindowsById?.get(Number(button.dataset.id))
+        const name = maintenanceWindow?.name || `window #${button.dataset.id}`
+        const confirmed = await showConfirmDialog(
+          `The scheduler will stop using “${name}” when deciding whether jobs may run.`,
+          {
+            title: 'Delete maintenance window?',
+            eyebrow: 'Scheduler policy',
+            confirmText: 'Delete window',
+            tone: 'danger',
+            calloutTitle: 'Jobs may become eligible at times previously blocked by this window.'
+          }
+        )
+        if (!confirmed) return
         try {
-          await api.delete('/maintenance-windows/' + btn.dataset.id)
+          await api.delete('/maintenance-windows/' + button.dataset.id)
           showToast('Maintenance window deleted', 'success')
-          loadMaintenanceWindows()
-        } catch (e) {
-          showToast('Failed: ' + e.message, 'error')
+          await loadMaintenanceWindows()
+        } catch (error) {
+          showToast('Failed: ' + error.message, 'error')
         }
       })
     })
-    
-  } catch (e) {
-    container.innerHTML = `<p class="error">Error: ${escapeHTML(e.message)}</p>`
+  } catch (error) {
+    container.innerHTML = `<div class="error-state"><strong>Maintenance windows could not be loaded.</strong><p>${escapeHTML(error.message)}</p></div>`
   }
 }
 
-function showMaintenanceWindowModal(editData = null) {
-  let modal = document.getElementById('maintenanceModal')
-  if (!modal) {
-    modal = document.createElement('div')
-    modal.id = 'maintenanceModal'
-    modal.className = 'modal'
-    modal.innerHTML = `
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>${editData ? 'Edit' : 'Add'} Maintenance Window</h3>
-          <button class="modal-close" data-wc-action="close-modal" data-modal-id="maintenanceModal">&times;</button>
+async function showMaintenanceWindowModal(editData = null) {
+  document.getElementById('maintenanceModal')?.remove()
+
+  const editing = Boolean(editData?.id)
+  const modal = document.createElement('div')
+  modal.id = 'maintenanceModal'
+  modal.className = 'modal hidden'
+  modal.innerHTML = `
+    <div class="modal-content modal-large maintenance-modal-shell">
+      <div class="modal-header">
+        <div class="modal-heading">
+          <span class="modal-eyebrow">Scheduler policy</span>
+          <h3>${editing ? 'Edit maintenance window' : 'Add maintenance window'}</h3>
+          <p class="modal-subtitle">Define when scheduled device work is allowed for the whole fleet, a region, or one site.</p>
         </div>
-        <div class="modal-body">
-          <div class="form-group">
-            <label>Name</label>
-            <input type="text" id="mwName" placeholder="e.g., Nightly Maintenance" />
-          </div>
-          <div class="form-group">
-            <label>Scope</label>
-            <select id="mwScope">
-              <option value="global">Global (all devices)</option>
-              <option value="region">Region</option>
-              <option value="site">Site</option>
-            </select>
-          </div>
-          <div class="form-group hidden" id="mwRegionGroup">
-            <label>Region</label>
-            <select id="mwRegion"></select>
-          </div>
-          <div class="form-group hidden" id="mwSiteGroup">
-            <label>Site</label>
-            <select id="mwSite"></select>
-          </div>
-          <div class="form-group">
-            <label>Days of Week</label>
-            <div class="day-picker" id="mwDays">
-              <label><input type="checkbox" value="0" /> Sun</label>
-              <label><input type="checkbox" value="1" /> Mon</label>
-              <label><input type="checkbox" value="2" /> Tue</label>
-              <label><input type="checkbox" value="3" /> Wed</label>
-              <label><input type="checkbox" value="4" /> Thu</label>
-              <label><input type="checkbox" value="5" /> Fri</label>
-              <label><input type="checkbox" value="6" /> Sat</label>
-            </div>
-            <small>Leave unchecked for all days</small>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>Start Time</label>
-              <input type="time" id="mwStartTime" value="02:00" />
+        <button type="button" class="modal-close" data-wc-action="close-modal" data-modal-id="maintenanceModal" aria-label="Close maintenance window editor">&times;</button>
+      </div>
+      <div class="modal-body">
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Identity and scope</span><span>Step 1</span></div>
+          <div class="modal-field-grid">
+            <div class="form-group field-span-2">
+              <label for="mwName">Window name</label>
+              <input type="text" id="mwName" placeholder="Nightly network maintenance" autocomplete="off" required />
             </div>
             <div class="form-group">
-              <label>End Time</label>
-              <input type="time" id="mwEndTime" value="06:00" />
-            </div>
-            <div class="form-group">
-              <label>Timezone</label>
-              <select id="mwTimezone">
-                <option value="UTC">UTC</option>
-                <option value="America/New_York">Eastern</option>
-                <option value="America/Chicago">Central</option>
-                <option value="America/Denver">Mountain</option>
-                <option value="America/Los_Angeles">Pacific</option>
+              <label for="mwScope">Scope</label>
+              <select id="mwScope">
+                <option value="global">Global · all devices</option>
+                <option value="region">One region</option>
+                <option value="site">One site</option>
               </select>
             </div>
-          </div>
-          <div class="form-group">
-            <label>Allowed Job Types</label>
-            <div class="job-type-picker">
-              <label><input type="checkbox" id="mwAllowUpgrade" checked /> Upgrade</label>
-              <label><input type="checkbox" id="mwAllowReboot" checked /> Reboot</label>
+            <div class="form-group hidden" id="mwRegionGroup">
+              <label for="mwRegion">Region</label>
+              <select id="mwRegion" disabled><option value="">Loading regions…</option></select>
+            </div>
+            <div class="form-group hidden" id="mwSiteGroup">
+              <label for="mwSite">Site</label>
+              <select id="mwSite" disabled><option value="">Loading sites…</option></select>
             </div>
           </div>
-          <div class="form-check">
-            <input type="checkbox" id="mwEnabled" checked />
-            <label for="mwEnabled">Enabled</label>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Allowed time</span><span>Step 2</span></div>
+          <div class="form-group">
+            <label>Days of week</label>
+            <div class="day-picker" id="mwDays">
+              ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day, index) => `
+                <label><input type="checkbox" value="${index}" /><span>${day}</span></label>
+              `).join('')}
+            </div>
+            <small class="form-hint">Leave every day unchecked to allow the window every day.</small>
           </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="maintenanceModal">Cancel</button>
-          <button class="btn btn-primary" id="saveMaintenance">Save</button>
-        </div>
+          <div class="modal-field-grid maintenance-time-grid">
+            <div class="form-group">
+              <label for="mwStartTime">Start time</label>
+              <input type="time" id="mwStartTime" value="02:00" required />
+            </div>
+            <div class="form-group">
+              <label for="mwEndTime">End time</label>
+              <input type="time" id="mwEndTime" value="06:00" required />
+            </div>
+            <div class="form-group field-span-2">
+              <label for="mwTimezone">Timezone</label>
+              <select id="mwTimezone">
+                <option value="UTC">UTC</option>
+                <option value="America/New_York">Eastern · America/New_York</option>
+                <option value="America/Chicago">Central · America/Chicago</option>
+                <option value="America/Denver">Mountain · America/Denver</option>
+                <option value="America/Los_Angeles">Pacific · America/Los_Angeles</option>
+              </select>
+              <small class="form-hint">A window may cross midnight; for example, 22:00–04:00.</small>
+            </div>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="modal-section-title"><span>Job policy</span><span>Step 3</span></div>
+          <div class="modal-choice-grid job-type-picker">
+            <label class="modal-choice">
+              <input type="checkbox" id="mwAllowUpgrade" checked />
+              <span><strong>Firmware upgrades</strong><small>Allow scheduled firmware work during this window.</small></span>
+            </label>
+            <label class="modal-choice">
+              <input type="checkbox" id="mwAllowReboot" checked />
+              <span><strong>Device reboots</strong><small>Allow scheduled reboot jobs during this window.</small></span>
+            </label>
+          </div>
+          <label class="modal-choice maintenance-enabled-choice">
+            <input type="checkbox" id="mwEnabled" checked />
+            <span><strong>Window enabled</strong><small>Disabled windows remain saved but are ignored by the scheduler.</small></span>
+          </label>
+        </section>
       </div>
-    `
-    document.body.appendChild(modal)
-    
-    // Scope change handler
-    document.getElementById('mwScope').addEventListener('change', (e) => {
-      document.getElementById('mwRegionGroup').classList.toggle('hidden', e.target.value !== 'region')
-      document.getElementById('mwSiteGroup').classList.toggle('hidden', e.target.value !== 'site')
-    })
-    
-    // Save handler
-    document.getElementById('saveMaintenance').addEventListener('click', async () => {
-      const days = []
-      document.querySelectorAll('#mwDays input:checked').forEach(cb => days.push(parseInt(cb.value)))
-      
-      const allowJobs = []
-      if (document.getElementById('mwAllowUpgrade').checked) allowJobs.push('upgrade')
-      if (document.getElementById('mwAllowReboot').checked) allowJobs.push('reboot')
-      
-      const data = {
-        name: document.getElementById('mwName').value,
-        scope: document.getElementById('mwScope').value,
-        region_id: document.getElementById('mwScope').value === 'region' ? parseInt(document.getElementById('mwRegion').value) : null,
-        site_id: document.getElementById('mwScope').value === 'site' ? parseInt(document.getElementById('mwSite').value) : null,
-        day_of_week: days,
-        start_time: document.getElementById('mwStartTime').value,
-        end_time: document.getElementById('mwEndTime').value,
-        timezone: document.getElementById('mwTimezone').value,
-        allow_jobs: allowJobs,
-        enabled: document.getElementById('mwEnabled').checked
-      }
-      
-      try {
-        await api.post('/maintenance-windows', data)
-        showToast('Maintenance window saved', 'success')
-        modal.classList.add('hidden')
-        loadMaintenanceWindows()
-      } catch (e) {
-        showToast('Failed: ' + e.message, 'error')
-      }
-    })
+      <div class="modal-footer">
+        <span class="modal-footer-note">Changes apply to jobs when the scheduler next checks eligibility.</span>
+        <button type="button" class="btn btn-secondary" data-wc-action="close-modal" data-modal-id="maintenanceModal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="saveMaintenance">${editing ? 'Save changes' : 'Create window'}</button>
+      </div>
+    </div>
+  `
+  document.body.appendChild(modal)
+  openModalElement(modal)
+
+  const scopeSelect = modal.querySelector('#mwScope')
+  const regionGroup = modal.querySelector('#mwRegionGroup')
+  const siteGroup = modal.querySelector('#mwSiteGroup')
+  const syncScope = () => {
+    regionGroup.classList.toggle('hidden', scopeSelect.value !== 'region')
+    siteGroup.classList.toggle('hidden', scopeSelect.value !== 'site')
   }
-  
-  modal.classList.remove('hidden')
+  scopeSelect.addEventListener('change', syncScope)
+
+  try {
+    const [regionsResult, sitesResult] = await Promise.all([api.regions(), api.sites()])
+    const regions = Array.isArray(regionsResult) ? regionsResult : []
+    const sites = Array.isArray(sitesResult) ? sitesResult : []
+    const regionSelect = modal.querySelector('#mwRegion')
+    const siteSelect = modal.querySelector('#mwSite')
+    regionSelect.innerHTML = regions.length
+      ? regions.map(region => `<option value="${escapeAttr(region.id)}">${escapeHTML(region.name)}</option>`).join('')
+      : '<option value="">No regions configured</option>'
+    siteSelect.innerHTML = sites.length
+      ? sites.map(site => `<option value="${escapeAttr(site.id)}">${escapeHTML(site.name)}${site.region_name ? ` · ${escapeHTML(site.region_name)}` : ''}</option>`).join('')
+      : '<option value="">No sites configured</option>'
+    regionSelect.disabled = regions.length === 0
+    siteSelect.disabled = sites.length === 0
+
+    if (editData) {
+      modal.querySelector('#mwName').value = editData.name || ''
+      scopeSelect.value = editData.scope || 'global'
+      if (editData.region_id != null) regionSelect.value = String(editData.region_id)
+      if (editData.site_id != null) siteSelect.value = String(editData.site_id)
+      const selectedDays = new Set((editData.day_of_week || []).map(Number))
+      modal.querySelectorAll('#mwDays input').forEach(input => { input.checked = selectedDays.has(Number(input.value)) })
+      modal.querySelector('#mwStartTime').value = String(editData.start_time || '02:00').slice(0, 5)
+      modal.querySelector('#mwEndTime').value = String(editData.end_time || '06:00').slice(0, 5)
+      const timezone = editData.timezone || 'UTC'
+      const timezoneSelect = modal.querySelector('#mwTimezone')
+      if (!Array.from(timezoneSelect.options).some(option => option.value === timezone)) {
+        timezoneSelect.append(new Option(timezone, timezone))
+      }
+      timezoneSelect.value = timezone
+      const allowed = new Set(editData.allow_jobs || [])
+      modal.querySelector('#mwAllowUpgrade').checked = allowed.has('upgrade')
+      modal.querySelector('#mwAllowReboot').checked = allowed.has('reboot')
+      modal.querySelector('#mwEnabled').checked = Boolean(editData.enabled)
+    }
+    syncScope()
+  } catch (error) {
+    showToast('Regions and sites could not be loaded: ' + error.message, 'error')
+    syncScope()
+  }
+
+  modal.querySelector('#saveMaintenance').addEventListener('click', async event => {
+    const button = event.currentTarget
+    const name = modal.querySelector('#mwName').value.trim()
+    const scope = scopeSelect.value
+    const startTime = modal.querySelector('#mwStartTime').value
+    const endTime = modal.querySelector('#mwEndTime').value
+    if (!name) {
+      showToast('Enter a maintenance-window name', 'error')
+      modal.querySelector('#mwName').focus()
+      return
+    }
+    if (!startTime || !endTime) {
+      showToast('Enter both start and end times', 'error')
+      return
+    }
+
+    const regionValue = modal.querySelector('#mwRegion').value
+    const siteValue = modal.querySelector('#mwSite').value
+    if (scope === 'region' && !regionValue) {
+      showToast('Select a region', 'error')
+      return
+    }
+    if (scope === 'site' && !siteValue) {
+      showToast('Select a site', 'error')
+      return
+    }
+
+    const days = Array.from(modal.querySelectorAll('#mwDays input:checked')).map(input => Number(input.value))
+    const allowJobs = []
+    if (modal.querySelector('#mwAllowUpgrade').checked) allowJobs.push('upgrade')
+    if (modal.querySelector('#mwAllowReboot').checked) allowJobs.push('reboot')
+    const payload = {
+      name,
+      scope,
+      region_id: scope === 'region' ? Number(regionValue) : null,
+      site_id: scope === 'site' ? Number(siteValue) : null,
+      day_of_week: days,
+      start_time: startTime,
+      end_time: endTime,
+      timezone: modal.querySelector('#mwTimezone').value,
+      allow_jobs: allowJobs,
+      enabled: modal.querySelector('#mwEnabled').checked
+    }
+
+    button.disabled = true
+    const originalText = button.textContent
+    button.textContent = editing ? 'Saving…' : 'Creating…'
+    try {
+      if (editing) {
+        await api.patch(`/maintenance-windows/${editData.id}`, payload)
+      } else {
+        await api.post('/maintenance-windows', payload)
+      }
+      showToast(editing ? 'Maintenance window updated' : 'Maintenance window created', 'success')
+      closeModalElement(modal)
+      await loadMaintenanceWindows()
+    } catch (error) {
+      showToast('Failed: ' + error.message, 'error')
+    } finally {
+      button.disabled = false
+      button.textContent = originalText
+    }
+  })
 }
 
 // ===== Scheduler Settings =====

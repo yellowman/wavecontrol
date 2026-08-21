@@ -526,8 +526,13 @@ export const api = {
     return request('POST', '/reports/generate', { type, ...options })
   },
   
-  async listReports() {
-    return request('GET', '/reports')
+  async listReports(options = {}) {
+    const params = new URLSearchParams()
+    const limit = Number.parseInt(options.limit, 10)
+    if (Number.isSafeInteger(limit) && limit > 0) params.set('limit', String(Math.min(limit, 200)))
+    if (options.type) params.set('type', String(options.type))
+    const query = params.toString()
+    return request('GET', `/reports${query ? `?${query}` : ''}`)
   },
   
   async getReport(reportId) {

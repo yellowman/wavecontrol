@@ -4245,28 +4245,31 @@ func (a *API) GenerateReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Type == "" {
-		req.Type = "health"
+	reportType, ok := normalizeReportType(req.Type)
+	if !ok {
+		http.Error(w, "unsupported report type", http.StatusBadRequest)
+		return
 	}
 
-	// Count devices
 	var deviceCount int
-	a.DB.QueryRow(`SELECT COUNT(*) FROM devices`).Scan(&deviceCount)
+	if err := a.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM devices`).Scan(&deviceCount); err != nil {
+		http.Error(w, "device count failed", http.StatusInternalServerError)
+		return
+	}
 
-	// Generate report data
-	reportData, err := a.generateReportData(req.Type)
+	reportData, err := a.generateReportData(r.Context(), reportType)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Store report
 	var reportID int
-	err = a.DB.QueryRow(`
+	err = a.DB.QueryRowContext(r.Context(), `
 		INSERT INTO reports (type, data, device_count, created_by)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id
-	`, req.Type, reportData, deviceCount, claims.UserID).Scan(&reportID)
+	`, reportType, reportData, deviceCount, claims.UserID).Scan(&reportID)
 	if err != nil {
 		http.Error(w, "save failed: "+err.Error(), 500)
 		return
@@ -4274,679 +4277,65 @@ func (a *API) GenerateReport(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, map[string]any{
 		"report_id":    reportID,
-		"type":         req.Type,
+		"type":         reportType,
 		"device_count": deviceCount,
 	})
 }
 
-func (a *API) generateReportData(reportType string) ([]byte, error) {
+func (a *API) generateReportData(ctx context.Context, reportType string) ([]byte, error) {
 	var data map[string]any
 
 	switch reportType {
 	case "health":
-		// Get counts from stats store (tri-state: online/offline/unknown)
-		online, offline, unknown, total := a.Stats.CountsByStatus()
-
-		// Fallback to database counts if stats store is empty
-		if total == 0 {
-			a.DB.QueryRow(`SELECT 
-				COUNT(*) FILTER (WHERE status = 'online'),
-				COUNT(*) FILTER (WHERE status = 'offline'),
-				COUNT(*) FILTER (WHERE status = 'unknown'),
-				COUNT(*)
-				FROM devices`).Scan(&online, &offline, &unknown, &total)
+		built, err := a.buildHealthReport(ctx)
+		if err != nil {
+			return nil, err
 		}
-
-		// Count APs and STAs
-		var apCount, staCount, apOnline, staOnline int
-		a.DB.QueryRow(`SELECT 
-			COUNT(*) FILTER (WHERE parent_id IS NULL),
-			COUNT(*) FILTER (WHERE parent_id IS NOT NULL),
-			COUNT(*) FILTER (WHERE parent_id IS NULL AND status = 'online'),
-			COUNT(*) FILTER (WHERE parent_id IS NOT NULL AND status = 'online')
-			FROM devices`).Scan(&apCount, &staCount, &apOnline, &staOnline)
-
-		// Get signal quality distribution from stats
-		allStats := a.Stats.List()
-		var goodSignal, fairSignal, poorSignal, noSignal int
-		var highCPU, highMem, highTemp int
-		var offlineDevices []map[string]any
-		var poorSignalDevices []map[string]any
-		var highCPUDevices []map[string]any
-
-		// Get device info from DB for enrichment (keyed by MAC)
-		deviceInfoByMAC := make(map[string]map[string]any)
-		rows, err := a.DB.Query(`
-			SELECT d.mac, host(d.ip_address), d.hostname, d.product, d.parent_id, s.name, d.status
-			FROM devices d
-			LEFT JOIN sites s ON d.site_id = s.id
-		`)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var mac, ip, hostname, product, siteName, status sql.NullString
-				var parentID sql.NullInt64
-				if rows.Scan(&mac, &ip, &hostname, &product, &parentID, &siteName, &status) == nil {
-					deviceInfoByMAC[strings.ToLower(mac.String)] = map[string]any{
-						"ip":       ip.String,
-						"hostname": hostname.String,
-						"product":  product.String,
-						"site":     siteName.String,
-						"is_sta":   parentID.Valid,
-						"status":   status.String,
-					}
-				}
-			}
-		}
-
-		// Analyze stats for signal quality and system health
-		for _, s := range allStats {
-			// MAC is authoritative
-			if s.MAC == "" {
-				continue
-			}
-			info := deviceInfoByMAC[strings.ToLower(s.MAC)]
-			if info == nil {
-				continue
-			}
-
-			isSTA, _ := info["is_sta"].(bool)
-			hostname, _ := info["hostname"].(string)
-			if hostname == "" {
-				hostname = s.IP
-			}
-			site, _ := info["site"].(string)
-
-			// Signal quality (STAs only)
-			if isSTA {
-				signal := 0
-				if s.Wireless.Radio60GHz != nil {
-					signal = s.Wireless.Radio60GHz.Signal
-				} else if s.Wireless.Radio5GHz != nil {
-					signal = s.Wireless.Radio5GHz.Signal
-				}
-
-				if signal == 0 || signal <= -100 {
-					noSignal++
-				} else if signal > -62 {
-					goodSignal++
-				} else if signal > -70 {
-					fairSignal++
-				} else {
-					poorSignal++
-					if len(poorSignalDevices) < 25 {
-						poorSignalDevices = append(poorSignalDevices, map[string]any{
-							"hostname": hostname,
-							"ip":       s.IP,
-							"site":     site,
-							"signal":   signal,
-						})
-					}
-				}
-			}
-
-			// System health (high CPU/memory/temp)
-			cpuUsage := 0
-			if len(s.CPU) > 0 {
-				cpuUsage = s.CPU[0].Usage
-			}
-			memUsage := s.RAM.Usage
-
-			if cpuUsage > 80 {
-				highCPU++
-				if len(highCPUDevices) < 25 {
-					highCPUDevices = append(highCPUDevices, map[string]any{
-						"hostname": hostname,
-						"ip":       s.IP,
-						"site":     site,
-						"cpu":      cpuUsage,
-					})
-				}
-			}
-			if memUsage > 80 {
-				highMem++
-			}
-			if s.Temperature.CPU > 70 {
-				highTemp++
-			}
-		}
-
-		// Get offline devices from memory store (no DB query needed)
-		offlineStats := a.Stats.OfflineDevices()
-		for _, s := range offlineStats {
-			if len(offlineDevices) >= 25 {
-				break
-			}
-			hostname := s.Hostname
-			if hostname == "" {
-				hostname = s.IP
-			}
-			// Enrich with site info from deviceInfoByMAC
-			site := ""
-			if info := deviceInfoByMAC[strings.ToLower(s.MAC)]; info != nil {
-				if sn, ok := info["site"].(string); ok {
-					site = sn
-				}
-				if hostname == "" || hostname == s.IP {
-					if hn, ok := info["hostname"].(string); ok && hn != "" {
-						hostname = hn
-					}
-				}
-			}
-			offlineDevices = append(offlineDevices, map[string]any{
-				"hostname":  hostname,
-				"ip":        s.IP,
-				"site":      site,
-				"last_seen": s.LastSeen,
-			})
-		}
-
-		// Get firmware distribution
-		firmwareDistribution := make(map[string]int)
-		fwRows, err := a.DB.Query(`
-			SELECT COALESCE(firmware, 'Unknown'), COUNT(*)
-			FROM devices
-			GROUP BY firmware
-			ORDER BY COUNT(*) DESC
-		`)
-		if err == nil {
-			defer fwRows.Close()
-			for fwRows.Next() {
-				var fw string
-				var count int
-				if fwRows.Scan(&fw, &count) == nil {
-					firmwareDistribution[fw] = count
-				}
-			}
-		}
-
-		// Get stability stats
-		stabilityStats := a.Stats.GetStabilityStats()
-		flappingDevices := make([]map[string]any, 0)
-		rebootingDevices := make([]map[string]any, 0)
-		totalFlaps1h := 0
-		totalFlaps24h := 0
-		totalReboots1h := 0
-		totalReboots24h := 0
-
-		for _, st := range stabilityStats {
-			totalFlaps1h += st.Flaps1h
-			totalFlaps24h += st.Flaps24h
-			totalReboots1h += st.Reboots1h
-			totalReboots24h += st.Reboots24h
-
-			if st.Flaps1h > 0 && len(flappingDevices) < 25 {
-				flappingDevices = append(flappingDevices, map[string]any{
-					"hostname":  st.Hostname,
-					"ip":        st.IP,
-					"flaps_1h":  st.Flaps1h,
-					"flaps_24h": st.Flaps24h,
-				})
-			}
-			if st.Reboots1h > 0 && len(rebootingDevices) < 25 {
-				rebootingDevices = append(rebootingDevices, map[string]any{
-					"hostname":    st.Hostname,
-					"ip":          st.IP,
-					"reboots_1h":  st.Reboots1h,
-					"reboots_24h": st.Reboots24h,
-				})
-			}
-		}
-
-		data = map[string]any{
-			"summary": map[string]any{
-				"total":      total,
-				"online":     online,
-				"offline":    offline,
-				"unknown":    unknown,
-				"uptime":     float64(online) / float64(max(total, 1)) * 100,
-				"ap_count":   apCount,
-				"sta_count":  staCount,
-				"ap_online":  apOnline,
-				"sta_online": staOnline,
-			},
-			"link_quality": map[string]any{
-				"good":      goodSignal,
-				"fair":      fairSignal,
-				"poor":      poorSignal,
-				"no_signal": noSignal,
-			},
-			"system_health": map[string]any{
-				"high_cpu":  highCPU,
-				"high_mem":  highMem,
-				"high_temp": highTemp,
-			},
-			"stability": map[string]any{
-				"flaps_1h":    totalFlaps1h,
-				"flaps_24h":   totalFlaps24h,
-				"reboots_1h":  totalReboots1h,
-				"reboots_24h": totalReboots24h,
-			},
-			"firmware_distribution": firmwareDistribution,
-			"top_offenders": map[string]any{
-				"offline":     offlineDevices,
-				"poor_signal": poorSignalDevices,
-				"high_cpu":    highCPUDevices,
-				"flapping":    flappingDevices,
-				"rebooting":   rebootingDevices,
-			},
-			"generated_at": time.Now(),
-		}
+		data = built
 	case "inventory":
-		rows, err := a.DB.Query(`
-			SELECT d.hostname, host(d.ip_address), d.mac, d.product, d.firmware, d.flavor, d.status, d.platform,
-			       d.parent_id, p.hostname as parent_hostname, host(p.ip_address) as parent_ip,
-			       r.name as region, s.name as site
-			FROM devices d
-			LEFT JOIN devices p ON d.parent_id = p.id
-			LEFT JOIN sites s ON d.site_id = s.id
-			LEFT JOIN regions r ON s.region_id = r.id
-			ORDER BY d.hostname
-		`)
+		built, err := a.buildInventoryReport(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("inventory query failed: %w", err)
+			return nil, err
 		}
-		defer rows.Close()
-		var devices []map[string]any
-		for rows.Next() {
-			var hostname, ip, mac, product, firmware, flavor, status, platform sql.NullString
-			var parentID sql.NullInt64
-			var parentHostname, parentIP, region, site sql.NullString
-			if err := rows.Scan(&hostname, &ip, &mac, &product, &firmware, &flavor, &status, &platform,
-				&parentID, &parentHostname, &parentIP, &region, &site); err != nil {
-				continue
-			}
-			dev := map[string]any{
-				"hostname": hostname.String,
-				"ip":       ip.String,
-				"mac":      mac.String,
-				"product":  product.String,
-				"firmware": firmware.String,
-				"flavor":   flavor.String,
-				"status":   status.String,
-				"platform": platform.String,
-				"region":   region.String,
-				"site":     site.String,
-				"is_sta":   parentID.Valid,
-			}
-			if parentID.Valid {
-				dev["parent_hostname"] = parentHostname.String
-				dev["parent_ip"] = parentIP.String
-			}
-			devices = append(devices, dev)
-		}
-		data = map[string]any{
-			"devices":      devices,
-			"generated_at": time.Now(),
-		}
+		data = built
 	case "performance":
-		// Get per-device performance from stats with device info from DB
-		allStats := a.Stats.List()
-
-		// Get device info from database keyed by MAC (authoritative identifier)
-		deviceInfoByMAC := make(map[string]map[string]any)
-		parentHostnames := make(map[int]string) // id -> hostname for parent lookup
-		rows, err := a.DB.Query(`
-			SELECT d.id, d.mac, host(d.ip_address), d.hostname, d.product, d.flavor, d.parent_id, s.name
-			FROM devices d
-			LEFT JOIN sites s ON d.site_id = s.id
-		`)
+		built, err := a.buildPerformanceReport(ctx)
 		if err != nil {
-			log.Printf("Performance report: device query failed: %v", err)
+			return nil, err
 		}
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var id int
-				var mac, ip, hostname, product, flavor, siteName sql.NullString
-				var parentID sql.NullInt64
-				if rows.Scan(&id, &mac, &ip, &hostname, &product, &flavor, &parentID, &siteName) == nil {
-					// Normalize MAC to lowercase for matching with stats store
-					normalizedMAC := strings.ToLower(mac.String)
-					deviceInfoByMAC[normalizedMAC] = map[string]any{
-						"id":        id,
-						"hostname":  hostname.String,
-						"ip":        ip.String,
-						"product":   product.String,
-						"flavor":    flavor.String,
-						"site":      siteName.String,
-						"is_sta":    parentID.Valid,
-						"parent_id": parentID.Int64,
-					}
-					parentHostnames[id] = hostname.String
-				}
-			}
-		}
-
-		var totalTx, totalRx int64
-		var apTx, apRx, staTx, staRx int64
-		var signalSum, signalCount int
-		var apDevices []map[string]any
-		var staDevices []map[string]any
-
-		// Signal quality counts (STAs only)
-		var goodSignal, fairSignal, poorSignal int
-
-		// Track per-AP client stats
-		apClientCounts := make(map[int]int)
-		apPoorClients := make(map[int]int)
-
-		// Platform-specific stats (must be outside loop)
-		platformStats := make(map[string]map[string]int64)
-		platformCounts := make(map[string]map[string]int)
-		platformSignal := make(map[string]map[string]int64) // sum and count for avg
-		initPlatform := func(p string) {
-			if platformStats[p] == nil {
-				platformStats[p] = map[string]int64{"tx": 0, "rx": 0}
-				platformCounts[p] = map[string]int{"ap": 0, "sta": 0, "good": 0, "fair": 0, "poor": 0}
-				platformSignal[p] = map[string]int64{"sum": 0, "count": 0}
-			}
-		}
-
-		// Helper to classify platform from flavor
-		getPlatformType := func(flavor string) string {
-			flavor = strings.ToUpper(flavor)
-			switch {
-			case strings.HasPrefix(flavor, "GMC") || strings.HasPrefix(flavor, "GMP") ||
-				strings.HasPrefix(flavor, "MGMP") || strings.HasPrefix(flavor, "GP"):
-				return "wave60"
-			case strings.HasPrefix(flavor, "MW"):
-				return "wavemlo"
-			case strings.HasPrefix(flavor, "AFLTU") || strings.HasPrefix(flavor, "AF5XHD"):
-				return "ltu"
-			case strings.HasPrefix(flavor, "XC") || strings.HasPrefix(flavor, "2XC") ||
-				strings.HasPrefix(flavor, "WA") || strings.HasPrefix(flavor, "2WA"):
-				return "airmaxac"
-			case strings.HasPrefix(flavor, "XM") || strings.HasPrefix(flavor, "XW"):
-				return "airmaxm"
-			case strings.HasPrefix(flavor, "AF11"):
-				return "af11"
-			case strings.HasPrefix(flavor, "AF24"):
-				return "af24"
-			case strings.HasPrefix(flavor, "AF2") || strings.HasPrefix(flavor, "AF3"):
-				return "af2x"
-			case strings.HasPrefix(flavor, "AF5"):
-				return "af5x"
-			default:
-				return "other"
-			}
-		}
-
-		// Only include devices that exist in the database (lookup by MAC)
-		for _, s := range allStats {
-			// MAC is authoritative - skip devices without MAC
-			if s.MAC == "" {
-				continue
-			}
-
-			// Normalize MAC for lookup (map keys are lowercase)
-			normalizedMAC := strings.ToLower(s.MAC)
-			info := deviceInfoByMAC[normalizedMAC]
-
-			// Skip stats entries for devices not in database
-			if info == nil {
-				continue
-			}
-
-			ip := s.IP
-			hostname := s.Hostname
-			product := ""
-			flavor := ""
-			site := ""
-			isSTA := false
-			parentID := int64(0)
-			if hostname == "" {
-				hostname, _ = info["hostname"].(string)
-			}
-			product, _ = info["product"].(string)
-			flavor, _ = info["flavor"].(string)
-			site, _ = info["site"].(string)
-			isSTA, _ = info["is_sta"].(bool)
-			parentID, _ = info["parent_id"].(int64)
-
-			// Get signal from appropriate radio
-			signal := 0
-			capacity := int64(0)
-			band := "5ghz"
-			if s.Wireless.Radio60GHz != nil {
-				signal = s.Wireless.Radio60GHz.Signal
-				band = "60ghz"
-				if s.Wireless.Radio60GHz.Capacity != nil {
-					capacity = s.Wireless.Radio60GHz.Capacity.Combined
-				}
-			} else if s.Wireless.Radio5GHz != nil {
-				signal = s.Wireless.Radio5GHz.Signal
-				if s.Wireless.Radio5GHz.Capacity != nil {
-					capacity = s.Wireless.Radio5GHz.Capacity.Combined
-				}
-			}
-
-			totalTx += s.Wireless.TxRate
-			totalRx += s.Wireless.RxRate
-
-			// Get platform type
-			platformType := getPlatformType(flavor)
-			initPlatform(platformType)
-			platformStats[platformType]["tx"] += s.Wireless.TxRate
-			platformStats[platformType]["rx"] += s.Wireless.RxRate
-
-			// Get CPU and RAM usage from actual fields
-			cpuUsage := 0
-			if len(s.CPU) > 0 {
-				cpuUsage = s.CPU[0].Usage
-			}
-			memUsage := s.RAM.Usage
-
-			devData := map[string]any{
-				"id":       info["id"],
-				"ip":       ip,
-				"hostname": hostname,
-				"product":  product,
-				"flavor":   flavor,
-				"platform": platformType,
-				"site":     site,
-				"is_sta":   isSTA,
-				"online":   s.Online,
-				"tx_rate":  s.Wireless.TxRate,
-				"rx_rate":  s.Wireless.RxRate,
-				"signal":   signal,
-				"capacity": capacity,
-				"cpu":      cpuUsage,
-				"ram":      memUsage,
-				"band":     band,
-			}
-
-			if isSTA {
-				staTx += s.Wireless.TxRate
-				staRx += s.Wireless.RxRate
-				platformCounts[platformType]["sta"]++
-
-				// Track signal quality
-				if signal != 0 && signal > -100 {
-					signalSum += signal
-					signalCount++
-					platformSignal[platformType]["sum"] += int64(signal)
-					platformSignal[platformType]["count"]++
-
-					// Determine quality based on band
-					poorThreshold := -70
-					fairThreshold := -62
-					if band == "60ghz" {
-						poorThreshold = -65
-						fairThreshold = -55
-					}
-
-					if signal > fairThreshold {
-						goodSignal++
-						platformCounts[platformType]["good"]++
-					} else if signal > poorThreshold {
-						fairSignal++
-						platformCounts[platformType]["fair"]++
-					} else {
-						poorSignal++
-						platformCounts[platformType]["poor"]++
-						apPoorClients[int(parentID)]++
-					}
-				}
-
-				// Track client count per AP
-				apClientCounts[int(parentID)]++
-
-				// Add parent hostname
-				if parentID > 0 {
-					devData["parent_hostname"] = parentHostnames[int(parentID)]
-				}
-
-				staDevices = append(staDevices, devData)
-			} else {
-				apTx += s.Wireless.TxRate
-				apRx += s.Wireless.RxRate
-				platformCounts[platformType]["ap"]++
-				apDevices = append(apDevices, devData)
-			}
-		}
-
-		// Add client counts and poor% to APs
-		for i, ap := range apDevices {
-			apID, _ := ap["id"].(int)
-			clientCount := apClientCounts[apID]
-			poorCount := apPoorClients[apID]
-			apDevices[i]["client_count"] = clientCount
-			apDevices[i]["poor_clients"] = poorCount
-			if clientCount > 0 {
-				apDevices[i]["poor_pct"] = poorCount * 100 / clientCount
-			}
-		}
-
-		avgSignal := 0
-		if signalCount > 0 {
-			avgSignal = signalSum / signalCount
-		}
-
-		// Build capacity risk list (APs with highest poor %)
-		capacityRisk := make([]map[string]any, 0)
-		for _, ap := range apDevices {
-			poorPct, _ := ap["poor_pct"].(int)
-			if poorPct > 20 {
-				capacityRisk = append(capacityRisk, ap)
-			}
-		}
-		// Sort by poor_pct descending (simple bubble sort for small list)
-		for i := 0; i < len(capacityRisk)-1; i++ {
-			for j := i + 1; j < len(capacityRisk); j++ {
-				pi, _ := capacityRisk[i]["poor_pct"].(int)
-				pj, _ := capacityRisk[j]["poor_pct"].(int)
-				if pj > pi {
-					capacityRisk[i], capacityRisk[j] = capacityRisk[j], capacityRisk[i]
-				}
-			}
-		}
-		if len(capacityRisk) > 25 {
-			capacityRisk = capacityRisk[:25]
-		}
-
-		// Use database device count, not stats store count
-		// Build platform breakdown
-		platformBreakdown := make(map[string]map[string]any)
-		platformOrder := []string{"wave60", "wavemlo", "ltu", "airmaxac", "airmaxm", "af11", "af24", "af2x", "af5x", "other"}
-		platformNames := map[string]string{
-			"wave60":   "Wave 60GHz",
-			"wavemlo":  "Wave MLO",
-			"ltu":      "LTU / AF5XHD",
-			"airmaxac": "airMAX AC",
-			"airmaxm":  "airMAX M",
-			"af11":     "AirFiber 11",
-			"af24":     "AirFiber 24",
-			"af2x":     "AirFiber 2/3",
-			"af5x":     "AirFiber 5",
-			"other":    "Other",
-		}
-		// Note which platforms report capacity vs throughput
-		// Wave: TxRate/RxRate = actual throughput
-		// LTU/airMAX: TxRate/RxRate = link capacity (not throughput)
-		platformMetricType := map[string]string{
-			"wave60":   "throughput",
-			"wavemlo":  "throughput",
-			"ltu":      "capacity",
-			"airmaxac": "capacity",
-			"airmaxm":  "capacity",
-			"af11":     "capacity",
-			"af24":     "capacity",
-			"af2x":     "capacity",
-			"af5x":     "capacity",
-			"other":    "unknown",
-		}
-		for _, p := range platformOrder {
-			if stats, ok := platformStats[p]; ok {
-				counts := platformCounts[p]
-				signalStats := platformSignal[p]
-				avgSig := 0
-				if signalStats != nil && signalStats["count"] > 0 {
-					avgSig = int(signalStats["sum"] / int64(signalStats["count"]))
-				}
-				platformBreakdown[p] = map[string]any{
-					"name":        platformNames[p],
-					"metric_type": platformMetricType[p],
-					"tx_rate":     stats["tx"],
-					"rx_rate":     stats["rx"],
-					"ap_count":    counts["ap"],
-					"sta_count":   counts["sta"],
-					"good":        counts["good"],
-					"fair":        counts["fair"],
-					"poor":        counts["poor"],
-					"avg_signal":  avgSig,
-				}
-			}
-		}
-
-		data = map[string]any{
-			"summary": map[string]any{
-				"total_tx_rate": totalTx,
-				"total_rx_rate": totalRx,
-				"ap_tx_rate":    apTx,
-				"ap_rx_rate":    apRx,
-				"sta_tx_rate":   staTx,
-				"sta_rx_rate":   staRx,
-				"avg_signal":    avgSignal,
-				"device_count":  len(deviceInfoByMAC),
-				"ap_count":      len(apDevices),
-				"sta_count":     len(staDevices),
-			},
-			"signal_quality": map[string]any{
-				"good": goodSignal,
-				"fair": fairSignal,
-				"poor": poorSignal,
-			},
-			"platform_breakdown": platformBreakdown,
-			"ap_devices":         apDevices,
-			"sta_devices":        staDevices,
-			"capacity_risk":      capacityRisk,
-			"generated_at":       time.Now(),
-		}
+		data = built
 
 	case "chain":
 		chainThreshold := a.getSettingIntDefault("chain_imbalance_threshold_db", 5)
 		allStats := a.Stats.List()
 
 		deviceInfoByMAC := make(map[string]map[string]any)
-		rows, err := a.DB.Query(`
+		rows, err := a.DB.QueryContext(ctx, `
 		SELECT d.mac, host(d.ip_address), d.hostname, d.product, s.name
 		FROM devices d
 		LEFT JOIN sites s ON d.site_id = s.id
 	`)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var mac, ip, hostname, product, site sql.NullString
-				if rows.Scan(&mac, &ip, &hostname, &product, &site) == nil {
-					deviceInfoByMAC[strings.ToLower(mac.String)] = map[string]any{
-						"ip":       ip.String,
-						"hostname": hostname.String,
-						"product":  product.String,
-						"site":     site.String,
-					}
-				}
+		if err != nil {
+			return nil, fmt.Errorf("load chain report inventory: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var mac, ip, hostname, product, site sql.NullString
+			if err := rows.Scan(&mac, &ip, &hostname, &product, &site); err != nil {
+				return nil, fmt.Errorf("scan chain report inventory: %w", err)
 			}
+			if !mac.Valid || strings.TrimSpace(mac.String) == "" {
+				continue
+			}
+			deviceInfoByMAC[strings.ToLower(mac.String)] = map[string]any{
+				"ip":       ip.String,
+				"hostname": hostname.String,
+				"product":  product.String,
+				"site":     site.String,
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("read chain report inventory: %w", err)
 		}
 
 		issues := make([]map[string]any, 0)
@@ -5138,42 +4527,55 @@ func (a *API) generateReportData(reportType string) ([]byte, error) {
 			}
 		}
 
-		data = map[string]any{
-			"summary": map[string]any{
-				"threshold_db":    chainThreshold,
-				"total_issues":    len(issues),
-				"device_issues":   deviceIssues,
-				"peer_issues":     peerIssues,
-				"both_issues":     bothCount,
-				"ap_only_issues":  apOnlyCount,
-				"sta_only_issues": staOnlyCount,
-			},
-			"issues":       issues,
-			"generated_at": time.Now(),
+		metricDevices := 0
+		for _, snapshot := range allStats {
+			if snapshot != nil && deviceInfoByMAC[strings.ToLower(snapshot.MAC)] != nil {
+				metricDevices++
+			}
 		}
+		data = baseReportData("chain", time.Now().UTC())
+		data["summary"] = map[string]any{
+			"threshold_db":    chainThreshold,
+			"total_issues":    len(issues),
+			"device_issues":   deviceIssues,
+			"peer_issues":     peerIssues,
+			"both_issues":     bothCount,
+			"ap_only_issues":  apOnlyCount,
+			"sta_only_issues": staOnlyCount,
+		}
+		data["coverage"] = reportCoverage(len(deviceInfoByMAC), metricDevices, 0)
+		data["issues"] = issues
 
 	case "rx_mismatch":
 		rxMismatchThreshold := a.getSettingIntDefault("rx_mismatch_threshold_db", 8)
 		allStats := a.Stats.List()
 
 		deviceInfoByMAC := make(map[string]map[string]any)
-		rows, err := a.DB.Query(`
+		rows, err := a.DB.QueryContext(ctx, `
 		SELECT d.mac, host(d.ip_address), d.hostname, s.name
 		FROM devices d
 		LEFT JOIN sites s ON d.site_id = s.id
 	`)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var mac, ip, hostname, site sql.NullString
-				if rows.Scan(&mac, &ip, &hostname, &site) == nil {
-					deviceInfoByMAC[strings.ToLower(mac.String)] = map[string]any{
-						"ip":       ip.String,
-						"hostname": hostname.String,
-						"site":     site.String,
-					}
-				}
+		if err != nil {
+			return nil, fmt.Errorf("load receive-mismatch report inventory: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var mac, ip, hostname, site sql.NullString
+			if err := rows.Scan(&mac, &ip, &hostname, &site); err != nil {
+				return nil, fmt.Errorf("scan receive-mismatch report inventory: %w", err)
 			}
+			if !mac.Valid || strings.TrimSpace(mac.String) == "" {
+				continue
+			}
+			deviceInfoByMAC[strings.ToLower(mac.String)] = map[string]any{
+				"ip":       ip.String,
+				"hostname": hostname.String,
+				"site":     site.String,
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("read receive-mismatch report inventory: %w", err)
 		}
 
 		issues := make([]map[string]any, 0)
@@ -5269,55 +4671,103 @@ func (a *API) generateReportData(reportType string) ([]byte, error) {
 			return idb > jdb
 		})
 
-		data = map[string]any{
-			"summary": map[string]any{
-				"threshold_db":        rxMismatchThreshold,
-				"total_issues":        len(issues),
-				"ap_stronger_issues":  apStronger,
-				"sta_stronger_issues": staStronger,
-			},
-			"issues":       issues,
-			"generated_at": time.Now(),
+		metricDevices := 0
+		for _, snapshot := range allStats {
+			if snapshot != nil && deviceInfoByMAC[strings.ToLower(snapshot.MAC)] != nil {
+				metricDevices++
+			}
 		}
+		data = baseReportData("rx_mismatch", time.Now().UTC())
+		data["summary"] = map[string]any{
+			"threshold_db":        rxMismatchThreshold,
+			"total_issues":        len(issues),
+			"ap_stronger_issues":  apStronger,
+			"sta_stronger_issues": staStronger,
+		}
+		data["coverage"] = reportCoverage(len(deviceInfoByMAC), metricDevices, 0)
+		data["issues"] = issues
 
 	default:
-		data = map[string]any{"error": "unknown report type"}
+		return nil, fmt.Errorf("unsupported report type %q", reportType)
 	}
 
-	result, _ := json.Marshal(data)
+	result, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("marshal report: %w", err)
+	}
 	return result, nil
 }
 
 // ListReports lists generated reports
 func (a *API) ListReports(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.DB.Query(`
-		SELECT id, type, device_count, created_at, created_by
-		FROM reports
-		ORDER BY created_at DESC
-		LIMIT 50
-	`)
+	if !a.requireView(w, r) {
+		return
+	}
+
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		if parsed > 200 {
+			parsed = 200
+		}
+		limit = parsed
+	}
+
+	reportType := strings.TrimSpace(r.URL.Query().Get("type"))
+	if reportType != "" {
+		var ok bool
+		reportType, ok = normalizeReportType(reportType)
+		if !ok {
+			http.Error(w, "unsupported report type", http.StatusBadRequest)
+			return
+		}
+	}
+
+	rows, err := a.DB.QueryContext(r.Context(), `
+		SELECT r.id, r.type, r.device_count, r.created_at, r.created_by, COALESCE(u.username, '')
+		FROM reports r
+		LEFT JOIN users u ON u.id = r.created_by
+		WHERE ($1 = '' OR r.type = $1)
+		ORDER BY r.created_at DESC
+		LIMIT $2
+	`, reportType, limit)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
-	var reports []map[string]any
+	reports := make([]map[string]any, 0)
 	for rows.Next() {
 		var id, deviceCount int
-		var reportType string
+		var reportTypeValue, createdByUsername string
 		var createdAt time.Time
 		var createdBy sql.NullInt64
-		rows.Scan(&id, &reportType, &deviceCount, &createdAt, &createdBy)
-		reports = append(reports, map[string]any{
-			"id":           id,
-			"type":         reportType,
-			"device_count": deviceCount,
-			"created_at":   createdAt,
-			"created_by":   createdBy.Int64,
-		})
+		if err := rows.Scan(&id, &reportTypeValue, &deviceCount, &createdAt, &createdBy, &createdByUsername); err != nil {
+			http.Error(w, "database row error", http.StatusInternalServerError)
+			return
+		}
+		report := map[string]any{
+			"id":                  id,
+			"type":                reportTypeValue,
+			"type_label":          reportTypeLabels[reportTypeValue],
+			"device_count":        deviceCount,
+			"created_at":          createdAt,
+			"created_by_username": createdByUsername,
+		}
+		if createdBy.Valid {
+			report["created_by"] = createdBy.Int64
+		}
+		reports = append(reports, report)
 	}
-
+	if err := rows.Err(); err != nil {
+		http.Error(w, "database iteration error", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, reports)
 }
 
@@ -5345,311 +4795,222 @@ func (a *API) DeleteReport(w http.ResponseWriter, r *http.Request) {
 
 // GetReport returns a single report with data for inline viewing
 func (a *API) GetReport(w http.ResponseWriter, r *http.Request) {
-	reportID, _ := strconv.Atoi(chi.URLParam(r, "id"))
+	if !a.requireView(w, r) {
+		return
+	}
+	reportID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || reportID <= 0 {
+		http.Error(w, "invalid report id", http.StatusBadRequest)
+		return
+	}
 
 	var reportType string
 	var data []byte
 	var deviceCount int
 	var createdAt time.Time
-	err := a.DB.QueryRow(`SELECT type, data, device_count, created_at FROM reports WHERE id = $1`, reportID).
-		Scan(&reportType, &data, &deviceCount, &createdAt)
+	var createdBy sql.NullInt64
+	var createdByUsername string
+	err = a.DB.QueryRowContext(r.Context(), `
+		SELECT r.type, r.data, r.device_count, r.created_at, r.created_by, COALESCE(u.username, '')
+		FROM reports r
+		LEFT JOIN users u ON u.id = r.created_by
+		WHERE r.id = $1
+	`, reportID).Scan(&reportType, &data, &deviceCount, &createdAt, &createdBy, &createdByUsername)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "report not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		http.Error(w, "report not found", 404)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, map[string]any{
-		"id":           reportID,
-		"type":         reportType,
-		"data":         json.RawMessage(data),
-		"device_count": deviceCount,
-		"created_at":   createdAt,
-	})
+	response := map[string]any{
+		"id":                  reportID,
+		"type":                reportType,
+		"type_label":          reportTypeLabels[reportType],
+		"data":                json.RawMessage(data),
+		"device_count":        deviceCount,
+		"created_at":          createdAt,
+		"created_by_username": createdByUsername,
+	}
+	if createdBy.Valid {
+		response["created_by"] = createdBy.Int64
+	}
+	writeJSON(w, response)
 }
 
-// DownloadReport downloads a report as JSON or CSV
+// DownloadReport downloads a report as JSON or CSV.
 func (a *API) DownloadReport(w http.ResponseWriter, r *http.Request) {
-	reportID, _ := strconv.Atoi(chi.URLParam(r, "id"))
-	format := r.URL.Query().Get("format") // "json" or "csv"
+	if !a.requireView(w, r) {
+		return
+	}
+	reportID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || reportID <= 0 {
+		http.Error(w, "invalid report id", http.StatusBadRequest)
+		return
+	}
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	if format == "" {
 		format = "json"
+	}
+	if format != "json" && format != "csv" {
+		http.Error(w, "format must be json or csv", http.StatusBadRequest)
+		return
 	}
 
 	var reportType string
 	var data []byte
 	var createdAt time.Time
-	err := a.DB.QueryRow(`SELECT type, data, created_at FROM reports WHERE id = $1`, reportID).
+	err = a.DB.QueryRowContext(r.Context(), `SELECT type, data, created_at FROM reports WHERE id = $1`, reportID).
 		Scan(&reportType, &data, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "report not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		http.Error(w, "report not found", 404)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
 
 	dateStr := createdAt.Format("2006-01-02")
-
-	// CSV export for inventory, performance, chain, and rx mismatch reports
-	if format == "csv" && (reportType == "inventory" || reportType == "performance" || reportType == "chain" || reportType == "rx_mismatch") {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if format == "csv" {
 		var reportData map[string]any
 		if err := json.Unmarshal(data, &reportData); err != nil {
-			http.Error(w, "parse error", 500)
+			http.Error(w, "report data is invalid", http.StatusInternalServerError)
 			return
 		}
-
+		var buffer bytes.Buffer
+		if err := writeReportCSV(&buffer, reportType, reportData); err != nil {
+			http.Error(w, "CSV generation failed", http.StatusInternalServerError)
+			return
+		}
 		filename := fmt.Sprintf("wavecontrol-%s-%s.csv", reportType, dateStr)
-		w.Header().Set("Content-Type", "text/csv")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-
-		if reportType == "chain" {
-			issues, ok := reportData["issues"].([]any)
-			if !ok || len(issues) == 0 {
-				http.Error(w, "no chain issues", 404)
-				return
-			}
-			w.Write([]byte("Scope,Band,Hostname,Affected IP,Site,Parent AP,Parent IP,MAC,Side,AP Spread dB,STA Spread dB,Max Spread dB,AP Chains,STA Chains\n"))
-			for _, raw := range issues {
-				issue, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				apChains := ""
-				if arr, ok := issue["ap_chains"].([]any); ok {
-					parts := make([]string, 0, len(arr))
-					for _, v := range arr {
-						parts = append(parts, fmt.Sprint(int(getFloat64(map[string]any{"v": v}, "v"))))
-					}
-					apChains = strings.Join(parts, " / ")
-				}
-				staChains := ""
-				if arr, ok := issue["sta_chains"].([]any); ok {
-					parts := make([]string, 0, len(arr))
-					for _, v := range arr {
-						parts = append(parts, fmt.Sprint(int(getFloat64(map[string]any{"v": v}, "v"))))
-					}
-					staChains = strings.Join(parts, " / ")
-				}
-				line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%s,%s\n",
-					csvEscape(getString(issue, "scope")),
-					csvEscape(getString(issue, "band")),
-					csvEscape(getString(issue, "hostname")),
-					csvEscape(getString(issue, "affected_ip")),
-					csvEscape(getString(issue, "site")),
-					csvEscape(getString(issue, "parent_hostname")),
-					csvEscape(getString(issue, "parent_ip")),
-					csvEscape(getString(issue, "mac")),
-					csvEscape(getString(issue, "mismatch_side")),
-					int(getInt64(issue, "ap_spread_db")),
-					int(getInt64(issue, "sta_spread_db")),
-					int(getInt64(issue, "spread_db")),
-					csvEscape(apChains),
-					csvEscape(staChains),
-				)
-				w.Write([]byte(line))
-			}
-			return
-		}
-
-		if reportType == "rx_mismatch" {
-			issues, ok := reportData["issues"].([]any)
-			if !ok || len(issues) == 0 {
-				http.Error(w, "no rx mismatch issues", 404)
-				return
-			}
-			w.Write([]byte("Band,AP Hostname,AP IP,STA Hostname,STA IP,Affected IP,Site,MAC,AP RX dBm,STA RX dBm,Delta dB,Stronger Side\n"))
-			for _, raw := range issues {
-				issue, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%s\n",
-					csvEscape(getString(issue, "band")),
-					csvEscape(getString(issue, "ap_hostname")),
-					csvEscape(getString(issue, "ap_ip")),
-					csvEscape(getString(issue, "sta_hostname")),
-					csvEscape(getString(issue, "sta_ip")),
-					csvEscape(getString(issue, "affected_ip")),
-					csvEscape(getString(issue, "site")),
-					csvEscape(getString(issue, "mac")),
-					int(getInt64(issue, "ap_rx")),
-					int(getInt64(issue, "sta_rx")),
-					int(getInt64(issue, "delta_db")),
-					csvEscape(getString(issue, "stronger_side")),
-				)
-				w.Write([]byte(line))
-			}
-			return
-		}
-
-		devices, ok := reportData["devices"].([]any)
-		if !ok || len(devices) == 0 {
-			if apDevices, ok2 := reportData["ap_devices"].([]any); ok2 && len(apDevices) > 0 && reportType == "performance" {
-				devices = apDevices
-			} else {
-				http.Error(w, "no device data", 404)
-				return
-			}
-		}
-
-		// Write CSV
-		if reportType == "inventory" {
-			w.Write([]byte("Hostname,IP,MAC,Product,Flavor,Firmware,Platform,Status,Region,Site,Type,Parent\n"))
-			for _, d := range devices {
-				dev := d.(map[string]any)
-				isSTA := dev["is_sta"] == true
-				devType := "AP"
-				parent := ""
-				if isSTA {
-					devType = "STA"
-					if ph, ok := dev["parent_hostname"].(string); ok && ph != "" {
-						parent = ph
-					} else if pip, ok := dev["parent_ip"].(string); ok {
-						parent = pip
-					}
-				}
-				line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-					csvEscape(getString(dev, "hostname")),
-					csvEscape(getString(dev, "ip")),
-					csvEscape(getString(dev, "mac")),
-					csvEscape(getString(dev, "product")),
-					csvEscape(getString(dev, "flavor")),
-					csvEscape(getString(dev, "firmware")),
-					csvEscape(getString(dev, "platform")),
-					csvEscape(getString(dev, "status")),
-					csvEscape(getString(dev, "region")),
-					csvEscape(getString(dev, "site")),
-					devType,
-					csvEscape(parent),
-				)
-				w.Write([]byte(line))
-			}
-		} else { // performance
-			w.Write([]byte("Hostname,IP,Product,Flavor,Type,Online,TX Rate,RX Rate,Signal,Capacity,CPU,RAM\n"))
-			for _, d := range devices {
-				dev := d.(map[string]any)
-				isSTA := dev["is_sta"] == true
-				devType := "AP"
-				if isSTA {
-					devType = "STA"
-				}
-				online := "No"
-				if dev["online"] == true {
-					online = "Yes"
-				}
-				line := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%.1f,%.1f\n",
-					csvEscape(getString(dev, "hostname")),
-					csvEscape(getString(dev, "ip")),
-					csvEscape(getString(dev, "product")),
-					csvEscape(getString(dev, "flavor")),
-					devType,
-					online,
-					getInt64(dev, "tx_rate"),
-					getInt64(dev, "rx_rate"),
-					getInt64(dev, "signal"),
-					getInt64(dev, "capacity"),
-					getFloat64(dev, "cpu"),
-					getFloat64(dev, "ram"),
-				)
-				w.Write([]byte(line))
-			}
-		}
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+		_, _ = w.Write(buffer.Bytes())
 		return
 	}
 
-	// Default: JSON download
 	filename := fmt.Sprintf("wavecontrol-%s-%s.json", reportType, dateStr)
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-	w.Write(data)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	_, _ = w.Write(data)
 }
 
-// CompareReports compares two reports and returns deltas
+// CompareReports compares two same-type report snapshots and returns deltas.
 func (a *API) CompareReports(w http.ResponseWriter, r *http.Request) {
 	if !a.requireView(w, r) {
 		return
 	}
 	var req struct {
-		ReportID1 int `json:"report_id_1"`
-		ReportID2 int `json:"report_id_2"`
+		ReportID1 int64 `json:"report_id_1"`
+		ReportID2 int64 `json:"report_id_2"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request", 400)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ReportID1 <= 0 || req.ReportID2 <= 0 {
+		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 
-	// Fetch both reports
-	var type1, type2 string
-	var data1, data2 []byte
-	var created1, created2 time.Time
+	fetch := func(id int64) (string, []byte, time.Time, error) {
+		var reportType string
+		var data []byte
+		var createdAt time.Time
+		err := a.DB.QueryRowContext(r.Context(), `SELECT type, data, created_at FROM reports WHERE id = $1`, id).
+			Scan(&reportType, &data, &createdAt)
+		return reportType, data, createdAt, err
+	}
 
-	err := a.DB.QueryRow(`SELECT type, data, created_at FROM reports WHERE id = $1`, req.ReportID1).
-		Scan(&type1, &data1, &created1)
+	type1, data1, created1, err := fetch(req.ReportID1)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "report 1 not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		http.Error(w, "report 1 not found", 404)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
-
-	err = a.DB.QueryRow(`SELECT type, data, created_at FROM reports WHERE id = $1`, req.ReportID2).
-		Scan(&type2, &data2, &created2)
+	type2, data2, created2, err := fetch(req.ReportID2)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "report 2 not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		http.Error(w, "report 2 not found", 404)
+		http.Error(w, "database error", http.StatusInternalServerError)
 		return
 	}
-
 	if type1 != type2 {
-		http.Error(w, "reports must be same type", 400)
+		http.Error(w, "reports must be the same type", http.StatusBadRequest)
 		return
 	}
 
 	var report1, report2 map[string]any
-	json.Unmarshal(data1, &report1)
-	json.Unmarshal(data2, &report2)
+	if err := json.Unmarshal(data1, &report1); err != nil {
+		http.Error(w, "report 1 data is invalid", http.StatusInternalServerError)
+		return
+	}
+	if err := json.Unmarshal(data2, &report2); err != nil {
+		http.Error(w, "report 2 data is invalid", http.StatusInternalServerError)
+		return
+	}
 
-	// Calculate deltas based on report type
-	deltas := make(map[string]any)
-	deltas["report_type"] = type1
-	deltas["report_1_id"] = req.ReportID1
-	deltas["report_2_id"] = req.ReportID2
-	deltas["report_1_time"] = created1
-	deltas["report_2_time"] = created2
+	deltas := map[string]any{
+		"report_type":   type1,
+		"report_name":   reportTypeLabels[type1],
+		"report_1_id":   req.ReportID1,
+		"report_2_id":   req.ReportID2,
+		"report_1_time": created1,
+		"report_2_time": created2,
+	}
 
 	switch type1 {
 	case "health":
-		deltas["summary"] = compareSummary(
-			getMap(report1, "summary"),
-			getMap(report2, "summary"),
-			[]string{"total", "online", "offline", "unknown", "ap_count", "sta_count"},
-		)
-		deltas["link_quality"] = compareSummary(
-			getMap(report1, "link_quality"),
-			getMap(report2, "link_quality"),
-			[]string{"good", "fair", "poor"},
-		)
-		deltas["system_health"] = compareSummary(
-			getMap(report1, "system_health"),
-			getMap(report2, "system_health"),
-			[]string{"high_cpu", "high_mem", "high_temp"},
-		)
+		deltas["summary"] = compareSummary(getMap(report1, "summary"), getMap(report2, "summary"),
+			[]string{"total", "online", "offline", "unknown", "uptime", "ap_count", "sta_count"})
+		deltas["coverage"] = compareSummary(getMap(report1, "coverage"), getMap(report2, "coverage"),
+			[]string{"inventory_devices", "metrics_devices", "missing_metrics", "signal_samples", "coverage_pct"})
+		deltas["link_quality"] = compareSummary(getMap(report1, "link_quality"), getMap(report2, "link_quality"),
+			[]string{"good", "fair", "poor", "no_signal"})
+		deltas["system_health"] = compareSummary(getMap(report1, "system_health"), getMap(report2, "system_health"),
+			[]string{"high_cpu", "high_mem", "high_temp"})
+		deltas["stability"] = compareSummary(getMap(report1, "stability"), getMap(report2, "stability"),
+			[]string{"flaps_1h", "flaps_24h", "reboots_1h", "reboots_24h"})
 
 	case "performance":
-		deltas["summary"] = compareSummary(
-			getMap(report1, "summary"),
-			getMap(report2, "summary"),
-			[]string{"total_tx_rate", "total_rx_rate", "avg_signal", "device_count", "ap_count", "sta_count"},
-		)
-		deltas["signal_quality"] = compareSummary(
-			getMap(report1, "signal_quality"),
-			getMap(report2, "signal_quality"),
-			[]string{"good", "fair", "poor"},
-		)
+		deltas["summary"] = compareSummary(getMap(report1, "summary"), getMap(report2, "summary"),
+			[]string{"total_tx_rate", "total_rx_rate", "avg_signal", "device_count", "metrics_device_count", "ap_count", "sta_count"})
+		deltas["coverage"] = compareSummary(getMap(report1, "coverage"), getMap(report2, "coverage"),
+			[]string{"inventory_devices", "metrics_devices", "missing_metrics", "signal_samples", "coverage_pct"})
+		deltas["signal_quality"] = compareSummary(getMap(report1, "signal_quality"), getMap(report2, "signal_quality"),
+			[]string{"good", "fair", "poor", "no_signal"})
 
 	case "inventory":
-		// Count devices
-		devices1 := getSlice(report1, "devices")
-		devices2 := getSlice(report2, "devices")
-		deltas["device_count"] = map[string]any{
-			"report_1": len(devices1),
-			"report_2": len(devices2),
-			"delta":    len(devices2) - len(devices1),
+		oldSummary, newSummary := getMap(report1, "summary"), getMap(report2, "summary")
+		if len(oldSummary) == 0 {
+			oldSummary = map[string]any{"total": len(getSlice(report1, "devices"))}
 		}
+		if len(newSummary) == 0 {
+			newSummary = map[string]any{"total": len(getSlice(report2, "devices"))}
+		}
+		deltas["summary"] = compareSummary(oldSummary, newSummary,
+			[]string{"total", "online", "offline", "unknown", "ap_count", "sta_count", "site_count", "region_count", "unassigned_site", "firmware_versions"})
+
+	case "chain":
+		deltas["summary"] = compareSummary(getMap(report1, "summary"), getMap(report2, "summary"),
+			[]string{"total_issues", "device_issues", "peer_issues", "both_issues", "ap_only_issues", "sta_only_issues"})
+		deltas["coverage"] = compareSummary(getMap(report1, "coverage"), getMap(report2, "coverage"),
+			[]string{"inventory_devices", "metrics_devices", "missing_metrics", "coverage_pct"})
+
+	case "rx_mismatch":
+		deltas["summary"] = compareSummary(getMap(report1, "summary"), getMap(report2, "summary"),
+			[]string{"total_issues", "ap_stronger_issues", "sta_stronger_issues"})
+		deltas["coverage"] = compareSummary(getMap(report1, "coverage"), getMap(report2, "coverage"),
+			[]string{"inventory_devices", "metrics_devices", "missing_metrics", "coverage_pct"})
+
+	default:
+		http.Error(w, "unsupported report type", http.StatusBadRequest)
+		return
 	}
 
 	writeJSON(w, deltas)
