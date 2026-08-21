@@ -124,6 +124,7 @@ var secretSettingKeys = map[string]struct{}{
 	"sta_cred1_pass": {}, "sta_cred2_pass": {}, "sta_cred3_pass": {},
 	"ap_passwords": {}, "sta_passwords": {}, "default_passwords": {},
 	"default_password": {}, "default_sta_password": {}, "smtp_password": {},
+	"sysmon_alerter_token": {},
 }
 
 func IsSecretSetting(key string) bool {

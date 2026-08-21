@@ -7,9 +7,10 @@ import (
 )
 
 var validMetrics = map[string]struct{}{
-	MetricSignal60GHz: {}, MetricSignal5GHz: {}, MetricSignalLTU: {}, MetricCPU: {},
+	MetricSignal60GHz: {}, MetricSignal5GHz: {}, MetricSignal6GHz: {}, MetricSignalLTU: {}, MetricCPU: {},
 	MetricTemperature: {}, MetricRAM: {}, MetricOfflineDuration: {}, MetricCapacity: {},
-	MetricPeerCount: {}, MetricLinkScore: {},
+	MetricPeerCount: {}, MetricLinkScore: {}, MetricInterference: {},
+	MetricChainImbalance: {}, MetricGPSSync: {},
 }
 
 var validOperators = map[string]struct{}{OpLT: {}, OpLTE: {}, OpGT: {}, OpGTE: {}, OpEQ: {}, OpNE: {}}
@@ -46,6 +47,9 @@ func ValidateRule(rule *Rule) error {
 	if _, ok := validOperators[rule.Operator]; !ok {
 		return fmt.Errorf("unsupported operator %q", rule.Operator)
 	}
+	if rule.Severity != SeverityAuto && rule.Severity != SeverityInfo && rule.Severity != SeverityWarning && rule.Severity != SeverityCritical {
+		return fmt.Errorf("severity must be auto, info, warning, or critical")
+	}
 	const maxSeconds = 31 * 24 * 60 * 60
 	if rule.DurationSeconds < 0 || rule.DurationSeconds > maxSeconds {
 		return fmt.Errorf("duration_seconds must be between 0 and %d", maxSeconds)
@@ -57,7 +61,7 @@ func ValidateRule(rule *Rule) error {
 	channels := map[string]bool{}
 	for _, ch := range rule.NotifyChannels {
 		switch ch {
-		case "email", "webhook", "zabbix":
+		case "email", "webhook", "zabbix", "sysmon":
 			channels[ch] = true
 		default:
 			return fmt.Errorf("unsupported notification channel %q", ch)

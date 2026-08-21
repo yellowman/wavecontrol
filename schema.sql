@@ -63,6 +63,13 @@ INSERT INTO settings (key, value) VALUES
     ('smtp_username', ''),
     ('smtp_password', ''),
     ('smtp_from', ''),
+    ('sysmon_alerter_enabled', 'false'),
+    ('sysmon_alerter_host', ''),
+    ('sysmon_alerter_port', '1347'),
+    ('sysmon_alerter_name', 'wavecontrol'),
+    ('sysmon_alerter_token', ''),
+    ('sysmon_alerter_application', 'WaveControl network alerts'),
+    ('sysmon_alerter_ca_pem', ''),
     ('backup_dir', 'backups'),
     ('cors_origins', ''),
     ('csp_img_sources', ''),
@@ -321,16 +328,18 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     require_alertable BOOLEAN NOT NULL DEFAULT TRUE, -- honor devices.alertable/silence gates
     
     -- Condition
-    metric VARCHAR(50) NOT NULL,         -- 'signal_60ghz', 'signal_5ghz', 'cpu', 'temperature', 'offline_duration', 'capacity', 'peer_count'
+    metric VARCHAR(50) NOT NULL,         -- validated by the server; Ubiquiti signal/system/link/radio-health metrics
     operator VARCHAR(10) NOT NULL,       -- 'lt', 'gt', 'eq', 'ne', 'lte', 'gte'
     threshold NUMERIC NOT NULL,
     duration_seconds INTEGER DEFAULT 0,  -- How long condition must persist (0 = immediate)
+    severity VARCHAR(20) NOT NULL DEFAULT 'auto' CHECK (severity IN ('auto', 'info', 'warning', 'critical')),
     
     -- Notification
-    notify_channels TEXT[],              -- ['email', 'webhook', 'zabbix']
+    notify_channels TEXT[],              -- ['email', 'webhook', 'zabbix', 'sysmon']
     notify_emails TEXT[],                -- Email addresses
     webhook_url TEXT,                    -- Webhook URL
-    cooldown_seconds INTEGER DEFAULT 300, -- Minimum time between repeat alerts
+    notify_recovery BOOLEAN NOT NULL DEFAULT TRUE, -- Send a recovery event when the condition clears
+    cooldown_seconds INTEGER DEFAULT 300, -- Post-trigger minimum before a cleared condition may open again
     
     -- Metadata
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -365,7 +374,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     
     -- Notification tracking
     notified_at TIMESTAMPTZ,
-    notify_error TEXT
+    notify_error TEXT,
+    recovery_notified_at TIMESTAMPTZ,
+    recovery_notify_error TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
@@ -386,11 +397,12 @@ CREATE TABLE IF NOT EXISTS alert_states (
 );
 
 
--- Durable alert notification delivery (email, webhook, or Zabbix)
+-- Durable alert trigger/recovery delivery (email, webhook, Zabbix, or sysmon-web)
 CREATE TABLE IF NOT EXISTS alert_notification_outbox (
     id BIGSERIAL PRIMARY KEY,
     alert_id INTEGER NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
-    channel VARCHAR(16) NOT NULL CHECK (channel IN ('email', 'webhook', 'zabbix')),
+    channel VARCHAR(16) NOT NULL CHECK (channel IN ('email', 'webhook', 'zabbix', 'sysmon')),
+    event VARCHAR(16) NOT NULL DEFAULT 'triggered' CHECK (event IN ('triggered', 'resolved')),
     payload JSONB NOT NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'sending', 'failed', 'sent', 'dead')),
@@ -400,7 +412,7 @@ CREATE TABLE IF NOT EXISTS alert_notification_outbox (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     sent_at TIMESTAMPTZ,
-    UNIQUE(alert_id, channel)
+    CONSTRAINT alert_notification_outbox_alert_channel_event_key UNIQUE(alert_id, channel, event)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_notification_outbox_due

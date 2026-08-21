@@ -9001,8 +9001,23 @@ body.drilldown-active .main-content {
 }
 
 .alert-severity {
+  background: var(--bg-2);
+  color: var(--text-2);
+}
+
+.alert-card.severity-critical .alert-severity {
   background: rgba(var(--red-rgb), 0.16);
   color: var(--red);
+}
+
+.alert-card.severity-warning .alert-severity {
+  background: rgba(var(--yellow-rgb), 0.16);
+  color: var(--yellow);
+}
+
+.alert-card.severity-info .alert-severity {
+  background: rgba(var(--cyan-rgb), 0.16);
+  color: var(--cyan);
 }
 
 .alert-status,
@@ -9093,8 +9108,24 @@ body.drilldown-active .main-content {
 }
 
 .alert-preset-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
   font-weight: 700;
   color: var(--text-0);
+}
+
+.alert-preset-manual {
+  padding: 0.08rem 0.38rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-3);
+  font-size: 0.62rem;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .alert-preset-description {
@@ -9142,6 +9173,164 @@ body.drilldown-active .main-content {
   color: var(--text-1);
 }
 
+.alert-channel-option > span {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.alert-channel-option small,
+.field-help {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--text-3);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.alert-channel-option em {
+  color: var(--text-3);
+  font-size: 0.68rem;
+  font-style: normal;
+  text-align: right;
+}
+
+.alert-channel-option.state-error {
+  border-color: rgba(var(--red-rgb), 0.42);
+}
+
+.alert-channel-option.state-ready {
+  border-color: rgba(var(--green-rgb), 0.3);
+}
+
+.alert-lifecycle-note {
+  margin-bottom: 1rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid rgba(var(--cyan-rgb), 0.28);
+  border-radius: 8px;
+  background: rgba(var(--cyan-rgb), 0.08);
+  color: var(--text-1);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.alert-recovery-check {
+  margin-top: 0.75rem;
+}
+
+.alert-channel-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 0.65rem;
+}
+
+.alert-channel-status-card {
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+}
+
+.alert-channel-status-card.state-ready { border-color: rgba(var(--green-rgb), 0.32); }
+.alert-channel-status-card.state-error { border-color: rgba(var(--red-rgb), 0.42); }
+
+.alert-channel-status-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.alert-channel-health {
+  color: var(--text-2);
+  font-size: 0.68rem;
+  text-align: right;
+}
+
+.alert-channel-status-card p {
+  margin: 0.45rem 0 0;
+  color: var(--text-3);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.alert-channel-runtime {
+  margin-top: 0.45rem;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.alert-channel-status-actions {
+  display: flex;
+  gap: 0.45rem;
+  margin-top: 0.75rem;
+}
+
+.alert-delivery-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+
+.alert-delivery-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.18rem 0.48rem;
+  border-radius: 999px;
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+}
+
+.alert-delivery-chip.status-sent { color: var(--green); }
+.alert-delivery-chip.status-failed,
+.alert-delivery-chip.status-dead { color: var(--red); }
+.alert-delivery-chip.status-pending,
+.alert-delivery-chip.status-sending { color: var(--cyan); }
+
+.alert-delivery-error {
+  flex-basis: 100%;
+  margin-top: 0.25rem;
+  color: var(--red);
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-subsection {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.settings-subsection:first-of-type {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.settings-subsection h5 {
+  margin: 0 0 0.6rem;
+  color: var(--text-0);
+  font-size: 0.9rem;
+}
+
+.sysmon-settings textarea {
+  width: 100%;
+  min-height: 9rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  resize: vertical;
+}
+
 .empty-state {
   padding: 1rem;
   border: 1px dashed var(--border);
@@ -9153,6 +9342,21 @@ body.drilldown-active .main-content {
 @media (max-width: 1100px) {
   .alerts-layout {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 680px) {
+  .alert-channel-grid,
+  .alert-channel-status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .alert-channel-option {
+    align-items: flex-start;
+  }
+
+  .alert-channel-option em {
+    max-width: 8rem;
   }
 }
 
@@ -9301,5 +9505,53 @@ body.drilldown-active .main-content {
 
   .table-actions {
     flex-wrap: wrap;
+  }
+}
+
+/* Alert workflows collapse to readable cards and full-width actions on phones. */
+@media (max-width: 680px) {
+  .alerts-header,
+  .alert-section-header,
+  .alert-form-header,
+  .alert-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .alerts-header > .btn,
+  .alert-section-header > .btn,
+  .alert-form-header > .btn,
+  .alert-inline-controls,
+  .alert-inline-controls select {
+    width: 100%;
+  }
+
+  .alert-card-actions,
+  .alert-rule-actions {
+    justify-content: flex-start;
+  }
+
+  .alert-card-actions .btn,
+  .alert-channel-status-actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .alert-channel-status-actions,
+  .settings-actions {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .settings-actions .btn {
+    flex: 1 1 10rem;
+  }
+
+  .alert-rules-table-wrap {
+    margin-inline: -0.25rem;
+    padding-bottom: 0.25rem;
+  }
+
+  .alert-rules-table {
+    min-width: 760px;
   }
 }

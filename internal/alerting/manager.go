@@ -15,11 +15,13 @@ import (
 	"github.com/lib/pq"
 	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
+	"github.com/yellowman/wavecontrol/internal/sysmonalerter"
 )
 
 const (
 	MetricSignal60GHz     = "signal_60ghz"
 	MetricSignal5GHz      = "signal_5ghz"
+	MetricSignal6GHz      = "signal_6ghz"
 	MetricSignalLTU       = "signal_ltu"
 	MetricCPU             = "cpu"
 	MetricTemperature     = "temperature"
@@ -28,6 +30,9 @@ const (
 	MetricCapacity        = "capacity"
 	MetricPeerCount       = "peer_count"
 	MetricLinkScore       = "link_score"
+	MetricInterference    = "interference"
+	MetricChainImbalance  = "chain_imbalance"
+	MetricGPSSync         = "gps_sync"
 
 	OpLT  = "lt"
 	OpLTE = "lte"
@@ -36,6 +41,7 @@ const (
 	OpEQ  = "eq"
 	OpNE  = "ne"
 
+	SeverityAuto     = "auto"
 	SeverityInfo     = "info"
 	SeverityWarning  = "warning"
 	SeverityCritical = "critical"
@@ -55,28 +61,39 @@ type Rule struct {
 	Operator         string    `json:"operator"`
 	Threshold        float64   `json:"threshold"`
 	DurationSeconds  int       `json:"duration_seconds"`
+	Severity         string    `json:"severity"`
 	NotifyChannels   []string  `json:"notify_channels"`
 	NotifyEmails     []string  `json:"notify_emails,omitempty"`
 	WebhookURL       string    `json:"webhook_url,omitempty"`
+	NotifyRecovery   bool      `json:"notify_recovery"`
 	CooldownSeconds  int       `json:"cooldown_seconds"`
 	CreatedAt        time.Time `json:"created_at"`
 	CreatedBy        int       `json:"created_by,omitempty"`
 }
 
 type Alert struct {
-	ID             int        `json:"id"`
-	RuleID         *int       `json:"rule_id,omitempty"`
-	DeviceID       int        `json:"device_id"`
-	Metric         string     `json:"metric"`
-	Value          float64    `json:"value"`
-	Threshold      float64    `json:"threshold"`
-	Message        string     `json:"message"`
-	Severity       string     `json:"severity"`
-	Status         string     `json:"status"`
-	TriggeredAt    time.Time  `json:"triggered_at"`
-	AcknowledgedAt *time.Time `json:"acknowledged_at,omitempty"`
-	AcknowledgedBy *int       `json:"acknowledged_by,omitempty"`
-	ResolvedAt     *time.Time `json:"resolved_at,omitempty"`
+	ID                     int                    `json:"id"`
+	RuleID                 *int                   `json:"rule_id,omitempty"`
+	DeviceID               int                    `json:"device_id"`
+	Metric                 string                 `json:"metric"`
+	Value                  float64                `json:"value"`
+	Threshold              float64                `json:"threshold"`
+	Message                string                 `json:"message"`
+	Severity               string                 `json:"severity"`
+	Status                 string                 `json:"status"`
+	TriggeredAt            time.Time              `json:"triggered_at"`
+	AcknowledgedAt         *time.Time             `json:"acknowledged_at,omitempty"`
+	AcknowledgedBy         *int                   `json:"acknowledged_by,omitempty"`
+	ResolvedAt             *time.Time             `json:"resolved_at,omitempty"`
+	NotifiedAt             *time.Time             `json:"notified_at,omitempty"`
+	NotifyError            string                 `json:"notify_error,omitempty"`
+	RecoveryNotifiedAt     *time.Time             `json:"recovery_notified_at,omitempty"`
+	RecoveryNotifyError    string                 `json:"recovery_notify_error,omitempty"`
+	NotifyChannels         []string               `json:"notify_channels"`
+	DeliveryStatus         string                 `json:"delivery_status"`
+	RecoveryChannels       []string               `json:"recovery_channels"`
+	RecoveryDeliveryStatus string                 `json:"recovery_delivery_status"`
+	Deliveries             []NotificationDelivery `json:"deliveries"`
 }
 
 type AlertState struct {
@@ -113,17 +130,23 @@ type Manager struct {
 	states         map[string]*AlertState
 	lastNotified   map[string]time.Time
 	smtpConfig     *SMTPConfig
+	sysmonClient   *sysmonalerter.Client
 	notificationCh chan struct{}
 }
 
 func NewManager(db *sql.DB, statsStore *stats.Store, secretStore *secrets.Manager) (*Manager, error) {
+	sysmonClient, err := sysmonalerter.NewClient(sysmonalerter.Config{})
+	if err != nil {
+		return nil, err
+	}
 	m := &Manager{
 		db:             db,
 		statsStore:     statsStore,
 		secrets:        secretStore,
 		states:         make(map[string]*AlertState),
 		lastNotified:   make(map[string]time.Time),
-		notificationCh: make(chan struct{}, 1),
+		notificationCh: make(chan struct{}, generalNotificationWorkers+2),
+		sysmonClient:   sysmonClient,
 	}
 	if err := m.Reload(); err != nil {
 		return nil, err
@@ -131,14 +154,23 @@ func NewManager(db *sql.DB, statsStore *stats.Store, secretStore *secrets.Manage
 	return m, nil
 }
 
+const generalNotificationWorkers = 3
+
 func (m *Manager) Start(ctx context.Context) {
-	go m.runNotificationWorker(ctx)
+	for i := 0; i < generalNotificationWorkers; i++ {
+		go m.runNotificationWorker(ctx, false)
+	}
+	// sysmon-web uses one ordered, long-lived request/reply stream. Keep its
+	// indefinite retry path isolated so an unavailable sysmon server cannot
+	// delay email, webhook, or Zabbix notifications.
+	go m.runNotificationWorker(ctx, true)
+	go m.sysmonClient.Run(ctx)
 }
 
 func (m *Manager) loadRules() ([]Rule, error) {
 	rows, err := m.db.Query(`
 		SELECT id, name, enabled, scope, scope_id, target_role, require_alertable, metric, operator, threshold,
-		       duration_seconds, notify_channels, notify_emails, webhook_url, cooldown_seconds
+		       duration_seconds, severity, notify_channels, notify_emails, webhook_url, notify_recovery, cooldown_seconds
 		FROM alert_rules WHERE enabled = true
 	`)
 	if err != nil {
@@ -153,8 +185,8 @@ func (m *Manager) loadRules() ([]Rule, error) {
 		var channels, emails pq.StringArray
 		var webhookURL sql.NullString
 		if err := rows.Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable,
-			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &channels, &emails, &webhookURL,
-			&r.CooldownSeconds); err != nil {
+			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhookURL,
+			&r.NotifyRecovery, &r.CooldownSeconds); err != nil {
 			return nil, err
 		}
 		if scopeID.Valid {
@@ -199,10 +231,11 @@ func (m *Manager) loadStates() (map[string]*AlertState, error) {
 
 func (m *Manager) loadLastNotified() (map[string]time.Time, error) {
 	rows, err := m.db.Query(`
-		SELECT rule_id, device_id, MAX(triggered_at)
-		FROM alerts
-		WHERE rule_id IS NOT NULL
-		GROUP BY rule_id, device_id
+		SELECT a.rule_id, a.device_id, MAX(a.triggered_at)
+		FROM alerts a
+		JOIN alert_rules r ON r.id=a.rule_id
+		WHERE a.rule_id IS NOT NULL AND a.triggered_at >= r.updated_at
+		GROUP BY a.rule_id, a.device_id
 	`)
 	if err != nil {
 		return nil, err
@@ -250,6 +283,42 @@ func (m *Manager) loadSMTPConfig() (*SMTPConfig, error) {
 	}, nil
 }
 
+func (m *Manager) loadSysmonConfig() (sysmonalerter.Config, error) {
+	keys := []string{
+		"sysmon_alerter_enabled", "sysmon_alerter_host", "sysmon_alerter_port",
+		"sysmon_alerter_name", "sysmon_alerter_token", "sysmon_alerter_application",
+		"sysmon_alerter_ca_pem",
+	}
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		var value string
+		err := m.db.QueryRow(`SELECT value FROM settings WHERE key=$1`, key).Scan(&value)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return sysmonalerter.Config{}, err
+		}
+		if key == "sysmon_alerter_token" && value != "" && m.secrets != nil {
+			plain, err := m.secrets.Decrypt(value)
+			if err != nil {
+				return sysmonalerter.Config{}, fmt.Errorf("decrypt sysmon_alerter_token: %w", err)
+			}
+			value = plain
+		}
+		values[key] = value
+	}
+	port := sysmonalerter.DefaultPort
+	if raw := strings.TrimSpace(values["sysmon_alerter_port"]); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%d", &port); err != nil || port < 1 || port > 65535 {
+			return sysmonalerter.Config{}, fmt.Errorf("invalid sysmon_alerter_port %q", raw)
+		}
+	}
+	return sysmonalerter.Config{
+		Enabled: strings.EqualFold(strings.TrimSpace(values["sysmon_alerter_enabled"]), "true"),
+		Host:    values["sysmon_alerter_host"], Port: port,
+		Name: values["sysmon_alerter_name"], Token: values["sysmon_alerter_token"],
+		Application: values["sysmon_alerter_application"], CAPEM: values["sysmon_alerter_ca_pem"],
+	}, nil
+}
+
 func (m *Manager) Reload() error {
 	rules, err := m.loadRules()
 	if err != nil {
@@ -266,6 +335,13 @@ func (m *Manager) Reload() error {
 	smtpCfg, err := m.loadSMTPConfig()
 	if err != nil {
 		return fmt.Errorf("load SMTP config: %w", err)
+	}
+	sysmonCfg, err := m.loadSysmonConfig()
+	if err != nil {
+		return fmt.Errorf("load sysmon-web alerter config: %w", err)
+	}
+	if err := m.sysmonClient.UpdateConfig(sysmonCfg); err != nil {
+		return fmt.Errorf("load sysmon-web alerter config: %w", err)
 	}
 	m.mu.Lock()
 	m.rules = rules
@@ -296,8 +372,10 @@ func (m *Manager) Evaluate(ctx context.Context) {
 	allStats := m.statsStore.List()
 	now := time.Now()
 	activeRuleIDs := make(map[int]struct{}, len(rules))
+	rulesByID := make(map[int]Rule, len(rules))
 	for _, rule := range rules {
 		activeRuleIDs[rule.ID] = struct{}{}
+		rulesByID[rule.ID] = rule
 		for _, ds := range allStats {
 			if ds == nil || ds.DeviceID <= 0 {
 				continue
@@ -305,18 +383,18 @@ func (m *Manager) Evaluate(ctx context.Context) {
 			key := stateKey(rule.ID, ds.DeviceID)
 			policy, ok := policies[ds.DeviceID]
 			if !ok || !m.ruleApplies(rule, ds, policy, now) {
-				m.handleResolved(key, rule.ID, ds.DeviceID)
+				m.handleResolved(ctx, key, rule, ds.DeviceID, "device no longer matches the rule scope or alert policy")
 				continue
 			}
 			value, ok := m.getMetricValue(rule.Metric, ds, policy, now)
 			if !ok {
-				m.handleResolved(key, rule.ID, ds.DeviceID)
+				m.handleResolved(ctx, key, rule, ds.DeviceID, "metric is no longer available")
 				continue
 			}
 			if evaluateCondition(rule.Operator, value, rule.Threshold) {
 				m.handleTriggered(rule, ds, value, now)
 			} else {
-				m.handleResolved(key, rule.ID, ds.DeviceID)
+				m.handleResolved(ctx, key, rule, ds.DeviceID, fmt.Sprintf("condition returned to normal at %.2f", value))
 			}
 		}
 	}
@@ -336,7 +414,11 @@ func (m *Manager) Evaluate(ctx context.Context) {
 	}
 	m.mu.RUnlock()
 	for _, s := range stale {
-		m.handleResolved(stateKey(s.RuleID, s.DeviceID), s.RuleID, s.DeviceID)
+		rule, ok := rulesByID[s.RuleID]
+		if !ok {
+			continue
+		}
+		m.handleResolved(ctx, stateKey(s.RuleID, s.DeviceID), rule, s.DeviceID, "device is no longer present in the monitored inventory")
 	}
 }
 
@@ -419,6 +501,13 @@ func (m *Manager) getMetricValue(metric string, ds *stats.DeviceStats, policy de
 		if ds.Wireless.Radio5GHz != nil {
 			return float64(ds.Wireless.Radio5GHz.Signal), true
 		}
+	case MetricSignal6GHz:
+		// Radio6GHz is also used as the secondary slot for a second 5 GHz
+		// interface on Wave MLO5. Frequency prevents that compatibility slot
+		// from being mislabeled as a 6 GHz measurement.
+		if radio := ds.Wireless.Radio6GHz; radio != nil && radio.Frequency >= 5925 {
+			return float64(radio.Signal), true
+		}
 	case MetricSignalLTU:
 		if ds.Wireless.RadioLTU != nil {
 			return float64(ds.Wireless.RadioLTU.Signal), true
@@ -451,6 +540,117 @@ func (m *Manager) getMetricValue(metric string, ds *stats.DeviceStats, policy de
 		if ds.Wireless.LinkScore != nil {
 			return float64(ds.Wireless.LinkScore.DL), true
 		}
+	case MetricInterference:
+		value, found := maxRadioInterference(ds)
+		return value, found
+	case MetricChainImbalance:
+		value, found := maxRadioChainImbalance(ds)
+		return value, found
+	case MetricGPSSync:
+		return gpsSyncMetric(ds)
+	}
+	return 0, false
+}
+
+func maxRadioInterference(ds *stats.DeviceStats) (float64, bool) {
+	if ds == nil {
+		return 0, false
+	}
+	maxValue := 0.0
+	found := false
+	check := func(radio *stats.RadioStats) {
+		if radio == nil || radio.Utilization == nil || !finite(radio.Utilization.Interference) {
+			return
+		}
+		if !found || radio.Utilization.Interference > maxValue {
+			maxValue = radio.Utilization.Interference
+		}
+		found = true
+	}
+	check(ds.Wireless.Radio60GHz)
+	check(ds.Wireless.Radio5GHz)
+	check(ds.Wireless.Radio6GHz)
+	check(ds.Wireless.RadioLTU)
+	for i := range ds.Wireless.Radios {
+		check(&ds.Wireless.Radios[i])
+	}
+	return maxValue, found
+}
+
+func maxRadioChainImbalance(ds *stats.DeviceStats) (float64, bool) {
+	if ds == nil {
+		return 0, false
+	}
+	maxSpread := 0.0
+	found := false
+	check := func(radio *stats.RadioStats) {
+		if radio == nil || len(radio.SignalPerChain) < 2 {
+			return
+		}
+		minSignal, maxSignal, count := 0, 0, 0
+		for _, signal := range radio.SignalPerChain {
+			// Chain RSSI is reported in negative dBm. Zero is the parser's
+			// missing-value default and must not create a false imbalance.
+			if signal >= 0 {
+				continue
+			}
+			if count == 0 || signal < minSignal {
+				minSignal = signal
+			}
+			if count == 0 || signal > maxSignal {
+				maxSignal = signal
+			}
+			count++
+		}
+		if count < 2 {
+			return
+		}
+		spread := float64(maxSignal - minSignal)
+		if !found || spread > maxSpread {
+			maxSpread = spread
+		}
+		found = true
+	}
+	check(ds.Wireless.Radio60GHz)
+	check(ds.Wireless.Radio5GHz)
+	check(ds.Wireless.Radio6GHz)
+	check(ds.Wireless.RadioLTU)
+	for i := range ds.Wireless.Radios {
+		check(&ds.Wireless.Radios[i])
+	}
+	return maxSpread, found
+}
+
+func gpsSyncMetric(ds *stats.DeviceStats) (float64, bool) {
+	if ds == nil {
+		return 0, false
+	}
+	seen := false
+	check := func(radio *stats.RadioStats) bool {
+		if radio == nil || radio.GPSSyncState == 0 {
+			return false
+		}
+		seen = true
+		return radio.GPSSyncState == 2
+	}
+	if check(ds.Wireless.Radio60GHz) || check(ds.Wireless.Radio5GHz) ||
+		check(ds.Wireless.Radio6GHz) || check(ds.Wireless.RadioLTU) {
+		return 1, true
+	}
+	for i := range ds.Wireless.Radios {
+		if check(&ds.Wireless.Radios[i]) {
+			return 1, true
+		}
+	}
+	if seen {
+		return 0, true
+	}
+	// A true parsed configuration value is still useful when the platform
+	// omits the live radio state. A false value is not enough to distinguish
+	// "not configured" from "configured but unsynchronized", so it remains
+	// unavailable rather than generating a false alert.
+	if ds.Config != nil && ds.Config.GPSSync {
+		return 1, true
 	}
 	return 0, false
 }
@@ -524,7 +724,7 @@ func (m *Manager) handleTriggered(rule Rule, ds *stats.DeviceStats, value float6
 	severity := m.determineSeverity(rule, value)
 	alert := Alert{RuleID: &rule.ID, DeviceID: ds.DeviceID, Metric: rule.Metric, Value: value,
 		Threshold: rule.Threshold, Message: message, Severity: severity, Status: "active", TriggeredAt: now}
-	payload := notificationPayload{Rule: rule, Alert: alert, Device: notificationDevice{
+	payload := notificationPayload{Event: "triggered", Rule: rule, Alert: alert, Device: notificationDevice{
 		ID: ds.DeviceID, SiteID: ds.SiteID, IP: ds.IP, MAC: ds.MAC, Hostname: ds.Hostname,
 	}}
 	payloadJSON, err := json.Marshal(payload)
@@ -556,9 +756,9 @@ func (m *Manager) handleTriggered(rule Rule, ds *stats.DeviceStats, value float6
 	}
 	for _, channel := range uniqueChannels(rule.NotifyChannels) {
 		if _, err := tx.Exec(`
-			INSERT INTO alert_notification_outbox (alert_id, channel, payload)
-			VALUES ($1,$2,$3::jsonb)
-			ON CONFLICT (alert_id, channel) DO NOTHING
+			INSERT INTO alert_notification_outbox (alert_id, channel, event, payload)
+			VALUES ($1,$2,'triggered',$3::jsonb)
+			ON CONFLICT (alert_id, channel, event) DO NOTHING
 		`, alertID, channel, payloadJSON); err != nil {
 			log.Printf("enqueue %s notification: %v", channel, err)
 			return
@@ -581,7 +781,7 @@ func (m *Manager) handleTriggered(rule Rule, ds *stats.DeviceStats, value float6
 	m.wakeNotificationWorker()
 }
 
-func (m *Manager) handleResolved(key string, ruleID, deviceID int) {
+func (m *Manager) handleResolved(ctx context.Context, key string, rule Rule, deviceID int, reason string) {
 	m.mu.RLock()
 	state, exists := m.states[key]
 	if exists {
@@ -598,16 +798,16 @@ func (m *Manager) handleResolved(key string, ruleID, deviceID int) {
 		return
 	}
 	defer tx.Rollback()
+	enqueued := false
 	if state.Notified {
-		if _, err := tx.Exec(`
-			UPDATE alerts SET status='resolved', resolved_at=NOW()
-			WHERE rule_id=$1 AND device_id=$2 AND status IN ('active','acknowledged')
-		`, ruleID, deviceID); err != nil {
+		var err error
+		enqueued, err = m.resolveRuleDeviceAlertsTx(ctx, tx, rule, deviceID, reason)
+		if err != nil {
 			log.Printf("resolve alerts failed: %v", err)
 			return
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM alert_states WHERE rule_id=$1 AND device_id=$2`, ruleID, deviceID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM alert_states WHERE rule_id=$1 AND device_id=$2`, rule.ID, deviceID); err != nil {
 		log.Printf("delete alert state failed: %v", err)
 		return
 	}
@@ -618,6 +818,9 @@ func (m *Manager) handleResolved(key string, ruleID, deviceID int) {
 	m.mu.Lock()
 	delete(m.states, key)
 	m.mu.Unlock()
+	if enqueued {
+		m.wakeNotificationWorker()
+	}
 }
 
 func (m *Manager) formatAlertMessage(rule Rule, ds *stats.DeviceStats, value float64) string {
@@ -625,13 +828,23 @@ func (m *Manager) formatAlertMessage(rule Rule, ds *stats.DeviceStats, value flo
 	if hostname == "" {
 		hostname = ds.IP
 	}
+	if rule.Metric == MetricGPSSync {
+		state := "not synchronized"
+		if value >= 1 {
+			state = "synchronized"
+		}
+		return fmt.Sprintf("%s: GPS synchronization is %s on %s", rule.Name, state, hostname)
+	}
 	opStr := map[string]string{OpLT: "below", OpLTE: "at or below", OpGT: "above", OpGTE: "at or above", OpEQ: "equal to", OpNE: "not equal to"}[rule.Operator]
 	return fmt.Sprintf("%s: %s is %s threshold (%.2f %s %.2f) on %s", rule.Name, rule.Metric, opStr, value, rule.Operator, rule.Threshold, hostname)
 }
 
 func (m *Manager) determineSeverity(rule Rule, value float64) string {
+	if rule.Severity == SeverityInfo || rule.Severity == SeverityWarning || rule.Severity == SeverityCritical {
+		return rule.Severity
+	}
 	switch rule.Metric {
-	case MetricSignal60GHz, MetricSignal5GHz, MetricSignalLTU:
+	case MetricSignal60GHz, MetricSignal5GHz, MetricSignal6GHz, MetricSignalLTU:
 		if value < -80 {
 			return SeverityCritical
 		}
@@ -659,6 +872,38 @@ func (m *Manager) determineSeverity(rule Rule, value float64) string {
 		if value > 300 {
 			return SeverityWarning
 		}
+	case MetricCapacity:
+		if value < 25 {
+			return SeverityCritical
+		}
+		if value < 100 {
+			return SeverityWarning
+		}
+	case MetricLinkScore:
+		if value < 25 {
+			return SeverityCritical
+		}
+		if value < 50 {
+			return SeverityWarning
+		}
+	case MetricInterference:
+		if value >= 50 {
+			return SeverityCritical
+		}
+		if value >= 25 {
+			return SeverityWarning
+		}
+	case MetricChainImbalance:
+		if value >= 12 {
+			return SeverityCritical
+		}
+		if value >= 6 {
+			return SeverityWarning
+		}
+	case MetricGPSSync:
+		if value < 1 {
+			return SeverityCritical
+		}
 	}
 	return SeverityWarning
 }
@@ -678,6 +923,10 @@ func normalizeRule(rule *Rule) {
 	}
 	rule.Metric = strings.ToLower(strings.TrimSpace(rule.Metric))
 	rule.Operator = strings.ToLower(strings.TrimSpace(rule.Operator))
+	rule.Severity = strings.ToLower(strings.TrimSpace(rule.Severity))
+	if rule.Severity == "" {
+		rule.Severity = SeverityAuto
+	}
 	rule.WebhookURL = strings.TrimSpace(rule.WebhookURL)
 	for i := range rule.NotifyChannels {
 		rule.NotifyChannels[i] = strings.ToLower(strings.TrimSpace(rule.NotifyChannels[i]))
@@ -705,26 +954,15 @@ func uniqueChannels(channels []string) []string {
 	return out
 }
 
-func resetRuleStateTx(tx *sql.Tx, ruleID int) error {
-	// A rule edit, disable, or deletion invalidates notifications that have not
-	// yet been claimed for delivery. A row already in "sending" may already be
-	// on the wire, so it is allowed to finish rather than pretending it can be
-	// recalled.
-	if _, err := tx.Exec(`
-		UPDATE alert_notification_outbox o
-		SET status='dead', last_error='notification canceled because alert rule changed or was deleted', updated_at=NOW()
-		FROM alerts a
-		WHERE o.alert_id=a.id AND a.rule_id=$1 AND o.status IN ('pending','failed')
-	`, ruleID); err != nil {
-		return err
+func (m *Manager) resetRuleStateTx(ctx context.Context, tx *sql.Tx, rule Rule, reason string) (bool, error) {
+	enqueued, err := m.resolveRuleAlertsTx(ctx, tx, rule, reason)
+	if err != nil {
+		return false, err
 	}
-	if _, err := tx.Exec(`UPDATE alerts SET status='resolved',resolved_at=NOW() WHERE rule_id=$1 AND status IN ('active','acknowledged')`, ruleID); err != nil {
-		return err
+	if _, err := tx.ExecContext(ctx, `DELETE FROM alert_states WHERE rule_id=$1`, rule.ID); err != nil {
+		return false, err
 	}
-	if _, err := tx.Exec(`DELETE FROM alert_states WHERE rule_id=$1`, ruleID); err != nil {
-		return err
-	}
-	return nil
+	return enqueued, nil
 }
 
 func (m *Manager) clearRuleStateMemory(ruleID int) {
@@ -769,12 +1007,12 @@ func (m *Manager) CreateRule(rule *Rule) (int, error) {
 	var id int
 	err := m.db.QueryRow(`
 		INSERT INTO alert_rules (name,enabled,scope,scope_id,target_role,require_alertable,metric,operator,threshold,
-		 duration_seconds,notify_channels,notify_emails,webhook_url,cooldown_seconds,created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13,''),$14,$15)
+		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,$16,$17)
 		RETURNING id
 	`, rule.Name, rule.Enabled, rule.Scope, rule.ScopeID, rule.TargetRole, rule.RequireAlertable, rule.Metric, rule.Operator,
-		rule.Threshold, rule.DurationSeconds, pq.Array(rule.NotifyChannels), pq.Array(rule.NotifyEmails), rule.WebhookURL,
-		rule.CooldownSeconds, rule.CreatedBy).Scan(&id)
+		rule.Threshold, rule.DurationSeconds, rule.Severity, pq.Array(rule.NotifyChannels), pq.Array(rule.NotifyEmails), rule.WebhookURL,
+		rule.NotifyRecovery, rule.CooldownSeconds, rule.CreatedBy).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -788,10 +1026,10 @@ func (m *Manager) GetRule(id int) (Rule, error) {
 	var webhook sql.NullString
 	err := m.db.QueryRow(`
 		SELECT id,name,enabled,scope,scope_id,target_role,require_alertable,metric,operator,threshold,
-		 duration_seconds,notify_channels,notify_emails,webhook_url,cooldown_seconds,created_at,COALESCE(created_by,0)
+		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_at,COALESCE(created_by,0)
 		FROM alert_rules WHERE id=$1
 	`, id).Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable, &r.Metric,
-		&r.Operator, &r.Threshold, &r.DurationSeconds, &channels, &emails, &webhook, &r.CooldownSeconds, &r.CreatedAt, &r.CreatedBy)
+		&r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhook, &r.NotifyRecovery, &r.CooldownSeconds, &r.CreatedAt, &r.CreatedBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return r, ErrNotFound
 	}
@@ -827,22 +1065,30 @@ func (m *Manager) UpdateRule(id int, rule *Rule) error {
 	} else if err != nil {
 		return err
 	}
-	if err := resetRuleStateTx(tx, id); err != nil {
+	oldRule, err := getRuleTx(context.Background(), tx, id)
+	if err != nil {
+		return err
+	}
+	enqueued, err := m.resetRuleStateTx(context.Background(), tx, oldRule, "alert rule was changed or disabled")
+	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`
 		UPDATE alert_rules SET name=$1,enabled=$2,scope=$3,scope_id=$4,target_role=$5,require_alertable=$6,
-		 metric=$7,operator=$8,threshold=$9,duration_seconds=$10,notify_channels=$11,notify_emails=$12,
-		 webhook_url=NULLIF($13,''),cooldown_seconds=$14,updated_at=NOW() WHERE id=$15
+		 metric=$7,operator=$8,threshold=$9,duration_seconds=$10,severity=$11,notify_channels=$12,notify_emails=$13,
+		 webhook_url=NULLIF($14,''),notify_recovery=$15,cooldown_seconds=$16,updated_at=NOW() WHERE id=$17
 	`, rule.Name, rule.Enabled, rule.Scope, rule.ScopeID, rule.TargetRole, rule.RequireAlertable, rule.Metric, rule.Operator,
-		rule.Threshold, rule.DurationSeconds, pq.Array(rule.NotifyChannels), pq.Array(rule.NotifyEmails), rule.WebhookURL,
-		rule.CooldownSeconds, id); err != nil {
+		rule.Threshold, rule.DurationSeconds, rule.Severity, pq.Array(rule.NotifyChannels), pq.Array(rule.NotifyEmails), rule.WebhookURL,
+		rule.NotifyRecovery, rule.CooldownSeconds, id); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	m.clearRuleStateMemory(id)
+	if enqueued {
+		m.wakeNotificationWorker()
+	}
 	return m.Reload()
 }
 
@@ -858,7 +1104,12 @@ func (m *Manager) DeleteRule(id int) error {
 	} else if err != nil {
 		return err
 	}
-	if err := resetRuleStateTx(tx, id); err != nil {
+	oldRule, err := getRuleTx(context.Background(), tx, id)
+	if err != nil {
+		return err
+	}
+	enqueued, err := m.resetRuleStateTx(context.Background(), tx, oldRule, "alert rule was deleted")
+	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM alert_rules WHERE id=$1`, id); err != nil {
@@ -868,13 +1119,16 @@ func (m *Manager) DeleteRule(id int) error {
 		return err
 	}
 	m.clearRuleStateMemory(id)
+	if enqueued {
+		m.wakeNotificationWorker()
+	}
 	return m.Reload()
 }
 
 func (m *Manager) ListRules() ([]Rule, error) {
 	rows, err := m.db.Query(`
 		SELECT id,name,enabled,scope,scope_id,target_role,require_alertable,metric,operator,threshold,
-		 duration_seconds,notify_channels,notify_emails,webhook_url,cooldown_seconds,created_at
+		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_at
 		FROM alert_rules ORDER BY name
 	`)
 	if err != nil {
@@ -888,8 +1142,8 @@ func (m *Manager) ListRules() ([]Rule, error) {
 		var channels, emails pq.StringArray
 		var webhook sql.NullString
 		if err := rows.Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable,
-			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &channels, &emails, &webhook,
-			&r.CooldownSeconds, &r.CreatedAt); err != nil {
+			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhook,
+			&r.NotifyRecovery, &r.CooldownSeconds, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		if scopeID.Valid {
@@ -912,10 +1166,11 @@ type alertScanner interface{ Scan(dest ...any) error }
 func scanAlert(row alertScanner) (Alert, error) {
 	var a Alert
 	var ruleID, ackBy sql.NullInt64
-	var ackAt, resAt sql.NullTime
+	var ackAt, resAt, notifiedAt, recoveryNotifiedAt sql.NullTime
 	var value, threshold sql.NullFloat64
+	var notifyError, recoveryNotifyError sql.NullString
 	err := row.Scan(&a.ID, &ruleID, &a.DeviceID, &a.Metric, &value, &threshold, &a.Message, &a.Severity,
-		&a.Status, &a.TriggeredAt, &ackAt, &ackBy, &resAt)
+		&a.Status, &a.TriggeredAt, &ackAt, &ackBy, &resAt, &notifiedAt, &notifyError, &recoveryNotifiedAt, &recoveryNotifyError)
 	if err != nil {
 		return a, err
 	}
@@ -939,6 +1194,21 @@ func scanAlert(row alertScanner) (Alert, error) {
 	if resAt.Valid {
 		a.ResolvedAt = &resAt.Time
 	}
+	if notifiedAt.Valid {
+		a.NotifiedAt = &notifiedAt.Time
+	}
+	if notifyError.Valid {
+		a.NotifyError = notifyError.String
+	}
+	if recoveryNotifiedAt.Valid {
+		a.RecoveryNotifiedAt = &recoveryNotifiedAt.Time
+	}
+	if recoveryNotifyError.Valid {
+		a.RecoveryNotifyError = recoveryNotifyError.String
+	}
+	a.NotifyChannels = []string{}
+	a.RecoveryChannels = []string{}
+	a.Deliveries = []NotificationDelivery{}
 	return a, nil
 }
 
@@ -950,12 +1220,18 @@ func (m *Manager) ListAlerts(status string, limit int) ([]Alert, error) {
 		limit = 500
 	}
 	status = strings.ToLower(strings.TrimSpace(status))
-	if status != "" && status != "active" && status != "acknowledged" && status != "resolved" {
+	if status != "" && status != "open" && status != "active" && status != "acknowledged" && status != "resolved" {
 		return nil, fmt.Errorf("invalid alert status")
 	}
-	query := `SELECT id,rule_id,device_id,metric,value,threshold,message,severity,status,triggered_at,acknowledged_at,acknowledged_by,resolved_at FROM alerts`
+	query := `SELECT id,rule_id,device_id,metric,value,threshold,message,severity,status,triggered_at,
+	                 acknowledged_at,acknowledged_by,resolved_at,notified_at,notify_error,
+	                 recovery_notified_at,recovery_notify_error FROM alerts`
 	args := []any{}
-	if status != "" {
+	switch status {
+	case "open":
+		query += ` WHERE status IN ('active','acknowledged')`
+	case "":
+	default:
 		query += ` WHERE status=$1`
 		args = append(args, status)
 	}
@@ -965,16 +1241,103 @@ func (m *Manager) ListAlerts(status string, limit int) ([]Alert, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var alerts []Alert
+	alertIndexes := map[int]int{}
 	for rows.Next() {
 		a, err := scanAlert(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
+		alertIndexes[a.ID] = len(alerts)
 		alerts = append(alerts, a)
 	}
-	return alerts, rows.Err()
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(alerts) == 0 {
+		return alerts, nil
+	}
+	ids := make([]int, 0, len(alerts))
+	for _, alert := range alerts {
+		ids = append(ids, alert.ID)
+	}
+	deliveryRows, err := m.db.Query(`
+		SELECT alert_id,channel,event,status,attempts,COALESCE(last_error,''),next_attempt_at,sent_at
+		FROM alert_notification_outbox
+		WHERE alert_id=ANY($1)
+		ORDER BY alert_id,event,channel
+	`, pq.Array(ids))
+	if err != nil {
+		return nil, err
+	}
+	for deliveryRows.Next() {
+		var alertID int
+		var delivery NotificationDelivery
+		var nextAttempt sql.NullTime
+		var sentAt sql.NullTime
+		if err := deliveryRows.Scan(&alertID, &delivery.Channel, &delivery.Event, &delivery.Status,
+			&delivery.Attempts, &delivery.LastError, &nextAttempt, &sentAt); err != nil {
+			deliveryRows.Close()
+			return nil, err
+		}
+		if nextAttempt.Valid {
+			t := nextAttempt.Time
+			delivery.NextAttemptAt = &t
+		}
+		if sentAt.Valid {
+			t := sentAt.Time
+			delivery.SentAt = &t
+		}
+		if index, ok := alertIndexes[alertID]; ok {
+			alerts[index].Deliveries = append(alerts[index].Deliveries, delivery)
+		}
+	}
+	if err := deliveryRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := deliveryRows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range alerts {
+		alerts[i].NotifyChannels, alerts[i].DeliveryStatus = summarizeDeliveries(alerts[i].Deliveries, "triggered", "in_app")
+		alerts[i].RecoveryChannels, alerts[i].RecoveryDeliveryStatus = summarizeDeliveries(alerts[i].Deliveries, "resolved", "not_requested")
+	}
+	return alerts, nil
+}
+
+func summarizeDeliveries(deliveries []NotificationDelivery, event, emptyStatus string) ([]string, string) {
+	channels := []string{}
+	counts := map[string]int{}
+	for _, delivery := range deliveries {
+		if delivery.Event != event {
+			continue
+		}
+		channels = append(channels, delivery.Channel)
+		counts[delivery.Status]++
+	}
+	if len(channels) == 0 {
+		return channels, emptyStatus
+	}
+	if counts["sending"] > 0 {
+		return channels, "sending"
+	}
+	if counts["pending"] > 0 {
+		return channels, "pending"
+	}
+	if counts["failed"] > 0 {
+		return channels, "retrying"
+	}
+	if counts["sent"] == len(channels) {
+		return channels, "sent"
+	}
+	if counts["sent"] > 0 && counts["dead"] > 0 {
+		return channels, "partial"
+	}
+	return channels, "failed"
 }
 
 func (m *Manager) AcknowledgeAlert(alertID, userID int) error {
@@ -999,23 +1362,27 @@ func (m *Manager) ResolveAlert(alertID int) error {
 	defer tx.Rollback()
 	var ruleID sql.NullInt64
 	var deviceID int
-	if err := tx.QueryRow(`SELECT rule_id,device_id FROM alerts WHERE id=$1 FOR UPDATE`, alertID).Scan(&ruleID, &deviceID); errors.Is(err, sql.ErrNoRows) {
+	var status string
+	if err := tx.QueryRow(`SELECT rule_id,device_id,status FROM alerts WHERE id=$1 FOR UPDATE`, alertID).Scan(&ruleID, &deviceID, &status); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
 	}
-	res, err := tx.Exec(`UPDATE alerts SET status='resolved',resolved_at=NOW() WHERE id=$1 AND status IN ('active','acknowledged')`, alertID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if status != "active" && status != "acknowledged" {
 		return ErrNotFound
 	}
-	if _, err := tx.Exec(`
-		UPDATE alert_notification_outbox
-		SET status='dead', last_error='notification canceled by manual alert resolution', updated_at=NOW()
-		WHERE alert_id=$1 AND status IN ('pending','failed')
-	`, alertID); err != nil {
+	var rule *Rule
+	if ruleID.Valid {
+		loaded, err := getRuleTx(context.Background(), tx, int(ruleID.Int64))
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if err == nil {
+			rule = &loaded
+		}
+	}
+	enqueued, err := m.resolveAlertTx(context.Background(), tx, rule, alertID, "resolved manually by an operator")
+	if err != nil {
 		return err
 	}
 	if ruleID.Valid {
@@ -1030,8 +1397,71 @@ func (m *Manager) ResolveAlert(alertID int) error {
 		key := stateKey(int(ruleID.Int64), deviceID)
 		m.mu.Lock()
 		delete(m.states, key)
-		delete(m.lastNotified, key)
+		// Keep lastNotified so manual resolution does not bypass the rule's
+		// post-trigger cooldown. If the condition remains present, evaluation
+		// starts a fresh persistence window and may open a new occurrence only
+		// after both persistence and cooldown have elapsed.
 		m.mu.Unlock()
+	}
+	if enqueued {
+		m.wakeNotificationWorker()
+	}
+	return nil
+}
+
+// ResolveDeviceAlerts closes all active occurrences for a device after its
+// alert policy is disabled or silenced. Recovery delivery uses each alert's
+// original rule payload so rule-specific email and webhook targets are kept.
+func (m *Manager) ResolveDeviceAlerts(ctx context.Context, deviceID int, reason string) error {
+	if deviceID <= 0 {
+		return fmt.Errorf("invalid device id")
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM alerts
+		WHERE device_id=$1 AND status IN ('active','acknowledged')
+		ORDER BY id
+		FOR UPDATE
+	`, deviceID)
+	if err != nil {
+		return err
+	}
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	enqueued := false
+	for _, id := range ids {
+		queued, err := m.resolveAlertTx(ctx, tx, nil, id, reason)
+		if err != nil {
+			return err
+		}
+		enqueued = enqueued || queued
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM alert_states WHERE device_id=$1`, deviceID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.ClearDeviceState(deviceID)
+	if enqueued {
+		m.wakeNotificationWorker()
 	}
 	return nil
 }

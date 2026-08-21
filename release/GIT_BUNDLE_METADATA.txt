@@ -1,0 +1,3 @@
+base=0e3cb186d869e63a74ed69694a9d07cffbc94ea5
+commit=b58c394832affcf8a7aeee31dbec986f103881fa
+branch=openai/windows-alerts-sysmon

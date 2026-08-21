@@ -36,7 +36,7 @@ Previous tools like UNMS/UISP would grind to a halt with 500+ devices. waveContr
 ### Monitoring
 - **Real-time Stats**: Per-chain signal levels, TX/RX rates, capacity, airtime
 - **WebSocket Updates**: Live stats push without polling
-- **Alerting**: Operator-facing alert rules UI, one-click recommended rule installer, active-alert workflow, signal/offline/capacity thresholds, and durable email, webhook, and Zabbix delivery
+- **Alerting**: Ubiquiti AP/STA rules with scope/role targeting, persistence, explicit or automatic severity, acknowledgement/recovery lifecycle, per-channel delivery state, and durable email, webhook, Zabbix, or sysmon-web delivery
 - **Map View**: Leaflet/OpenStreetMap with GPS markers and signal-colored links
 - **KMZ Export**: Export device locations to Google Earth (APs-only or all devices)
 - **Quality**: Table-based AP<->client quality monitoring (Signal + Modulation) with issues queue
@@ -46,7 +46,7 @@ Previous tools like UNMS/UISP would grind to a halt with 500+ devices. waveContr
 - **Firmware Management**: Upload, delete firmware via web UI (up to 1GB)
 - **Config Management**: Backup, restore, batch push configurations
 - **Scheduled Jobs**: Upgrades, reboots, refresh with repeat options
-- **Maintenance Windows**: Define maintenance periods to pause alerts/jobs
+- **Maintenance Windows**: Define maintenance periods for scheduled jobs; radio alerts use explicit per-device alertability and silence controls
 - **Reports**: Versioned health, inventory, performance, chain-imbalance, and RX-mismatch snapshots
 
 ### Reports
@@ -102,14 +102,14 @@ waveControl uses one responsive modal runtime rather than browser-native `alert(
 - **Zabbix Bridge**: Native agent protocol on port 10050
 - **TLS Management**: Pin certificates, trust-on-first-use, or skip verification
 - **REST API**: Cookie-authenticated API for the browser and same-origin automation
-- **Durable Notifications**: Retryable email, webhook, and Zabbix delivery through a PostgreSQL outbox
+- **Durable Notifications**: Retryable trigger/recovery delivery through a PostgreSQL outbox, including sysmon-web CRITICAL/WARNING/OK reporting
 
 ### Security
 - **Role-Based Access**: Viewer, Creator, Editor, Administrator roles
 - **Privilege Dropping**: Drops to unprivileged user after startup
 - **OpenBSD Support**: pledge(2) syscall restriction
 
-### Platform Support
+### Supported Ubiquiti platforms
 | Platform | Models | API Type |
 |----------|--------|----------|
 | Wave 60GHz | GMC, GMP, MGMP | REST JSON |
@@ -121,6 +121,17 @@ waveControl uses one responsive modal runtime rather than browser-native `alert(
 | airMAX M | XM, XW | CGI/JSON |
 | AirFiber (future) | AF11, AF24, AF2X, AF3X, AF5, AF5X | REST JSON |
 
+### WaveControl host operating systems
+
+| Host OS | Runtime | Notes |
+|---|---|---|
+| Linux | Native Go binary | systemd example included |
+| OpenBSD | Native Go binary | rc.d and pledge support included |
+| FreeBSD | Native Go binary | Foreground or service wrapper |
+| Windows x64/ARM64 | Native console `.exe` | PowerShell build/run packaging included; still monitors Ubiquiti devices only |
+
+See [Windows host installation](docs/WINDOWS_HOST.md).
+
 ## Navigation
 
 | Page | Description |
@@ -130,7 +141,7 @@ waveControl uses one responsive modal runtime rather than browser-native `alert(
 | Quality | Signal + Modulation quality tables, issues queue, mismatches |
 | Config | Backup/restore, batch configuration push |
 | Reports | Generate, inspect, compare, print, and download saved network snapshots |
-| Settings | Poll interval, credentials, Zabbix, scheduled jobs |
+| Settings | Polling, credentials, alert delivery, sysmon-web, Zabbix, users, TLS, and scheduled jobs |
 
 ### Quality Page
 
@@ -254,6 +265,11 @@ EOF
 psql -U wavecontrol -h localhost wavecontrol < schema.sql
 ```
 
+#### Windows host
+
+Install PostgreSQL 14+ locally or use a reachable PostgreSQL server, then create the database and load `schema.sql` with `psql.exe`. The Windows package/build procedure is documented in [docs/WINDOWS_HOST.md](docs/WINDOWS_HOST.md).
+
+
 ### Build and Run
 
 ```bash
@@ -278,6 +294,16 @@ go build -o wavecontrol ./cmd/server
 # Access UI: http://localhost:8080
 # Remove the two WAVECONTROL_BOOTSTRAP_* variables after the first successful start.
 ```
+
+On Windows, use the complete PowerShell packaging path rather than copying only the executable:
+
+```powershell
+.\windows\build.ps1
+Copy-Item .\dist\windows-amd64\wavecontrol.env.example .\dist\windows-amd64\wavecontrol.env
+.\dist\windows-amd64\run-wavecontrol.ps1
+```
+
+The script supplies executable-relative working and web-root paths so launches from Explorer, Task Scheduler, or a service wrapper do not accidentally look for assets under `C:\Windows\System32`.
 
 ### Directory Setup
 
@@ -347,7 +373,8 @@ After setup:
 -web            Standalone HTTP server mode (implies -d)
 -addr string    Listen address (default: from settings or 127.0.0.1:8080)
 -webroot string Path to web directory (default: "web")
--pidfile string PID file path in daemon mode (default: /var/run/wavecontrol.pid)
+-workdir string Working directory for relative web, firmware, and backup paths
+-pidfile string PID file path in daemon mode (default: /var/run/wavecontrol.pid; empty on Windows)
 -U              Unchrooted mode (skip chroot, just chdir to user's home)
 -u string       User to run as (default: _wavecontrol, www, or nobody)
 ```
@@ -590,6 +617,13 @@ All configuration is done via the web UI Settings page:
 | `listen_addr` | `127.0.0.1:8080` | HTTP listen address |
 | `zabbix_enabled` | `false` | Enable Zabbix bridge |
 | `zabbix_listen` | `127.0.0.1:10050` | Zabbix agent listen address |
+| `smtp_host` / `smtp_port` | empty / `25` | Global SMTP endpoint for alert rules |
+| `zabbix_server` | empty | Outbound Zabbix sender/trapper endpoint |
+| `sysmon_alerter_enabled` | `false` | Enable sysmon-web alerter delivery |
+| `sysmon_alerter_host` / `sysmon_alerter_port` | empty / `1347` | sysmon-web TLS agent listener |
+| `sysmon_alerter_name` | `wavecontrol` | Minted sysmon-web alerter identity |
+| `sysmon_alerter_token` | empty | Encrypted sysmon-web bearer token |
+| `sysmon_alerter_ca_pem` | empty | Pinned sysmon-web certificate or CA PEM |
 | `cors_origins` | (empty) | Additional exact HTTP(S) origins; wildcard-all is rejected for cookie authentication |
 | `csp_img_sources` | (empty) | Additional CSP img-src domains for map tiles (space-separated) |
 | `csp_connect_sources` | (empty) | Additional CSP connect-src domains for APIs (space-separated) |
@@ -599,6 +633,10 @@ All configuration is done via the web UI Settings page:
 - Google: `https://*.googleapis.com https://*.gstatic.com`
 - Bing: `https://*.virtualearth.net`
 - Stamen: `https://stamen-tiles.a.ssl.fastly.net`
+
+### Alert delivery and lifecycle
+
+Alert rules and occurrences are managed on the Alerts page; global SMTP, Zabbix sender, and sysmon-web endpoints are configured under **Settings → Alert Delivery**. The page shows runtime channel readiness, and each alert shows its durable trigger/recovery delivery state. See [Alerting](docs/ALERTING.md) and [sysmon-web alerter integration](docs/SYSMON_WEB_ALERTER.md).
 
 ### Poller Configuration (Admin only)
 

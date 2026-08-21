@@ -377,6 +377,14 @@ export const api = {
     return request('GET', '/alerts/rules')
   },
 
+  async alertChannelStatuses() {
+    return request('GET', '/alerts/channels')
+  },
+
+  async testSysmonAlerter() {
+    return request('POST', '/alerts/channels/sysmon/test')
+  },
+
   async createAlertRule(rule) {
     return request('POST', '/alerts/rules', rule)
   },

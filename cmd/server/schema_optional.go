@@ -42,11 +42,22 @@ func ensureRuntimeSchema(db *sql.DB) error {
 		`ALTER TABLE sites ADD COLUMN IF NOT EXISTS tower_h_m DOUBLE PRECISION`,
 		`ALTER TABLE alert_rules
 		  ADD COLUMN IF NOT EXISTS target_role VARCHAR(16) NOT NULL DEFAULT 'all',
-		  ADD COLUMN IF NOT EXISTS require_alertable BOOLEAN NOT NULL DEFAULT TRUE`,
+		  ADD COLUMN IF NOT EXISTS require_alertable BOOLEAN NOT NULL DEFAULT TRUE,
+		  ADD COLUMN IF NOT EXISTS severity VARCHAR(20) NOT NULL DEFAULT 'auto',
+		  ADD COLUMN IF NOT EXISTS notify_recovery BOOLEAN NOT NULL DEFAULT TRUE`,
 		`ALTER TABLE alerts
 		  ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ,
-		  ADD COLUMN IF NOT EXISTS notify_error TEXT`,
+		  ADD COLUMN IF NOT EXISTS notify_error TEXT,
+		  ADD COLUMN IF NOT EXISTS recovery_notified_at TIMESTAMPTZ,
+		  ADD COLUMN IF NOT EXISTS recovery_notify_error TEXT`,
 		`UPDATE alert_rules SET target_role = 'all' WHERE target_role IS NULL OR btrim(target_role) = ''`,
+		`UPDATE alert_rules SET severity = 'auto' WHERE severity IS NULL OR severity NOT IN ('auto','info','warning','critical')`,
+		`DO $$ BEGIN
+		  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='alert_rules_severity_check') THEN
+		    ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_severity_check
+		      CHECK (severity IN ('auto','info','warning','critical'));
+		  END IF;
+		END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_devices_managed ON devices(managed)`,
 		`CREATE INDEX IF NOT EXISTS idx_devices_alertable ON devices(alertable)`,
 		`CREATE INDEX IF NOT EXISTS idx_devices_role_alertable ON devices(role, alertable)`,
@@ -76,7 +87,8 @@ func ensureRuntimeSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS alert_notification_outbox (
 		    id BIGSERIAL PRIMARY KEY,
 		    alert_id INTEGER NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
-		    channel VARCHAR(16) NOT NULL CHECK (channel IN ('email', 'webhook', 'zabbix')),
+		    channel VARCHAR(16) NOT NULL CHECK (channel IN ('email', 'webhook', 'zabbix', 'sysmon')),
+		    event VARCHAR(16) NOT NULL DEFAULT 'triggered' CHECK (event IN ('triggered', 'resolved')),
 		    payload JSONB NOT NULL,
 		    status VARCHAR(16) NOT NULL DEFAULT 'pending'
 		      CHECK (status IN ('pending', 'sending', 'failed', 'sent', 'dead')),
@@ -86,8 +98,30 @@ func ensureRuntimeSchema(db *sql.DB) error {
 		    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		    sent_at TIMESTAMPTZ,
-		    UNIQUE(alert_id, channel)
+		    CONSTRAINT alert_notification_outbox_alert_channel_event_key UNIQUE(alert_id, channel, event)
 		)`,
+		`ALTER TABLE alert_notification_outbox ADD COLUMN IF NOT EXISTS event VARCHAR(16) NOT NULL DEFAULT 'triggered'`,
+		`ALTER TABLE alert_notification_outbox DROP CONSTRAINT IF EXISTS alert_notification_outbox_alert_id_channel_key`,
+		`ALTER TABLE alert_notification_outbox DROP CONSTRAINT IF EXISTS alert_notification_outbox_channel_check`,
+		`ALTER TABLE alert_notification_outbox DROP CONSTRAINT IF EXISTS alert_notification_outbox_event_check`,
+		`DO $$ BEGIN
+		  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='alert_notification_outbox_channel_check') THEN
+		    ALTER TABLE alert_notification_outbox ADD CONSTRAINT alert_notification_outbox_channel_check
+		      CHECK (channel IN ('email','webhook','zabbix','sysmon'));
+		  END IF;
+		END $$`,
+		`DO $$ BEGIN
+		  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='alert_notification_outbox_event_check') THEN
+		    ALTER TABLE alert_notification_outbox ADD CONSTRAINT alert_notification_outbox_event_check
+		      CHECK (event IN ('triggered','resolved'));
+		  END IF;
+		END $$`,
+		`DO $$ BEGIN
+		  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname IN ('alert_notification_outbox_alert_channel_event_key','alert_notification_outbox_alert_id_channel_event_key')) THEN
+		    ALTER TABLE alert_notification_outbox ADD CONSTRAINT alert_notification_outbox_alert_channel_event_key
+		      UNIQUE (alert_id, channel, event);
+		  END IF;
+		END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_alert_notification_outbox_due
 		  ON alert_notification_outbox(status, next_attempt_at, id)`,
 		// Native APNs/FCM delivery is intentionally out of scope. Remove the
@@ -131,10 +165,10 @@ func validateRuntimeSchema(db *sql.DB) error {
 		"sites":                      {"id", "name", "tower_h_m"},
 		"devices":                    {"id", "mac", "ip_address", "role", "managed", "alertable", "alert_silenced_until", "username", "password", "status"},
 		"scheduled_jobs":             {"id", "status", "progress", "total_devices", "completed_devices", "error_message"},
-		"alert_rules":                {"id", "enabled", "scope", "scope_id", "target_role", "require_alertable", "metric", "operator", "threshold", "notify_channels"},
-		"alerts":                     {"id", "rule_id", "device_id", "status", "triggered_at", "resolved_at", "notified_at", "notify_error"},
+		"alert_rules":                {"id", "enabled", "scope", "scope_id", "target_role", "require_alertable", "metric", "operator", "threshold", "severity", "notify_channels", "notify_recovery"},
+		"alerts":                     {"id", "rule_id", "device_id", "status", "triggered_at", "resolved_at", "notified_at", "notify_error", "recovery_notified_at", "recovery_notify_error"},
 		"alert_states":               {"rule_id", "device_id", "first_triggered_at", "last_value", "last_checked_at", "notified"},
-		"alert_notification_outbox":  {"id", "alert_id", "channel", "payload", "status", "attempts", "next_attempt_at", "last_error", "updated_at", "sent_at"},
+		"alert_notification_outbox":  {"id", "alert_id", "channel", "event", "payload", "status", "attempts", "next_attempt_at", "last_error", "updated_at", "sent_at"},
 		"device_identity_mismatches": {"device_id", "expected_mac", "observed_macs", "observed_ip"},
 		"reports":                    {"id", "type", "data"},
 		"job_runs":                   {"id", "job_type", "status"},

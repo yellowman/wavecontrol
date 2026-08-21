@@ -3483,88 +3483,72 @@ CREATE TABLE device_certs (
 
 ## Alerting System
 
-Monitor device metrics and receive notifications when thresholds are crossed.
+WaveControl alerting is limited to Ubiquiti AP and STA inventory/telemetry. The operating system hosting WaveControl is not an alert target.
 
-### Supported Metrics
+### Rule model
 
-| Metric | Description | Unit |
-|--------|-------------|------|
-| `signal_60ghz` | 60GHz radio signal strength | dBm |
-| `signal_5ghz` | 5GHz radio signal strength | dBm |
-| `signal_ltu` | LTU radio signal strength | dBm |
-| `cpu` | CPU usage | % |
-| `temperature` | CPU temperature | degC |
-| `ram` | Memory usage | % |
-| `offline_duration` | Time since device went offline | seconds |
-| `capacity` | Link capacity | Mbps |
-| `peer_count` | Number of connected peers | count |
-| `link_score` | Link quality score | % |
+A rule contains:
 
-### Operators
+- inventory scope: `all`, `site`, or `device`;
+- role target: `all`, `ap`, or `sta`;
+- optional enforcement of `devices.alertable` and `alert_silenced_until`;
+- metric, operator, threshold, and persistence duration;
+- severity: `auto`, `info`, `warning`, or `critical`;
+- zero or more notification channels;
+- optional clear/recovery delivery;
+- post-trigger cooldown.
 
-- `lt` - Less than
-- `lte` - Less than or equal
-- `gt` - Greater than
-- `gte` - Greater than or equal
-- `eq` - Equal to
-- `ne` - Not equal to
+Supported metrics are `signal_60ghz`, `signal_5ghz`, `signal_6ghz`, `signal_ltu`, `cpu`, `temperature`, `ram`, `offline_duration`, `capacity`, `peer_count`, `link_score`, `interference`, `chain_imbalance`, and `gps_sync`. `chain_imbalance` is the largest valid per-chain receive-signal spread reported by any radio. `gps_sync` is available only when a live GPS-sync state is present (or a positive parsed synchronized state), and is `1` while synchronized and `0` while a live state reports unsynchronized. A missing metric does not compare as zero; the device is skipped and an existing occurrence is closed as no longer applicable.
 
-### API Endpoints
+Evaluation order is: enabled rule, scope, role, device alert policy, metric availability, condition, persistence, cooldown, durable occurrence/outbox creation.
+
+### Occurrence lifecycle
+
+- One rule/device pair has at most one active occurrence.
+- Acknowledgement marks the occurrence seen but does not alter evaluation or recovery.
+- Automatic recovery, manual resolution, device policy changes, and rule changes all use one transactional close path.
+- Manual resolution preserves the previous trigger time; an ongoing condition cannot bypass cooldown.
+- Trigger notifications that have not left the outbox are canceled when the occurrence closes.
+- Recovery is queued only for channels where the trigger was sent or was concurrently in flight and only when `notify_recovery` is true.
+- Rule edits and deletion resolve old occurrences and clear old duration state before the new definition is loaded.
+
+### Durable notification delivery
+
+Channels are `email`, `webhook`, `zabbix`, and `sysmon`. Rules with no channel still create in-application history.
+
+`alert_notification_outbox` is unique by `(alert_id, channel, event)` where event is `triggered` or `resolved`. Workers claim with `FOR UPDATE SKIP LOCKED` and recover stale claims. Email, webhook, and Zabbix stop after eight exponentially backed-off attempts. sysmon-web retries after 5 seconds, doubles to a 60-second cap, and remains retryable while that trigger or matching recovery is still relevant. The alert API returns safe per-channel status, attempt count, next attempt, sent time, and last error.
+
+Webhook delivery must reject unsafe schemes, embedded credentials, loopback, private, link-local, multicast, documentation, and metadata destinations, including redirected/resolved destinations.
+
+### sysmon-web alerter
+
+Admin settings are:
+
+- `sysmon_alerter_enabled`
+- `sysmon_alerter_host`
+- `sysmon_alerter_port` (default 1347)
+- `sysmon_alerter_name`
+- `sysmon_alerter_token` (encrypted and masked)
+- `sysmon_alerter_application`
+- `sysmon_alerter_ca_pem`
+
+The client uses pinned TLS, authenticates with `ALERTER`, maintains one serialized long-lived connection, sends keepalive `PING`, and accepts only `333` success or `444` refusal lines. Trigger mapping is critical→`CRITICAL`, warning/info→`WARNING`; recovery→`OK`. Object identity is stable as `device-<device-id>-rule-<rule-id>`.
+
+### API
 
 ```
-# Alert Rules
-GET    /api/wavecontrol/alerts/rules           # List all rules
-POST   /api/wavecontrol/alerts/rules           # Create rule
-PATCH  /api/wavecontrol/alerts/rules/{id}      # Update rule
-DELETE /api/wavecontrol/alerts/rules/{id}      # Delete rule
-
-# Alerts
-GET    /api/wavecontrol/alerts                 # List alerts (filter with ?status=active)
-POST   /api/wavecontrol/alerts/{id}/acknowledge # Acknowledge alert
-POST   /api/wavecontrol/alerts/{id}/resolve    # Resolve alert
+GET    /api/wavecontrol/alerts/rules
+POST   /api/wavecontrol/alerts/rules
+PATCH  /api/wavecontrol/alerts/rules/{id}
+DELETE /api/wavecontrol/alerts/rules/{id}
+GET    /api/wavecontrol/alerts
+POST   /api/wavecontrol/alerts/{id}/acknowledge
+POST   /api/wavecontrol/alerts/{id}/resolve
+GET    /api/wavecontrol/alerts/channels
+POST   /api/wavecontrol/alerts/channels/sysmon/test
 ```
 
-### Example: Create Signal Alert
-
-```json
-POST /api/wavecontrol/alerts/rules
-{
-  "name": "Low Signal Warning",
-  "metric": "signal_60ghz",
-  "operator": "lt",
-  "threshold": -70,
-  "duration_seconds": 300,
-  "scope": "all",
-  "notify_channels": ["email", "webhook"],
-  "notify_emails": ["ops@example.com"],
-  "webhook_url": "https://slack.example.com/webhook",
-  "cooldown_seconds": 3600
-}
-```
-
-### Notification Channels
-
-1. **Email** - SMTP configuration via settings:
-   - `smtp_host`, `smtp_port`, `smtp_username`, `smtp_password`, `smtp_from`
-
-2. **Webhook** - HTTP POST with JSON payload:
-   ```json
-   {
-     "alert_id": 123,
-     "rule_name": "Low Signal Warning",
-     "device_id": 45,
-     "device_ip": "192.168.1.100",
-     "hostname": "AP-Tower-01",
-     "metric": "signal_60ghz",
-     "value": -75,
-     "threshold": -70,
-     "severity": "warning",
-     "message": "Low Signal Warning: signal_60ghz is below threshold...",
-     "triggered_at": "2025-01-15T10:30:00Z"
-   }
-   ```
-
-3. **Zabbix** - Triggers via zabbix_sender or HTTP API
+The sysmon test endpoint is administrator-only and performs TLS, authentication, `PING`, and `QUIT` without sending an alert.
 
 ---
 
@@ -5477,4 +5461,11 @@ Alert evaluation is server-authoritative and uses two layers:
 1. Alert rule targeting: `scope` narrows by inventory scope (`all`, `site`, or `device`), `target_role` narrows by role (`all`, `ap`, `sta`), and `require_alertable` controls whether per-device alert policy is honored.
 2. Device alert policy: `devices.alertable`, `devices.alert_silenced_until`, and `devices.alert_notes` define operator intent for each inventory row.
 
-Evaluation order is: enabled rule, scope match, role match, alertable/silence gate, metric existence, threshold condition, duration, cooldown, notification.
+Evaluation order is: enabled rule, scope match, role match, alertable/silence gate, metric existence, threshold condition, persistence, cooldown, transactional occurrence/outbox creation. Full lifecycle semantics are defined in the Alerting System section and `docs/ALERTING.md`.
+
+
+## Windows host runtime
+
+Windows is a supported WaveControl server host, not a monitored endpoint type. `GOOS=windows` builds must use `CGO_ENABLED=0` and include the same Ubiquiti poller, PostgreSQL storage, web UI, alert engine, and report implementation as Unix builds.
+
+The Windows executable runs in the foreground. It must not change to a user-profile directory implicitly. When no explicit `-workdir` is provided and a relative web root is used, it may prefer the executable directory if the current directory lacks `web/index.html`. Release packaging must include `wavecontrol.exe`, `web/`, `schema.sql`, migrations, run/environment examples, and writable firmware/backup directories. PowerShell launch scripts must pass explicit executable-relative `-workdir` and `-webroot` values.

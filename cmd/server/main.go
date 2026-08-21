@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,7 +49,8 @@ var (
 	flagWeb        = flag.Bool("web", false, "Run as standalone HTTP server (implies -d)")
 	flagAddr       = flag.String("addr", "", "Listen address (default: from settings or 127.0.0.1:8080)")
 	flagWebRoot    = flag.String("webroot", "web", "Path to web directory")
-	flagPidFile    = flag.String("pidfile", "/var/run/wavecontrol.pid", "PID file path (daemon mode)")
+	flagWorkDir    = flag.String("workdir", "", "Working directory for relative web, firmware, and backup paths")
+	flagPidFile    = flag.String("pidfile", defaultPIDFile(), "PID file path (daemon mode)")
 	flagUnchrooted = flag.Bool("U", false, "Unchrooted mode (skip chroot, just chdir)")
 	flagUser       = flag.String("u", "", "User to run as (default: _wavecontrol, www, or nobody)")
 )
@@ -89,6 +91,18 @@ func logFatal(format string, v ...any) {
 
 func main() {
 	flag.Parse()
+	if *flagWorkDir == "" {
+		*flagWorkDir = strings.TrimSpace(os.Getenv("WAVECONTROL_WORKDIR"))
+	}
+	if *flagWebRoot == "web" {
+		if configured := strings.TrimSpace(os.Getenv("WAVECONTROL_WEBROOT")); configured != "" {
+			*flagWebRoot = configured
+		}
+	}
+	if err := configureWorkingDirectory(*flagWorkDir, *flagWebRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "wavecontrol: working directory: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Debug mode if -d or -web specified
 	debugMode = *flagDebug || *flagWeb
@@ -126,7 +140,7 @@ func main() {
 		logDebug("platform security: %v", err)
 	}
 
-	// Only DSN and JWT secret from environment
+	// Load the database DSN and persistent authentication/encryption secrets from the environment
 	dsn := os.Getenv("WAVECONTROL_DSN")
 	if dsn == "" {
 		logFatal("WAVECONTROL_DSN is required")
@@ -334,6 +348,49 @@ func main() {
 	}
 }
 
+func defaultPIDFile() string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	return "/var/run/wavecontrol.pid"
+}
+
+func configureWorkingDirectory(explicit, webRoot string) error {
+	if explicit != "" {
+		absolute, err := filepath.Abs(explicit)
+		if err != nil {
+			return err
+		}
+		if err := os.Chdir(absolute); err != nil {
+			return fmt.Errorf("chdir %s: %w", absolute, err)
+		}
+		return nil
+	}
+	if runtime.GOOS != "windows" || filepath.IsAbs(webRoot) {
+		return nil
+	}
+	// A console launched from Explorer, Task Scheduler, or a service wrapper
+	// often starts in System32. Prefer the current directory when it is a valid
+	// WaveControl tree; otherwise use the executable's directory.
+	if fileExists(filepath.Join(webRoot, "index.html")) {
+		return nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable while resolving %s: %w", webRoot, err)
+	}
+	executableDir := filepath.Dir(executable)
+	if fileExists(filepath.Join(executableDir, webRoot, "index.html")) {
+		return os.Chdir(executableDir)
+	}
+	return fmt.Errorf("could not find %s/index.html in the launch directory or beside %s", webRoot, filepath.Base(executable))
+}
+
+func fileExists(name string) bool {
+	info, err := os.Stat(name)
+	return err == nil && !info.IsDir()
+}
+
 func ensureBootstrapAdmin(db *sql.DB) error {
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
@@ -414,6 +471,13 @@ func initSettings(db *sql.DB) error {
 		"sta_cred3_user":                "",
 		"sta_cred3_pass":                "",
 		"smtp_from":                     "",
+		"sysmon_alerter_enabled":        "false",
+		"sysmon_alerter_host":           "",
+		"sysmon_alerter_port":           "1347",
+		"sysmon_alerter_name":           "wavecontrol",
+		"sysmon_alerter_token":          "",
+		"sysmon_alerter_application":    "WaveControl network alerts",
+		"sysmon_alerter_ca_pem":         "",
 		"scheduler_max_concurrent":      "5",
 		"scheduler_check_interval":      "10",
 		"scheduler_respect_maintenance": "true",
@@ -1023,6 +1087,8 @@ func buildRouter(db *sql.DB, jwtSecret []byte, statsStore *stats.Store, fwServic
 
 			// Alert Rules
 			priv.Get("/alerts/rules", api.ListAlertRules)
+			priv.Get("/alerts/channels", api.GetAlertChannelStatuses)
+			priv.Post("/alerts/channels/sysmon/test", api.TestSysmonAlerter)
 			priv.Post("/alerts/rules", api.CreateAlertRule)
 			priv.Patch("/alerts/rules/{id}", api.UpdateAlertRule)
 			priv.Delete("/alerts/rules/{id}", api.DeleteAlertRule)

@@ -2584,16 +2584,20 @@ ultraCopyBtn?.addEventListener('click', async () => {
 
 // ===== Alerts Page =====
 const ALERT_METRIC_OPTIONS = [
-  { value: 'offline_duration', label: 'Offline duration', unit: 'seconds' },
-  { value: 'signal_5ghz', label: '5 GHz signal', unit: 'dBm' },
-  { value: 'signal_60ghz', label: '60 GHz signal', unit: 'dBm' },
-  { value: 'signal_ltu', label: 'LTU signal', unit: 'dBm' },
-  { value: 'cpu', label: 'CPU usage', unit: '%' },
-  { value: 'temperature', label: 'Temperature', unit: '°C' },
-  { value: 'ram', label: 'RAM usage', unit: '%' },
-  { value: 'capacity', label: '60 GHz capacity', unit: 'Mbps' },
-  { value: 'peer_count', label: 'Peer count', unit: 'peers' },
-  { value: 'link_score', label: 'Link score', unit: 'score' },
+  { value: 'offline_duration', label: 'Offline duration', unit: 'seconds', help: 'Time since an unreachable device was last seen.' },
+  { value: 'signal_5ghz', label: '5 GHz signal', unit: 'dBm', help: 'Primary 5 GHz receive signal when that radio is present.' },
+  { value: 'signal_6ghz', label: '6 GHz signal', unit: 'dBm', help: 'True 6 GHz MLO receive signal; a second MLO5 radio is excluded.' },
+  { value: 'signal_60ghz', label: '60 GHz signal', unit: 'dBm', help: '60 GHz receive signal when that radio is present.' },
+  { value: 'signal_ltu', label: 'LTU signal', unit: 'dBm', help: 'LTU receive signal when that radio is present.' },
+  { value: 'cpu', label: 'CPU usage', unit: '%', help: 'Current device CPU utilization.' },
+  { value: 'temperature', label: 'CPU temperature', unit: '°C', help: 'Reported CPU temperature.' },
+  { value: 'ram', label: 'RAM usage', unit: '%', help: 'Current device memory utilization.' },
+  { value: 'capacity', label: '60 GHz capacity', unit: 'Mbps', help: 'Combined estimated 60 GHz link capacity.' },
+  { value: 'peer_count', label: 'AP peer count', unit: 'peers', help: 'Number of currently associated subscribers reported by an AP.' },
+  { value: 'link_score', label: 'Downlink score', unit: 'score', help: 'Reported downlink score for Wave links.' },
+  { value: 'interference', label: 'Maximum interference airtime', unit: '%', help: 'Highest reported interference utilization across the device radios.' },
+  { value: 'chain_imbalance', label: 'Maximum chain imbalance', unit: 'dB', help: 'Largest valid per-chain receive-signal spread reported by any radio.' },
+  { value: 'gps_sync', label: 'GPS synchronization', unit: 'state', help: 'Numeric state: 1 when synchronized, 0 when a live GPS-sync state is present but not synchronized.' },
 ]
 
 const ALERT_OPERATOR_OPTIONS = [
@@ -2606,71 +2610,113 @@ const ALERT_OPERATOR_OPTIONS = [
 ]
 
 const ALERT_CHANNEL_OPTIONS = [
-  { value: 'email', label: 'Email' },
-  { value: 'webhook', label: 'Webhook' },
-  { value: 'zabbix', label: 'Zabbix' },
+  { value: 'email', label: 'Email', description: 'SMTP message to rule recipients.' },
+  { value: 'webhook', label: 'Webhook', description: 'JSON POST to this rule’s public HTTP(S) endpoint.' },
+  { value: 'zabbix', label: 'Zabbix', description: 'wavecontrol.alert via the configured Zabbix sender endpoint.' },
+  { value: 'sysmon', label: 'sysmon-web', description: 'Pinned-TLS CRITICAL/WARNING/OK alerter protocol.' },
 ]
 
 const ALERT_PRESETS = [
   {
     key: 'host_down',
-    title: 'Host down',
-    description: 'Alert when an alertable AP has been unreachable for 3 minutes.',
-    rule: { name: 'AP down', metric: 'offline_duration', operator: 'gte', threshold: 180, duration_seconds: 0, cooldown_seconds: 900, notify_channels: [], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+    title: 'AP down',
+    description: 'Critical after an alertable AP has been unreachable for 3 minutes.',
+    rule: { name: 'AP down', metric: 'offline_duration', operator: 'gte', threshold: 180, duration_seconds: 0, severity: 'critical', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'weak_5ghz',
     title: 'Weak 5 GHz signal',
-    description: 'Warn when an alertable STA 5 GHz link falls below -70 dBm.',
-    rule: { name: 'Weak 5 GHz signal', metric: 'signal_5ghz', operator: 'lt', threshold: -70, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
+    description: 'Warning when an alertable STA remains below -70 dBm for 2 minutes.',
+    rule: { name: 'Weak 5 GHz signal', metric: 'signal_5ghz', operator: 'lt', threshold: -70, duration_seconds: 120, severity: 'warning', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
+  },
+  {
+    key: 'weak_6ghz',
+    title: 'Weak 6 GHz signal',
+    description: 'Warning when a Wave MLO6 STA remains below -70 dBm for 2 minutes.',
+    rule: { name: 'Weak 6 GHz signal', metric: 'signal_6ghz', operator: 'lt', threshold: -70, duration_seconds: 120, severity: 'warning', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'weak_60ghz',
     title: 'Weak 60 GHz signal',
-    description: 'Warn when a 60 GHz link falls below -65 dBm.',
-    rule: { name: 'Weak 60 GHz signal', metric: 'signal_60ghz', operator: 'lt', threshold: -65, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    description: 'Warning when a 60 GHz link remains below -65 dBm for 2 minutes.',
+    rule: { name: 'Weak 60 GHz signal', metric: 'signal_60ghz', operator: 'lt', threshold: -65, duration_seconds: 120, severity: 'warning', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'weak_ltu',
     title: 'Weak LTU signal',
-    description: 'Warn when an LTU link falls below -70 dBm.',
-    rule: { name: 'Weak LTU signal', metric: 'signal_ltu', operator: 'lt', threshold: -70, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
+    description: 'Warning when an LTU STA remains below -70 dBm for 2 minutes.',
+    rule: { name: 'Weak LTU signal', metric: 'signal_ltu', operator: 'lt', threshold: -70, duration_seconds: 120, severity: 'warning', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'high_cpu',
     title: 'High CPU',
-    description: 'Warn when a radio reports CPU usage above 90%.',
-    rule: { name: 'High CPU', metric: 'cpu', operator: 'gt', threshold: 90, duration_seconds: 180, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    description: 'Warning when a radio stays above 90% CPU for 3 minutes.',
+    rule: { name: 'High CPU', metric: 'cpu', operator: 'gt', threshold: 90, duration_seconds: 180, severity: 'warning', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'high_temp',
     title: 'High temperature',
-    description: 'Alert when a radio CPU temperature rises above 75 °C.',
-    rule: { name: 'High temperature', metric: 'temperature', operator: 'gt', threshold: 75, duration_seconds: 180, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    description: 'Critical when CPU temperature stays above 85 °C for 3 minutes.',
+    rule: { name: 'High temperature', metric: 'temperature', operator: 'gt', threshold: 85, duration_seconds: 180, severity: 'critical', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+  },
+  {
+    key: 'high_ram',
+    title: 'High RAM',
+    description: 'Warning when a radio stays above 90% memory use for 5 minutes.',
+    rule: { name: 'High RAM', metric: 'ram', operator: 'gt', threshold: 90, duration_seconds: 300, severity: 'warning', cooldown_seconds: 1800, notify_channels: [], notify_recovery: true, target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'low_capacity',
-    title: 'Low capacity',
-    description: 'Warn when combined 60 GHz capacity falls below 100 Mbps.',
-    rule: { name: 'Low 60 GHz capacity', metric: 'capacity', operator: 'lt', threshold: 100, duration_seconds: 300, cooldown_seconds: 1800, notify_channels: [], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+    title: 'Low 60 GHz capacity',
+    description: 'Warning when AP combined 60 GHz capacity stays below 100 Mbps for 5 minutes.',
+    rule: { name: 'Low 60 GHz capacity', metric: 'capacity', operator: 'lt', threshold: 100, duration_seconds: 300, severity: 'warning', cooldown_seconds: 1800, notify_channels: [], notify_recovery: true, target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'peer_count',
-    title: 'Peer count dropped',
-    description: 'For a selected AP/site, alert when AP peer count drops below a threshold.',
-    rule: { name: 'Peer count dropped', metric: 'peer_count', operator: 'lt', threshold: 1, duration_seconds: 120, cooldown_seconds: 900, notify_channels: [], target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+    title: 'AP peer count dropped',
+    description: 'Critical when an AP reports fewer than one peer for 2 minutes. Scope this to an AP/site that should never be empty.',
+    recommended: false,
+    rule: { name: 'AP peer count dropped', metric: 'peer_count', operator: 'lt', threshold: 1, duration_seconds: 120, severity: 'critical', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+  },
+  {
+    key: 'sta_down',
+    title: 'STA down',
+    description: 'Critical after an alertable subscriber has been unreachable for 5 minutes. Use selectively to avoid alarm floods.',
+    recommended: false,
+    rule: { name: 'STA down', metric: 'offline_duration', operator: 'gte', threshold: 300, duration_seconds: 0, severity: 'critical', cooldown_seconds: 1800, notify_channels: [], notify_recovery: true, target_role: 'sta', require_alertable: true, enabled: true, scope: 'all' },
   },
   {
     key: 'link_score',
     title: 'Low link score',
-    description: 'Warn when a device reports link score below 50.',
-    rule: { name: 'Low link score', metric: 'link_score', operator: 'lt', threshold: 50, duration_seconds: 180, cooldown_seconds: 900, notify_channels: [], target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+    description: 'Warning when a reported downlink score stays below 50 for 3 minutes.',
+    rule: { name: 'Low link score', metric: 'link_score', operator: 'lt', threshold: 50, duration_seconds: 180, severity: 'warning', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+  },
+  {
+    key: 'interference',
+    title: 'High interference',
+    description: 'Warning when maximum reported interference airtime stays above 25% for 5 minutes.',
+    rule: { name: 'High interference', metric: 'interference', operator: 'gte', threshold: 25, duration_seconds: 300, severity: 'warning', cooldown_seconds: 1800, notify_channels: [], notify_recovery: true, target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
+  },
+  {
+    key: 'chain_imbalance',
+    title: 'RF chain imbalance',
+    description: 'Warning when a radio reports more than 6 dB between valid receive chains for 5 minutes. Apply only where multi-chain RSSI is expected.',
+    recommended: false,
+    rule: { name: 'RF chain imbalance', metric: 'chain_imbalance', operator: 'gte', threshold: 6, duration_seconds: 300, severity: 'auto', cooldown_seconds: 1800, notify_channels: [], notify_recovery: true, target_role: 'all', require_alertable: true, enabled: true, scope: 'all' },
+  },
+  {
+    key: 'gps_sync',
+    title: 'GPS sync lost',
+    description: 'Critical when an AP that reports a live GPS-sync state remains unsynchronized for 2 minutes. Use only on synchronized sectors.',
+    recommended: false,
+    rule: { name: 'GPS sync lost', metric: 'gps_sync', operator: 'lt', threshold: 1, duration_seconds: 120, severity: 'critical', cooldown_seconds: 900, notify_channels: [], notify_recovery: true, target_role: 'ap', require_alertable: true, enabled: true, scope: 'all' },
   },
 ]
 
 let alertRuleDraft = null
 let alertRuleEditingId = null
-let alertStatusFilter = 'active'
+let alertStatusFilter = 'open'
+let alertChannelStatusesCache = []
 
 function canEditAlerts() {
   const roles = store.user?.roles || []
@@ -2689,9 +2735,11 @@ function defaultAlertRule() {
     operator: 'gte',
     threshold: 180,
     duration_seconds: 0,
+    severity: 'auto',
     notify_channels: [],
     notify_emails: [],
     webhook_url: '',
+    notify_recovery: true,
     cooldown_seconds: 900,
   }
 }
@@ -2706,6 +2754,8 @@ function normalizedAlertRule(rule = {}) {
     scope_id: rule.scope_id === undefined ? null : rule.scope_id,
     target_role: ['all', 'ap', 'sta'].includes(String(rule.target_role || '').toLowerCase()) ? String(rule.target_role || 'all').toLowerCase() : 'all',
     require_alertable: rule.require_alertable !== false,
+    severity: ['auto', 'info', 'warning', 'critical'].includes(String(rule.severity || '').toLowerCase()) ? String(rule.severity).toLowerCase() : 'auto',
+    notify_recovery: rule.notify_recovery !== false,
     enabled: rule.enabled !== false,
   }
 }
@@ -2738,12 +2788,82 @@ function alertDeviceName(alert) {
   return dev?.hostname || dev?.ip_address || (alert.device_id ? `device #${alert.device_id}` : '-')
 }
 
+function alertChannelStatus(channel) {
+  return (alertChannelStatusesCache || []).find(item => item.channel === channel) || null
+}
+
+function alertChannelReadiness(item) {
+  if (!item) return { state: 'unknown', label: 'Status unavailable' }
+  if (item.channel === 'sysmon') {
+    if (!item.configured) return { state: 'error', label: 'Setup required' }
+    if (!item.enabled) return { state: 'muted', label: 'Disabled' }
+    if (item.sysmon_status?.connected) return { state: 'ready', label: 'Connected' }
+    if (item.sysmon_status?.last_error) return { state: 'error', label: 'Reconnecting' }
+    return { state: 'muted', label: 'Connecting' }
+  }
+  if (!item.configured) return { state: 'error', label: 'Setup required' }
+  if (!item.enabled) return { state: 'muted', label: 'Disabled' }
+  return { state: 'ready', label: item.channel === 'webhook' ? 'Configured per rule' : 'Ready' }
+}
+
+function renderAlertChannelStatuses(statuses, canAdmin) {
+  if (!Array.isArray(statuses) || statuses.length === 0) {
+    return `<div class="empty-state">Delivery-channel readiness is temporarily unavailable.</div>`
+  }
+  return `
+    <div class="alert-channel-status-grid">
+      ${statuses.map(item => {
+        const readiness = alertChannelReadiness(item)
+        const runtime = item.sysmon_status || {}
+        return `
+          <div class="alert-channel-status-card state-${escapeAttr(readiness.state)}">
+            <div class="alert-channel-status-head">
+              <strong>${escapeHTML(item.label || item.channel)}</strong>
+              <span class="alert-channel-health">${escapeHTML(readiness.label)}</span>
+            </div>
+            <p>${escapeHTML(item.description || '')}</p>
+            ${item.channel === 'sysmon' && runtime.address ? `<div class="alert-channel-runtime">${escapeHTML(runtime.name || 'wavecontrol')} → ${escapeHTML(runtime.address)}</div>` : ''}
+            ${runtime.last_error ? `<div class="alert-delivery-error">${escapeHTML(runtime.last_error)}</div>` : ''}
+          </div>
+        `
+      }).join('')}
+    </div>
+    ${canAdmin ? `
+      <div class="alert-channel-status-actions">
+        <button type="button" class="btn btn-sm btn-secondary" id="alertConfigureDelivery">Configure delivery</button>
+        <button type="button" class="btn btn-sm btn-secondary" id="alertTestSysmon">Test sysmon-web</button>
+      </div>
+    ` : ''}
+  `
+}
+
+function renderAlertDeliverySummary(alert) {
+  const deliveries = Array.isArray(alert.deliveries) ? alert.deliveries : []
+  const chips = deliveries.map(delivery => {
+    const rawStatus = String(delivery.status || 'unknown').toLowerCase()
+    const displayStatus = rawStatus === 'dead' && String(delivery.last_error || '').includes('closed before') ? 'canceled' : rawStatus
+    const title = delivery.last_error ? ` title="${escapeAttr(delivery.last_error)}"` : ''
+    const event = delivery.event === 'resolved' ? 'clear' : 'alert'
+    return `<span class="alert-delivery-chip status-${escapeAttr(rawStatus)}"${title}>${escapeHTML(delivery.channel)} · ${escapeHTML(event)} · ${escapeHTML(displayStatus)}</span>`
+  })
+  if (chips.length === 0) {
+    chips.push('<span class="alert-delivery-chip status-sent">in-app history</span>')
+  }
+  const errors = deliveries.filter(item => item.last_error && ['failed', 'dead'].includes(item.status))
+  return `
+    <div class="alert-delivery-summary">
+      ${chips.join('')}
+      ${errors.slice(0, 1).map(item => `<div class="alert-delivery-error">${escapeHTML(item.channel)}: ${escapeHTML(item.last_error)}</div>`).join('')}
+    </div>
+  `
+}
+
 async function refreshAlertNavBadge() {
   const badge = document.getElementById('alertNavBadge')
   if (!badge || !store.user) return
   try {
-    const active = await api.alerts('active', 101)
-    const count = Array.isArray(active) ? active.length : 0
+    const openAlerts = await api.alerts('open', 101)
+    const count = Array.isArray(openAlerts) ? openAlerts.length : 0
     if (count > 0) {
       badge.textContent = count > 99 ? '99+' : String(count)
       badge.classList.remove('hidden')
@@ -2763,7 +2883,7 @@ function alertRulePresetDuplicateKey(rule = {}) {
 
 function findMissingAlertPresets(rules = []) {
   const existing = new Set((Array.isArray(rules) ? rules : []).map(alertRulePresetDuplicateKey))
-  return ALERT_PRESETS.filter(p => !existing.has(alertRulePresetDuplicateKey(p.rule)))
+  return ALERT_PRESETS.filter(p => p.recommended !== false && !existing.has(alertRulePresetDuplicateKey(p.rule)))
 }
 
 function renderAlertPresetCards() {
@@ -2771,7 +2891,7 @@ function renderAlertPresetCards() {
     <div class="alert-preset-grid">
       ${ALERT_PRESETS.map(p => `
         <button type="button" class="alert-preset-card" data-alert-preset="${escapeAttr(p.key)}">
-          <span class="alert-preset-title">${escapeHTML(p.title)}</span>
+          <span class="alert-preset-title">${escapeHTML(p.title)}${p.recommended === false ? '<em class="alert-preset-manual">manual</em>' : ''}</span>
           <span class="alert-preset-description">${escapeHTML(p.description)}</span>
         </button>
       `).join('')}
@@ -2803,7 +2923,9 @@ function renderActiveAlerts(alerts, canEdit) {
                 <span>${escapeHTML(alertDeviceName(a))}</span>
                 <span>${escapeHTML(metric.label)}: ${escapeHTML(formatAlertNumber(a.value, a.metric))} ${escapeHTML(metric.unit || '')}</span>
                 <span>threshold ${escapeHTML(formatAlertNumber(a.threshold, a.metric))}</span>
+                ${a.resolved_at ? `<span>cleared ${escapeHTML(formatAlertTime(a.resolved_at))}</span>` : ''}
               </div>
+              ${renderAlertDeliverySummary(a)}
             </div>
             ${canEdit ? `
               <div class="alert-card-actions">
@@ -2833,8 +2955,9 @@ function renderAlertRuleTable(rules, canEdit) {
             <th>Targets</th>
             <th>Condition</th>
             <th>Delay</th>
+            <th>Severity</th>
             <th>Channels</th>
-            <th>Cooldown</th>
+            <th>Clear / cooldown</th>
             <th>Status</th>
             ${canEdit ? '<th></th>' : ''}
           </tr>
@@ -2851,8 +2974,9 @@ function renderAlertRuleTable(rules, canEdit) {
                 <td>${escapeHTML((r.target_role || 'all').toUpperCase())}${r.require_alertable !== false ? ' · alertable only' : ' · ignores alertable'}</td>
                 <td>${escapeHTML(metric.label)} ${escapeHTML(op)} ${escapeHTML(formatAlertNumber(r.threshold, r.metric))} ${escapeHTML(metric.unit || '')}</td>
                 <td>${escapeHTML(String(r.duration_seconds || 0))}s</td>
+                <td>${escapeHTML(String(r.severity || 'auto'))}</td>
                 <td>${channels.map(c => `<span class="alert-channel-chip">${escapeHTML(c)}</span>`).join(' ') || '-'}</td>
-                <td>${escapeHTML(String(r.cooldown_seconds || 0))}s</td>
+                <td>${r.notify_recovery !== false ? 'send clear' : 'no clear'} · ${escapeHTML(String(r.cooldown_seconds || 0))}s</td>
                 <td><span class="alert-enabled ${r.enabled ? 'enabled' : 'disabled'}">${r.enabled ? 'enabled' : 'disabled'}</span></td>
                 ${canEdit ? `
                   <td class="alert-rule-actions">
@@ -2870,7 +2994,7 @@ function renderAlertRuleTable(rules, canEdit) {
   `
 }
 
-function renderAlertRuleForm(rule, sites, devices, canEdit) {
+function renderAlertRuleForm(rule, sites, devices, canEdit, channelStatuses = []) {
   const r = normalizedAlertRule(rule)
   const channels = new Set(r.notify_channels || [])
   const metric = alertMetricMeta(r.metric)
@@ -2885,6 +3009,10 @@ function renderAlertRuleForm(rule, sites, devices, canEdit) {
           <p class="settings-note">Rules are evaluated server-side against live stats, target role, and per-device alertability. Notification channels are optional; a rule without one still appears in the alert history.</p>
         </div>
         ${canEdit ? `<button type="button" class="btn btn-secondary" id="alertNewRule">New blank rule</button>` : ''}
+      </div>
+
+      <div class="alert-lifecycle-note">
+        <strong>Lifecycle:</strong> the condition must remain true for the persistence delay, then WaveControl creates one active occurrence. It does not repeat while active. When the condition clears—or the rule/policy no longer applies—the occurrence resolves and can send a recovery event. Cooldown gates a new occurrence after the previous trigger. Devices that do not report the selected metric are skipped.
       </div>
 
       <div class="form-row">
@@ -2950,6 +3078,7 @@ function renderAlertRuleForm(rule, sites, devices, canEdit) {
           <select id="alertMetric" ${canEdit ? '' : 'disabled'}>
             ${ALERT_METRIC_OPTIONS.map(opt => alertOption(opt.value, `${opt.label}${opt.unit ? ` (${opt.unit})` : ''}`, r.metric)).join('')}
           </select>
+          <small class="field-help" id="alertMetricHelp">${escapeHTML(metric.help || '')}</small>
         </div>
         <div class="form-group small-field">
           <label>Operator</label>
@@ -2965,12 +3094,24 @@ function renderAlertRuleForm(rule, sites, devices, canEdit) {
 
       <div class="form-row">
         <div class="form-group small-field">
-          <label>Must persist <small>seconds</small></label>
+          <label>Persistence delay <small>seconds</small></label>
           <input id="alertDuration" type="number" min="0" step="1" value="${escapeAttr(r.duration_seconds || 0)}" ${canEdit ? '' : 'disabled'} />
+          <small class="field-help">Ignore shorter transients.</small>
         </div>
         <div class="form-group small-field">
-          <label>Cooldown <small>seconds</small></label>
+          <label>Post-trigger cooldown <small>seconds</small></label>
           <input id="alertCooldown" type="number" min="0" step="1" value="${escapeAttr(r.cooldown_seconds || 300)}" ${canEdit ? '' : 'disabled'} />
+          <small class="field-help">Minimum time before a cleared condition may create another occurrence.</small>
+        </div>
+        <div class="form-group">
+          <label>Severity</label>
+          <select id="alertSeverity" ${canEdit ? '' : 'disabled'}>
+            ${alertOption('auto', 'Automatic from metric value', r.severity || 'auto')}
+            ${alertOption('info', 'Info', r.severity || 'auto')}
+            ${alertOption('warning', 'Warning', r.severity || 'auto')}
+            ${alertOption('critical', 'Critical', r.severity || 'auto')}
+          </select>
+          <small class="field-help">sysmon-web maps critical to loud CRITICAL; info and warning to quiet WARNING.</small>
         </div>
       </div>
 
@@ -2978,12 +3119,22 @@ function renderAlertRuleForm(rule, sites, devices, canEdit) {
         <label>Notification channels</label>
         <div class="alert-channel-grid">
           ${ALERT_CHANNEL_OPTIONS.map(ch => `
-            <label class="alert-channel-option">
+            ${(() => {
+              const status = channelStatuses.find(item => item.channel === ch.value)
+              const readiness = alertChannelReadiness(status)
+              return `<label class="alert-channel-option state-${escapeAttr(readiness.state)}">
               <input type="checkbox" data-alert-channel="${escapeAttr(ch.value)}" ${channels.has(ch.value) ? 'checked' : ''} ${canEdit ? '' : 'disabled'} />
-              <span>${escapeHTML(ch.label)}</span>
-            </label>
+              <span><strong>${escapeHTML(ch.label)}</strong><small>${escapeHTML(ch.description)}</small></span>
+              <em>${escapeHTML(readiness.label)}</em>
+            </label>`
+            })()}
           `).join('')}
         </div>
+        <div class="form-check alert-recovery-check">
+          <input id="alertNotifyRecovery" type="checkbox" ${r.notify_recovery !== false ? 'checked' : ''} ${canEdit ? '' : 'disabled'} />
+          <label for="alertNotifyRecovery">Send a clear/recovery event when the condition closes</label>
+        </div>
+        <p class="settings-note">For sysmon-web this sends <code>OK</code> with the same object key, replacing the prior phone notification instead of stacking another alert.</p>
       </div>
 
       <div class="form-row alert-email-row ${channels.has('email') ? '' : 'hidden'}">
@@ -3037,6 +3188,11 @@ function readAlertRuleForm() {
   const webhookURL = get('alertWebhook')?.value.trim() || ''
   if (channels.includes('email') && notifyEmails.length === 0) throw new Error('Email channel selected but no recipients were entered')
   if (channels.includes('webhook') && !webhookURL) throw new Error('Webhook channel selected but no URL was entered')
+  for (const channel of channels) {
+    const status = alertChannelStatus(channel)
+    if (status && !status.configured) throw new Error(`${status.label || channel} is not configured by an administrator`)
+    if (channel === 'sysmon' && status && !status.enabled) throw new Error('sysmon-web delivery is configured but disabled')
+  }
 
   return {
     name,
@@ -3049,20 +3205,41 @@ function readAlertRuleForm() {
     operator: get('alertOperator')?.value || 'gte',
     threshold,
     duration_seconds: duration,
+    severity: get('alertSeverity')?.value || 'auto',
     notify_channels: channels,
     notify_emails: notifyEmails,
     webhook_url: webhookURL,
+    notify_recovery: !!get('alertNotifyRecovery')?.checked,
     cooldown_seconds: cooldown,
   }
 }
 
 function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
   container.querySelector('#alertStatusFilter')?.addEventListener('change', e => {
-    alertStatusFilter = e.target.value || 'active'
+    alertStatusFilter = e.target.value || 'open'
     renderAlertsPage(container)
   })
 
   container.querySelector('#refreshAlerts')?.addEventListener('click', () => renderAlertsPage(container))
+
+  container.querySelector('#alertConfigureDelivery')?.addEventListener('click', () => {
+    document.querySelector('a[data-page="settings"]')?.click()
+  })
+
+  container.querySelector('#alertTestSysmon')?.addEventListener('click', async e => {
+    const btn = e.currentTarget
+    btn.disabled = true
+    btn.textContent = 'Testing...'
+    try {
+      await api.testSysmonAlerter()
+      showToast('sysmon-web TLS handshake and protocol test passed', 'success')
+      renderAlertsPage(container)
+    } catch (err) {
+      showToast('sysmon-web test failed: ' + err.message, 'error')
+      btn.disabled = false
+      btn.textContent = 'Test sysmon-web'
+    }
+  })
 
   container.querySelectorAll('[data-alert-action]').forEach(btn => {
     btn.addEventListener('click', async () => {
@@ -3204,6 +3381,8 @@ function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
     const meta = alertMetricMeta(e.target.value)
     const unit = container.querySelector('#alertThresholdUnit')
     if (unit) unit.textContent = meta.unit || ''
+    const help = container.querySelector('#alertMetricHelp')
+    if (help) help.textContent = meta.help || ''
   })
 
   container.querySelector('#alertNewRule')?.addEventListener('click', () => {
@@ -3243,6 +3422,7 @@ function bindAlertPageHandlers(container, rules, sites, devices, canEdit) {
 
 async function renderAlertsPage(container) {
   const canEdit = canEditAlerts()
+  const canAdmin = (store.user?.roles || []).includes('administrator')
   if (!alertRuleDraft) alertRuleDraft = defaultAlertRule()
 
   container.innerHTML = `
@@ -3250,7 +3430,7 @@ async function renderAlertsPage(container) {
       <div class="alerts-header">
         <div>
           <h3>Alerts</h3>
-          <p class="settings-note">Operator rules, active alarms, and notification delivery setup. The server evaluates rules continuously and records state here; email, webhook, and Zabbix delivery are optional.</p>
+          <p class="settings-note">Ubiquiti AP/STA rules, active occurrences, and durable delivery state. Alerts can remain in WaveControl or fan out through email, webhook, Zabbix, and sysmon-web.</p>
         </div>
         <button class="btn btn-secondary" id="refreshAlerts">Refresh</button>
       </div>
@@ -3260,22 +3440,38 @@ async function renderAlertsPage(container) {
 
   const content = container.querySelector('#alertsContent')
   try {
-    const [rules, alerts, sites] = await Promise.all([
+    const [rules, alerts, sites, channelStatuses] = await Promise.all([
       api.alertRules(),
       api.alerts(alertStatusFilter === 'all' ? '' : alertStatusFilter, 100),
       api.sites().catch(() => []),
+      api.alertChannelStatuses().catch(() => []),
     ])
+    alertChannelStatusesCache = Array.isArray(channelStatuses) ? channelStatuses : []
     const devices = store.devices || []
-    const activeCount = Array.isArray(alerts) && alertStatusFilter === 'active' ? alerts.length : null
+    const openCount = Array.isArray(alerts) && alertStatusFilter === 'open' ? alerts.length : null
     content.innerHTML = `
       <div class="alerts-layout">
         <div class="alerts-main">
           <div class="settings-section">
             <div class="alert-section-header">
-              <h4>Active / Recent Alerts</h4>
+              <div>
+                <h4>Delivery readiness</h4>
+                <p class="settings-note">Delivery attempts are persisted and retried. Per-alert channel state and the last delivery error appear on each occurrence.</p>
+              </div>
+            </div>
+            ${renderAlertChannelStatuses(alertChannelStatusesCache, canAdmin)}
+          </div>
+
+          <div class="settings-section">
+            <div class="alert-section-header">
+              <div>
+                <h4>Open / Recent Alerts</h4>
+                <p class="settings-note"><strong>Acknowledge</strong> marks an occurrence as seen; it still auto-resolves on recovery. <strong>Resolve</strong> closes it now; a still-bad condition may open a fresh occurrence only after persistence and cooldown.</p>
+              </div>
               <div class="alert-inline-controls">
                 <select id="alertStatusFilter" class="select-sm">
-                  ${alertOption('active', 'Active', alertStatusFilter)}
+                  ${alertOption('open', 'Open (active + acknowledged)', alertStatusFilter)}
+                  ${alertOption('active', 'Active — unacknowledged', alertStatusFilter)}
                   ${alertOption('acknowledged', 'Acknowledged', alertStatusFilter)}
                   ${alertOption('resolved', 'Resolved', alertStatusFilter)}
                   ${alertOption('all', 'All recent', alertStatusFilter)}
@@ -3288,7 +3484,7 @@ async function renderAlertsPage(container) {
           <div class="settings-section">
             <div class="alert-section-header">
               <h4>Alert Rules</h4>
-              <span class="alert-count-note">${Array.isArray(rules) ? rules.length : 0} configured${activeCount !== null ? ` · ${activeCount} active alerts` : ''}</span>
+              <span class="alert-count-note">${Array.isArray(rules) ? rules.length : 0} configured${openCount !== null ? ` · ${openCount} open alerts` : ''}</span>
             </div>
             ${renderAlertRuleTable(rules, canEdit)}
           </div>
@@ -3301,13 +3497,13 @@ async function renderAlertsPage(container) {
                 <h4>Presets</h4>
                 <button type="button" class="btn btn-sm btn-secondary" id="alertInstallRecommended">Install recommended rules</button>
               </div>
-              <p class="settings-note">Pick a sane starting point, tune one rule before saving, or install the default host-down/signal/cpu/temp/capacity rules in one shot.</p>
+              <p class="settings-note">Pick a Ubiquiti-focused starting point and tune it before saving. “Install recommended” excludes manual presets that could be noisy without an AP/site-specific scope.</p>
               ${renderAlertPresetCards()}
             </div>
           ` : ''}
 
           <div class="settings-section">
-            ${renderAlertRuleForm(alertRuleDraft, sites, devices, canEdit)}
+            ${renderAlertRuleForm(alertRuleDraft, sites, devices, canEdit, alertChannelStatusesCache)}
           </div>
         </div>
       </div>
@@ -3556,7 +3752,11 @@ async function renderSettingsPage(container) {
   `
   
   try {
-    const settings = await api.settings()
+    const [settings, channelStatuses] = await Promise.all([
+      api.settings(),
+      api.alertChannelStatuses().catch(() => []),
+    ])
+    alertChannelStatusesCache = Array.isArray(channelStatuses) ? channelStatuses : []
     const content = document.getElementById('settingsContent')
     
     content.innerHTML = `
@@ -3626,7 +3826,7 @@ async function renderSettingsPage(container) {
           
           <div class="settings-section">
             <h4>Paths</h4>
-            <p class="settings-note">Relative to working directory (user home or chroot)</p>
+            <p class="settings-note">Relative to the WaveControl working directory (explicit package directory on Windows; service/chroot root on Unix)</p>
             <div class="form-row">
               <div class="form-group">
                 <label>Firmware Directory</label>
@@ -3646,9 +3846,105 @@ async function renderSettingsPage(container) {
               <input type="text" id="settListenAddr" value="${settings.listen_addr || '127.0.0.1:8080'}" />
             </div>
           </div>
+
+          <div class="settings-section alert-delivery-settings">
+            <div class="alert-section-header">
+              <div>
+                <h4>Alert Delivery</h4>
+                <p class="settings-note">Global delivery endpoints used by alert rules. Rule-specific recipients and webhook URLs remain on the Alerts page.</p>
+              </div>
+            </div>
+
+            <div class="settings-subsection">
+              <h5>Email (SMTP)</h5>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>SMTP host</label>
+                  <input type="text" id="settSMTPHost" value="${escapeAttr(settings.smtp_host || '')}" placeholder="mail.example.net" />
+                </div>
+                <div class="form-group small-field">
+                  <label>SMTP port</label>
+                  <input type="number" id="settSMTPPort" min="1" max="65535" value="${escapeAttr(settings.smtp_port || '25')}" />
+                </div>
+                <div class="form-group">
+                  <label>SMTP username</label>
+                  <input type="text" id="settSMTPUsername" value="${escapeAttr(settings.smtp_username || '')}" autocomplete="off" />
+                </div>
+                <div class="form-group">
+                  <label>SMTP password</label>
+                  <input type="password" id="settSMTPPassword" value="${escapeAttr(settings.smtp_password || '')}" autocomplete="new-password" />
+                </div>
+                <div class="form-group flex-2">
+                  <label>From address</label>
+                  <input type="email" id="settSMTPFrom" value="${escapeAttr(settings.smtp_from || '')}" placeholder="wavecontrol@example.net" />
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-subsection">
+              <h5>Zabbix sender</h5>
+              <p class="settings-note">Separate from the inbound Zabbix Agent Bridge below. Alert rules send <code>wavecontrol.alert</code> to this trapper endpoint.</p>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>Zabbix server <small>host or host:port</small></label>
+                  <input type="text" id="settZabbixServer" value="${escapeAttr(settings.zabbix_server || '')}" placeholder="zabbix.example.net:10051" />
+                </div>
+                <div class="form-group">
+                  <label>Sender host</label>
+                  <input type="text" id="settZabbixSenderHost" value="${escapeAttr(settings.zabbix_sender_host || 'wavecontrol')}" />
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-subsection sysmon-settings">
+              <div class="alert-section-header">
+                <div>
+                  <h5>sysmon-web alerter</h5>
+                  <p class="settings-note">Pinned TLS to the sysmon-web agent listener. WaveControl keeps an authenticated alerter session connected and sends CRITICAL, WARNING, and OK transitions.</p>
+                </div>
+                <button type="button" class="btn btn-sm btn-secondary" id="testSysmonSettings">Test saved configuration</button>
+              </div>
+              <div id="sysmonSettingsStatus">
+                ${renderAlertChannelStatuses(alertChannelStatusesCache.filter(item => item.channel === 'sysmon'), false)}
+              </div>
+              <div class="form-check">
+                <input type="checkbox" id="settSysmonEnabled" ${settings.sysmon_alerter_enabled === 'true' ? 'checked' : ''} />
+                <label for="settSysmonEnabled">Enable sysmon-web delivery</label>
+              </div>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>sysmon-web server</label>
+                  <input type="text" id="settSysmonHost" value="${escapeAttr(settings.sysmon_alerter_host || '')}" placeholder="sysmon-web.example.net" />
+                </div>
+                <div class="form-group small-field">
+                  <label>Agent port</label>
+                  <input type="number" id="settSysmonPort" min="1" max="65535" value="${escapeAttr(settings.sysmon_alerter_port || '1347')}" />
+                </div>
+                <div class="form-group">
+                  <label>Alerter name</label>
+                  <input type="text" id="settSysmonName" value="${escapeAttr(settings.sysmon_alerter_name || 'wavecontrol')}" maxlength="64" />
+                </div>
+                <div class="form-group">
+                  <label>Minted token</label>
+                  <input type="password" id="settSysmonToken" value="${escapeAttr(settings.sysmon_alerter_token || '')}" autocomplete="new-password" />
+                  <small class="field-help">Mint this identity in sysmon-web under Admin → Monitoring boxes. Save before testing.</small>
+                </div>
+                <div class="form-group flex-2">
+                  <label>Application name</label>
+                  <input type="text" id="settSysmonApplication" value="${escapeAttr(settings.sysmon_alerter_application || 'WaveControl network alerts')}" maxlength="128" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Pinned CA/certificate PEM <small>contents of aggregator-ca.pem</small></label>
+                <textarea id="settSysmonCAPEM" rows="7" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----">${escapeHTML(settings.sysmon_alerter_ca_pem || '')}</textarea>
+                <small class="field-help">Certificate verification is mandatory; WaveControl will not offer an insecure-skip option.</small>
+              </div>
+            </div>
+          </div>
           
           <div class="settings-section">
-            <h4>Zabbix Integration</h4>
+            <h4>Zabbix Agent Bridge</h4>
+            <p class="settings-note">Optional inbound compatibility listener for Zabbix queries. This is independent of alert delivery through Zabbix sender.</p>
             <div class="form-check">
               <input type="checkbox" id="settZabbixEnabled" ${settings.zabbix_enabled === 'true' ? 'checked' : ''} />
               <label for="settZabbixEnabled">Enable Zabbix Agent Bridge</label>
@@ -3762,6 +4058,21 @@ async function renderSettingsPage(container) {
     loadTLSSettings()
     loadUserManagement()
     loadSitesRegionsManager()
+
+    document.getElementById('testSysmonSettings')?.addEventListener('click', async e => {
+      const btn = e.currentTarget
+      btn.disabled = true
+      btn.textContent = 'Testing...'
+      try {
+        await api.testSysmonAlerter()
+        showToast('sysmon-web TLS handshake, authentication, PING, and QUIT passed', 'success')
+        renderSettingsPage(container)
+      } catch (err) {
+        showToast('sysmon-web test failed: ' + err.message, 'error')
+        btn.disabled = false
+        btn.textContent = 'Test saved configuration'
+      }
+    })
     
     document.getElementById('saveSettings')?.addEventListener('click', async () => {
       const btn = document.getElementById('saveSettings')
@@ -3820,6 +4131,21 @@ async function renderSettingsPage(container) {
           zabbix_enabled: document.getElementById('settZabbixEnabled').checked ? 'true' : 'false',
           zabbix_listen: document.getElementById('settZabbixListen').value,
           zabbix_allowed_hosts: document.getElementById('settZabbixAllowedHosts').value,
+          // Alert delivery
+          smtp_host: document.getElementById('settSMTPHost').value,
+          smtp_port: document.getElementById('settSMTPPort').value,
+          smtp_username: document.getElementById('settSMTPUsername').value,
+          smtp_password: document.getElementById('settSMTPPassword').value,
+          smtp_from: document.getElementById('settSMTPFrom').value,
+          zabbix_server: document.getElementById('settZabbixServer').value,
+          zabbix_sender_host: document.getElementById('settZabbixSenderHost').value,
+          sysmon_alerter_enabled: document.getElementById('settSysmonEnabled').checked ? 'true' : 'false',
+          sysmon_alerter_host: document.getElementById('settSysmonHost').value,
+          sysmon_alerter_port: document.getElementById('settSysmonPort').value,
+          sysmon_alerter_name: document.getElementById('settSysmonName').value,
+          sysmon_alerter_token: document.getElementById('settSysmonToken').value,
+          sysmon_alerter_application: document.getElementById('settSysmonApplication').value,
+          sysmon_alerter_ca_pem: document.getElementById('settSysmonCAPEM').value,
           // Wave feature flags
           wave_mlo_multi_radio: document.getElementById('settWaveMloMultiRadio').checked ? 'true' : 'false',
           wave_peer_fallback: document.getElementById('settWavePeerFallback').checked ? 'true' : 'false',
@@ -3832,6 +4158,20 @@ async function renderSettingsPage(container) {
         }
         
         const settingResult = await api.updateSettings(updates)
+
+        try {
+          const refreshedStatuses = await api.alertChannelStatuses()
+          alertChannelStatusesCache = Array.isArray(refreshedStatuses) ? refreshedStatuses : []
+          const statusContainer = document.getElementById('sysmonSettingsStatus')
+          if (statusContainer) {
+            statusContainer.innerHTML = renderAlertChannelStatuses(
+              alertChannelStatusesCache.filter(item => item.channel === 'sysmon'),
+              false,
+            )
+          }
+        } catch (statusErr) {
+          console.warn('Could not refresh alert channel status after saving settings:', statusErr)
+        }
         
 	        // Update client-side cached settings so other pages use new values without a reload
 	        const prev = (store.getState && store.getState().settings) ? store.getState().settings : {}

@@ -17,6 +17,8 @@ func validTestRule() Rule {
 		Operator:         OpGTE,
 		Threshold:        120,
 		DurationSeconds:  30,
+		Severity:         SeverityAuto,
+		NotifyRecovery:   true,
 		CooldownSeconds:  300,
 		NotifyChannels:   []string{"email"},
 		NotifyEmails:     []string{"ops@example.com"},
@@ -43,6 +45,7 @@ func TestValidateRule(t *testing.T) {
 		{"negative duration", func(r *Rule) { r.DurationSeconds = -1 }},
 		{"nonfinite threshold", func(r *Rule) { r.Threshold = math.NaN() }},
 		{"unsupported channel", func(r *Rule) { r.NotifyChannels = []string{"mobile"} }},
+		{"invalid severity", func(r *Rule) { r.Severity = "emergency" }},
 		{"email without recipient", func(r *Rule) { r.NotifyEmails = nil }},
 		{"invalid email", func(r *Rule) { r.NotifyEmails = []string{"not-an-address"} }},
 		{"private webhook", func(r *Rule) {

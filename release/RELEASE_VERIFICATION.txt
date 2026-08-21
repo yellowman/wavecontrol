@@ -1,0 +1,39 @@
+WaveControl Windows/alerts/sysmon release verification
+Date: 2026-08-20
+Base commit: 0e3cb186d869e63a74ed69694a9d07cffbc94ea5
+Patch commit: b58c394832affcf8a7aeee31dbec986f103881fa
+
+PASSED ON THE FINAL SOURCE TREE
+- gofmt check for cmd/ and internal/
+- git diff --check
+- JavaScript syntax checks for all web/*.js
+- HTML parsing
+- static security/removal/schema audit
+- authorization audit: 70 POST/PUT/PATCH/DELETE routes inspected
+- complete offline API-compatible dependency-harness test run
+- complete offline go vet run
+- focused race tests: internal/sysmonalerter, internal/alerting, internal/stats
+- Linux amd64 static cross-build
+- Windows amd64 static cross-build (PE32+ x86-64)
+- Windows arm64 static cross-build (PE32+ ARM64)
+- shell syntax checks
+- sysmon protocol integration tests against a local TLS server
+- pinned-certificate rejection test
+- maintained-session and configuration-wake tests
+- bounded sysmon reply test
+- alert lifecycle/outbox regression tests
+- desktop/mobile visual fixture QA for Alerts and Alert Delivery settings
+- no horizontal page overflow at 1440, 1100, or 430 CSS pixels
+- base patch clean-apply and byte-for-byte working-tree comparison
+- Git bundle verification
+
+ENVIRONMENTAL LIMITATIONS (NOT CLAIMED AS PASSES)
+- The exact production module graph could not be downloaded because this container could not resolve proxy.golang.org. The attempted `go test ./...` failed at dependency retrieval, before compilation or tests.
+- PowerShell was not installed in this Linux container. The PowerShell scripts were manually/static reviewed, but were not parsed or executed by PowerShell here.
+- PostgreSQL server/client binaries were not available, so no live database migration or end-to-end database-backed browser test was run in this environment.
+- The cross-built PE files used the repository's API-compatible offline dependency harness and are verification artifacts, not production binaries. Build deployable Windows binaries with `windows/build.ps1`, which uses the pinned production `go.mod`/`go.sum` graph.
+
+PACKAGE POLICY
+- This clean source archive excludes generated verification binaries/logs, old package patches/manifests, the offline module override, and duplicate archive material.
+- `release/CHANGES_FROM_0e3cb186.patch` applies the complete change set to the named base commit.
+- The separately supplied Git bundle contains complete history and branch `openai/windows-alerts-sysmon`.

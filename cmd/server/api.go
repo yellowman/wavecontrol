@@ -36,6 +36,7 @@ import (
 	"github.com/yellowman/wavecontrol/internal/scheduler"
 	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
+	"github.com/yellowman/wavecontrol/internal/sysmonalerter"
 	"github.com/yellowman/wavecontrol/internal/tlsutil"
 	"github.com/yellowman/wavecontrol/internal/udebug"
 	"github.com/yellowman/wavecontrol/internal/websocket"
@@ -1597,30 +1598,13 @@ func (a *API) updateDeviceAlertPolicy(ctx context.Context, deviceID int64, req d
 	}
 
 	shouldResolve := !alertable || (silenced.Valid && time.Now().Before(silenced.Time))
-	if shouldResolve {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE alert_notification_outbox o
-			SET status='dead', last_error='notification canceled because device alerting was disabled or silenced', updated_at=NOW()
-			FROM alerts alert
-			WHERE o.alert_id=alert.id AND alert.device_id=$1 AND o.status IN ('pending','failed')
-		`, deviceID); err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE alerts SET status='resolved', resolved_at=NOW()
-			WHERE device_id=$1 AND status IN ('active','acknowledged')
-		`, deviceID); err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM alert_states WHERE device_id=$1`, deviceID); err != nil {
-			return nil, err
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	if shouldResolve && a.Alerts != nil {
-		a.Alerts.ClearDeviceState(int(deviceID))
+		if err := a.Alerts.ResolveDeviceAlerts(ctx, int(deviceID), "device alerting was disabled or silenced"); err != nil {
+			return nil, fmt.Errorf("alert policy saved but active alert resolution failed: %w", err)
+		}
 	}
 
 	changeParts := []string{}
@@ -3010,7 +2994,7 @@ func validateSettingValue(key, value string) error {
 		return validateSettingInt(trimmed, 1, 100)
 	case "scheduler_check_interval":
 		return validateSettingInt(trimmed, 1, 3600)
-	case "smtp_port":
+	case "smtp_port", "sysmon_alerter_port":
 		return validateSettingInt(trimmed, 1, 65535)
 	case "chain_imbalance_threshold_db", "rx_mismatch_threshold_db":
 		return validateSettingInt(trimmed, 1, 100)
@@ -3019,7 +3003,7 @@ func validateSettingValue(key, value string) error {
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
 			return errors.New("must be a finite number between 0 and 100")
 		}
-	case "zabbix_enabled", "scheduler_respect_maintenance", "wave_peer_fallback", "wave_mlo_multi_radio":
+	case "zabbix_enabled", "scheduler_respect_maintenance", "wave_peer_fallback", "wave_mlo_multi_radio", "sysmon_alerter_enabled":
 		if trimmed != "true" && trimmed != "false" {
 			return errors.New("must be true or false")
 		}
@@ -3034,6 +3018,29 @@ func validateSettingValue(key, value string) error {
 			}
 			if _, _, err := net.SplitHostPort(trimmed); err != nil && strings.Contains(trimmed, ":") && net.ParseIP(trimmed) == nil {
 				return errors.New("must be a hostname, IP address, or host:port")
+			}
+		}
+	case "sysmon_alerter_host":
+		if trimmed != "" {
+			if err := sysmonalerter.ValidateHost(trimmed); err != nil {
+				return err
+			}
+		}
+	case "sysmon_alerter_name":
+		if trimmed != "" && !sysmonalerter.ValidProtocolName(trimmed) {
+			return errors.New("must use only letters, digits, '-' or '_' and be 1-64 characters")
+		}
+	case "sysmon_alerter_application":
+		if len([]rune(trimmed)) > 128 || strings.ContainsAny(value, "\r\n") {
+			return errors.New("must be at most 128 characters and contain no newline")
+		}
+	case "sysmon_alerter_ca_pem":
+		if len(value) > 256<<10 {
+			return errors.New("certificate PEM must be at most 256 KiB")
+		}
+		if trimmed != "" {
+			if err := sysmonalerter.ValidateCAPEM(value); err != nil {
+				return err
 			}
 		}
 	case "management_prefixes":
@@ -3104,6 +3111,10 @@ func validateSettingValue(key, value string) error {
 		if len(value) > 65536 {
 			return errors.New("secret is too long")
 		}
+	case "sysmon_alerter_token":
+		if len(value) > 4096 || strings.ContainsAny(value, " \t\r\n") {
+			return errors.New("token must be at most 4096 bytes and contain no whitespace")
+		}
 	}
 	return nil
 }
@@ -3134,6 +3145,30 @@ func validateSettingsSnapshot(values map[string]string) error {
 			}
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(values["sysmon_alerter_enabled"]), "true") {
+		port, err := strconv.Atoi(strings.TrimSpace(values["sysmon_alerter_port"]))
+		if err != nil {
+			return errors.New("sysmon_alerter_port must be an integer")
+		}
+		token := values["sysmon_alerter_token"]
+		// Snapshot validation runs after secret values have been encrypted for
+		// storage. The plaintext was validated before encryption; use a safe
+		// placeholder here so ciphertext length/format is not mistaken for the
+		// on-wire bearer token. Startup/runtime reload decrypts and validates the
+		// actual token again.
+		if secrets.IsEncrypted(token) {
+			token = "stored-encrypted-token"
+		}
+		cfg := sysmonalerter.Config{
+			Enabled: true, Host: values["sysmon_alerter_host"], Port: port,
+			Name: values["sysmon_alerter_name"], Token: token,
+			Application: values["sysmon_alerter_application"], CAPEM: values["sysmon_alerter_ca_pem"],
+		}
+		if err := sysmonalerter.ValidateConfig(cfg); err != nil {
+			return fmt.Errorf("sysmon-web alerter configuration: %w", err)
+		}
+	}
+
 	warning, warnErr := strconv.ParseFloat(values["interference_warning_pct"], 64)
 	critical, critErr := strconv.ParseFloat(values["interference_critical_pct"], 64)
 	if warnErr == nil && critErr == nil && warning > critical {
@@ -5701,13 +5736,40 @@ func (a *API) ListAlertRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, rules)
 }
 
+func (a *API) GetAlertChannelStatuses(w http.ResponseWriter, r *http.Request) {
+	statuses, err := a.Alerts.NotificationChannelStatuses(r.Context())
+	if err != nil {
+		writeAlertManagerError(w, err)
+		return
+	}
+	writeJSON(w, statuses)
+}
+
+func (a *API) TestSysmonAlerter(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	if err := a.Alerts.TestSysmon(ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	statuses, err := a.Alerts.NotificationChannelStatuses(r.Context())
+	if err != nil {
+		writeAlertManagerError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "channels": statuses})
+}
+
 func decodeAlertRulePatch(raw map[string]json.RawMessage, base alerting.Rule) (alerting.Rule, error) {
 	allowed := map[string]bool{
 		"name": true, "enabled": true, "scope": true, "scope_id": true,
 		"target_role": true, "require_alertable": true, "metric": true,
-		"operator": true, "threshold": true, "duration_seconds": true,
+		"operator": true, "threshold": true, "duration_seconds": true, "severity": true,
 		"notify_channels": true, "notify_emails": true, "webhook_url": true,
-		"cooldown_seconds": true,
+		"notify_recovery": true, "cooldown_seconds": true,
 	}
 	baseJSON, err := json.Marshal(base)
 	if err != nil {
@@ -5761,7 +5823,7 @@ func (a *API) CreateAlertRule(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	base := alerting.Rule{Enabled: true, Scope: "all", TargetRole: "all", RequireAlertable: true, CooldownSeconds: 300}
+	base := alerting.Rule{Enabled: true, Scope: "all", TargetRole: "all", RequireAlertable: true, Severity: alerting.SeverityAuto, NotifyRecovery: true, CooldownSeconds: 300}
 	rule, err := decodeAlertRulePatch(raw, base)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
