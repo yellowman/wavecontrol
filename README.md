@@ -4,7 +4,7 @@ Device management and monitoring system for Ubiquiti Wave (60GHz, 5GHz/6GHz MLO)
 
 ## Screenshots
 
-These sample views use fictional device names, placeholder metrics, and documentation-only IP addresses. Click any image to open the full-size PNG.
+These sample views use fictional rural Washington tower sites, customer stations, placeholder metrics, and documentation-only IP addresses. Map lines represent only known parent-AP-to-STA associations. Click any image to open the full-size PNG.
 
 <table>
   <tr>
@@ -20,7 +20,7 @@ These sample views use fictional device names, placeholder metrics, and document
     <td width="50%"><strong>Quality</strong><br><a href="docs/screenshots/quality.png"><img src="docs/screenshots/quality.png" alt="waveControl signal quality screen"></a></td>
   </tr>
   <tr>
-    <td colspan="2"><strong>Map</strong><br><a href="docs/screenshots/map.png"><img src="docs/screenshots/map.png" alt="waveControl network map with fictional Central Oregon sites and wireless links"></a></td>
+    <td colspan="2"><strong>Map</strong><br><a href="docs/screenshots/map.png"><img src="docs/screenshots/map.png" alt="waveControl rural Washington network map with tower APs connected only to their associated customer STAs"></a></td>
   </tr>
 </table>
 
