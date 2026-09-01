@@ -1,0 +1,122 @@
+name: Apply minimal invalid-rule disable fix
+
+on:
+  push:
+    branches:
+      - fix/disable-invalid-alert-rules
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Replace fatal invalid-rule handling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("internal/alerting/manager.go")
+          source = path.read_text()
+          start = source.index("func (m *Manager) loadRules() ([]Rule, error) {")
+          end = source.index("\nfunc (m *Manager) loadStates()", start)
+          replacement = r'''func (m *Manager) loadRules() ([]Rule, error) {
+          	rows, err := m.db.Query(`
+          		SELECT id, name, enabled, scope, scope_id, target_role, require_alertable, metric, operator, threshold,
+          		       duration_seconds, severity, notify_channels, notify_emails, webhook_url, notify_recovery, cooldown_seconds
+          		FROM alert_rules WHERE enabled = true
+          		ORDER BY id
+          	`)
+          	if err != nil {
+          		return nil, err
+          	}
+
+          	type invalidRule struct {
+          		id     int
+          		name   string
+          		reason string
+          	}
+
+          	var rules []Rule
+          	var invalid []invalidRule
+          	for rows.Next() {
+          		var r Rule
+          		var scopeID sql.NullInt64
+          		var channels, emails pq.StringArray
+          		var webhookURL sql.NullString
+          		if err := rows.Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable,
+          			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhookURL,
+          			&r.NotifyRecovery, &r.CooldownSeconds); err != nil {
+          			rows.Close()
+          			return nil, err
+          		}
+          		if scopeID.Valid {
+          			id := int(scopeID.Int64)
+          			r.ScopeID = &id
+          		}
+          		r.NotifyChannels = append([]string(nil), channels...)
+          		r.NotifyEmails = append([]string(nil), emails...)
+          		if webhookURL.Valid {
+          			r.WebhookURL = webhookURL.String
+          		}
+          		normalizeRule(&r)
+          		if err := ValidateRule(&r); err != nil {
+          			invalid = append(invalid, invalidRule{id: r.ID, name: r.Name, reason: err.Error()})
+          			continue
+          		}
+          		rules = append(rules, r)
+          	}
+          	if err := rows.Err(); err != nil {
+          		rows.Close()
+          		return nil, err
+          	}
+          	if err := rows.Close(); err != nil {
+          		return nil, err
+          	}
+
+          	if len(invalid) != 0 {
+          		tx, err := m.db.Begin()
+          		if err != nil {
+          			return nil, fmt.Errorf("disable invalid alert rules: %w", err)
+          		}
+          		defer tx.Rollback()
+          		for _, bad := range invalid {
+          			if _, err := tx.Exec(`
+          				UPDATE alert_rules
+          				SET enabled = false, updated_at = NOW()
+          				WHERE id = $1 AND enabled = true
+          			`, bad.id); err != nil {
+          				return nil, fmt.Errorf("disable invalid alert rule %d: %w", bad.id, err)
+          			}
+          		}
+          		if err := tx.Commit(); err != nil {
+          			return nil, fmt.Errorf("disable invalid alert rules: %w", err)
+          		}
+          		for _, bad := range invalid {
+          			log.Printf("WARN: disabled structurally invalid alert rule id=%d name=%q: %s", bad.id, bad.name, bad.reason)
+          		}
+          	}
+
+          	return rules, nil
+          }
+          '''
+          path.write_text(source[:start] + replacement + source[end:])
+          PY
+
+          gofmt -w internal/alerting/manager.go
+          go test ./...
+          go vet ./...
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm .github/workflows/apply-disable-invalid-alert-rules.yml
+          git add -A
+          git commit -m "Disable invalid alert rules instead of aborting startup"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
