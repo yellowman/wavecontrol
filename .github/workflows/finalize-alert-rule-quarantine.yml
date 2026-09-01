@@ -1,0 +1,51 @@
+name: Finalize alert-rule quarantine fix
+
+on:
+  push:
+    branches:
+      - fix/alert-rule-quarantine
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify quarantine implementation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -q 'QuarantineReason' internal/alerting/manager.go
+          grep -q 'quarantine_reason' cmd/server/schema_optional.go
+          grep -q 'quarantine_reason' schema.sql
+          test -f migrations/020_alert_rule_quarantine.sql
+          grep -q 'quarantine' web/js/app.js
+          gofmt -w internal/alerting/manager.go internal/alerting/quarantine_test.go cmd/server/schema_optional.go
+          git diff --check
+          go test ./...
+          node --check web/js/app.js
+
+      - name: Remove patch transport and publish verified tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git rm -rf --ignore-unmatch .github/alert-rule-quarantine-patch
+          git rm -f --ignore-unmatch .github/workflows/apply-alert-rule-quarantine.yml
+          git rm -f --ignore-unmatch .github/workflows/finalize-alert-rule-quarantine.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m 'Quarantine invalid legacy alert rules at startup'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
