@@ -1,5 +1,5 @@
-import { store } from './store.js?v=15'
-import { api } from './api.js?v=27'
+import { store } from './store.js?v=16'
+import { api } from './api.js?v=28'
 import { 
   VirtualTable, 
   shouldUseVirtualTable, 
@@ -7,7 +7,7 @@ import {
   setVirtualTableRef,
   VIRTUAL_THRESHOLD,
   triggerUpdateCounts
-} from './virtual-integration.js?v=11'
+} from './virtual-integration.js?v=12'
 
 
 async function requestConfirmation(message, options = {}) {

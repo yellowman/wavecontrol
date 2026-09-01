@@ -1,11 +1,11 @@
 import { api, auth, ws, sync } from './api.js?v=28'
-import { store } from './store.js?v=15'
+import { store } from './store.js?v=16'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=65'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=66'
 import { 
   wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, scrollToDeviceById 
-} from './virtual-integration.js?v=11'
+} from './virtual-integration.js?v=12'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
@@ -5815,9 +5815,11 @@ function initMap() {
     mapInstance.on('zoomend', updateMapMarkerSizing)
     updateMapMarkerSizing()
     
-    // Dark tile layer
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap, &copy; CARTO',
+    // Use Leaflet's standard OpenStreetMap raster endpoint. Keep the tile
+    // layer separate so dark-theme styling never alters markers or AP-to-STA links.
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      className: 'wavecontrol-map-tiles',
       maxZoom: 19
     }).addTo(mapInstance)
     

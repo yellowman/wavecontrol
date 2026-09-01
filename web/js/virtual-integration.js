@@ -10,7 +10,7 @@
 //
 
 import { VirtualTable } from './virtual-table.js?v=6'
-import { store } from './store.js?v=15'
+import { store } from './store.js?v=16'
 
 // Re-export for components.js
 export { VirtualTable }

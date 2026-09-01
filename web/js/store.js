@@ -400,10 +400,12 @@ get dashboardScopedDevices() {
     })
   },
   
-  // Helper: Count devices by status
+  // Header fleet totals are global and must not change when the Dashboard's
+  // optional type/band exclusions are active. Those exclusions affect only
+  // Dashboard rendering; every page reports the same complete-inventory totals.
   get counts() {
     const counts = { online: 0, offline: 0, unknown: 0 }
-    const devices = getDashboardScopedDevices(state.devices)
+    const devices = Array.isArray(state.devices) ? state.devices : []
     devices.forEach(d => {
       const status = getStatus(d)
       if (status === 'online') counts.online++
