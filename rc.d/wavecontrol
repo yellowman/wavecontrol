@@ -29,7 +29,7 @@ rc_start() {
 		return 1
 	fi
 
-	rc_exec "${daemon} ${daemon_flags}"
+	rc_exec "env WAVECONTROL_DSN=\"${WAVECONTROL_DSN}\" WAVECONTROL_JWT_SECRET=\"${WAVECONTROL_JWT_SECRET}\" WAVECONTROL_DATA_KEY=\"${WAVECONTROL_DATA_KEY}\" ${daemon} ${daemon_flags}"
 }
 
 rc_cmd $1
