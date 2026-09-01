@@ -1182,7 +1182,7 @@ func loadCSPSources(db *sql.DB, key string, allowedSchemes map[string]struct{}) 
 }
 
 func buildCSP(db *sql.DB) string {
-	imgSrc := []string{"'self'", "data:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://unpkg.com"}
+	imgSrc := []string{"'self'", "data:", "https://tile.openstreetmap.org", "https://unpkg.com"}
 	connectSrc := []string{"'self'", "ws:", "wss:"}
 	imgSrc = append(imgSrc, loadCSPSources(db, "csp_img_sources", map[string]struct{}{"http": {}, "https": {}})...)
 	connectSrc = append(connectSrc, loadCSPSources(db, "csp_connect_sources", map[string]struct{}{"http": {}, "https": {}, "ws": {}, "wss": {}})...)

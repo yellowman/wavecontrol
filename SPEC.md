@@ -369,7 +369,7 @@ CSP is configurable via settings to allow different map tile providers:
 - `script-src-attr 'none'`
 - `style-src 'self' 'unsafe-inline' https://unpkg.com`
 - `font-src 'self' data:`
-- `img-src 'self' data: https://*.tile.openstreetmap.org https://*.basemaps.cartocdn.com` + extra
+- `img-src 'self' data: https://tile.openstreetmap.org` + extra
 - `connect-src 'self' wss:` + extra
 
 **Example - adding Mapbox tiles:**
@@ -3774,7 +3774,7 @@ The main navigation now consists of:
 
 ### Map View
 
-Uses Leaflet with CARTO dark tiles. Features:
+Uses Leaflet with the standard OpenStreetMap raster endpoint. In dark mode, WaveControl filters only the basemap tile layer. Features:
 - Device markers colored by status (green=online, red=offline). Marker dot size scales with map zoom (smaller when zoomed out, with a minimum size so they remain visible).
 - Link lines between APs and STAs, colored by signal quality
 - Popup with device info on click

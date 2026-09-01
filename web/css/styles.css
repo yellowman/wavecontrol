@@ -137,11 +137,18 @@ html, body {
 }
 
 .header-tabs a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  flex: 0 0 auto;
+  white-space: nowrap;
   color: var(--text-2);
   text-decoration: none;
   padding: 0.5rem 1rem;
   font-size: 0.85rem;
   font-weight: 600;
+  line-height: 1;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   border-bottom: 2px solid transparent;
@@ -3912,6 +3919,21 @@ tr.selected {
   flex: 1;
   min-height: 600px;
   height: 600px;
+}
+
+/* The standard OSM raster layer is light. Darken only its tiles in dark
+   mode; markers, popups, and AP-to-STA link overlays remain untouched. */
+html[data-theme="dark"] .wavecontrol-map-tiles {
+  filter: invert(100%) hue-rotate(180deg) brightness(78%) contrast(90%) saturate(70%);
+}
+
+html[data-theme="dark"] #mapContainer .leaflet-control-attribution {
+  background: rgba(8, 31, 49, 0.9);
+  color: var(--text-2);
+}
+
+html[data-theme="dark"] #mapContainer .leaflet-control-attribution a {
+  color: var(--cyan);
 }
 
 .map-marker {
@@ -8881,16 +8903,16 @@ body.drilldown-active .main-content {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex: 0 0 auto;
   min-width: 16px;
   height: 16px;
   padding: 0 5px;
-  margin-left: 4px;
+  margin: 0;
   border-radius: 999px;
   background: var(--red);
   color: white;
   font-size: 10px;
   line-height: 1;
-  vertical-align: middle;
 }
 
 .alerts-page {
