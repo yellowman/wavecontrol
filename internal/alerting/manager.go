@@ -172,13 +172,20 @@ func (m *Manager) loadRules() ([]Rule, error) {
 		SELECT id, name, enabled, scope, scope_id, target_role, require_alertable, metric, operator, threshold,
 		       duration_seconds, severity, notify_channels, notify_emails, webhook_url, notify_recovery, cooldown_seconds
 		FROM alert_rules WHERE enabled = true
+		ORDER BY id
 	`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+
+	type invalidRule struct {
+		id     int
+		name   string
+		reason string
+	}
 
 	var rules []Rule
+	var invalid []invalidRule
 	for rows.Next() {
 		var r Rule
 		var scopeID sql.NullInt64
@@ -187,6 +194,7 @@ func (m *Manager) loadRules() ([]Rule, error) {
 		if err := rows.Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable,
 			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhookURL,
 			&r.NotifyRecovery, &r.CooldownSeconds); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		if scopeID.Valid {
@@ -200,11 +208,43 @@ func (m *Manager) loadRules() ([]Rule, error) {
 		}
 		normalizeRule(&r)
 		if err := ValidateRule(&r); err != nil {
-			return nil, fmt.Errorf("enabled alert rule %d is invalid: %w", r.ID, err)
+			invalid = append(invalid, invalidRule{id: r.ID, name: r.Name, reason: err.Error()})
+			continue
 		}
 		rules = append(rules, r)
 	}
-	return rules, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	if len(invalid) != 0 {
+		tx, err := m.db.Begin()
+		if err != nil {
+			return nil, fmt.Errorf("disable invalid alert rules: %w", err)
+		}
+		defer tx.Rollback()
+		for _, bad := range invalid {
+			if _, err := tx.Exec(`
+				UPDATE alert_rules
+				SET enabled = false, updated_at = NOW()
+				WHERE id = $1 AND enabled = true
+			`, bad.id); err != nil {
+				return nil, fmt.Errorf("disable invalid alert rule %d: %w", bad.id, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("disable invalid alert rules: %w", err)
+		}
+		for _, bad := range invalid {
+			log.Printf("WARN: disabled structurally invalid alert rule id=%d name=%q: %s", bad.id, bad.name, bad.reason)
+		}
+	}
+
+	return rules, nil
 }
 
 func (m *Manager) loadStates() (map[string]*AlertState, error) {
