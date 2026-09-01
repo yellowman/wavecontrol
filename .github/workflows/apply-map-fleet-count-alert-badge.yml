@@ -33,181 +33,163 @@ jobs:
 
           replace_once(
               "cmd/server/main.go",
-              '''\timgSrc := []string{"'self'", "data:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://unpkg.com"}''',
-              '''\timgSrc := []string{"'self'", "data:", "https://tile.openstreetmap.org", "https://unpkg.com"}''',
+              "\timgSrc := []string{\"'self'\", \"data:\", \"https://*.tile.openstreetmap.org\", \"https://*.basemaps.cartocdn.com\", \"https://unpkg.com\"}",
+              "\timgSrc := []string{\"'self'\", \"data:\", \"https://tile.openstreetmap.org\", \"https://unpkg.com\"}",
           )
 
-          replace_once(
-              "web/js/app.js",
-              "import { store } from './store.js?v=15'",
-              "import { store } from './store.js?v=16'",
-          )
+          replace_once("web/js/app.js", "import { store } from './store.js?v=15'", "import { store } from './store.js?v=16'")
           replace_once(
               "web/js/app.js",
               "         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=65'",
               "         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=66'",
           )
-          replace_once(
-              "web/js/app.js",
-              "} from './virtual-integration.js?v=11'",
-              "} from './virtual-integration.js?v=12'",
-          )
-          replace_once(
-              "web/js/app.js",
-              '''    // Dark tile layer
-              L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                attribution: '&copy; OpenStreetMap, &copy; CARTO',
-                maxZoom: 19
-              }).addTo(mapInstance)''',
-              '''    // Use Leaflet's standard OpenStreetMap raster endpoint. Keep the tile
-              // layer separate so dark-theme styling never alters markers or AP-to-STA links.
-              L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-                className: 'wavecontrol-map-tiles',
-                maxZoom: 19
-              }).addTo(mapInstance)''',
-          )
+          replace_once("web/js/app.js", "} from './virtual-integration.js?v=11'", "} from './virtual-integration.js?v=12'")
+
+          old_map = "\n".join([
+              "    // Dark tile layer",
+              "    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {",
+              "      attribution: '&copy; OpenStreetMap, &copy; CARTO',",
+              "      maxZoom: 19",
+              "    }).addTo(mapInstance)",
+          ])
+          new_map = "\n".join([
+              "    // Use Leaflet's standard OpenStreetMap raster endpoint. Keep the tile",
+              "    // layer separate so dark-theme styling never alters markers or AP-to-STA links.",
+              "    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {",
+              "      attribution: '&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors',",
+              "      className: 'wavecontrol-map-tiles',",
+              "      maxZoom: 19",
+              "    }).addTo(mapInstance)",
+          ])
+          replace_once("web/js/app.js", old_map, new_map)
 
           replace_once(
               "web/js/components.js",
               "import { store } from './store.js?v=15'\nimport { api } from './api.js?v=27'",
               "import { store } from './store.js?v=16'\nimport { api } from './api.js?v=28'",
           )
-          replace_once(
-              "web/js/components.js",
-              "} from './virtual-integration.js?v=11'",
-              "} from './virtual-integration.js?v=12'",
-          )
-          replace_once(
-              "web/js/virtual-integration.js",
-              "import { store } from './store.js?v=15'",
-              "import { store } from './store.js?v=16'",
-          )
+          replace_once("web/js/components.js", "} from './virtual-integration.js?v=11'", "} from './virtual-integration.js?v=12'")
+          replace_once("web/js/virtual-integration.js", "import { store } from './store.js?v=15'", "import { store } from './store.js?v=16'")
 
           replace_once(
               "web/js/store.js",
-              '''  // Helper: Count devices by status
-              get counts() {
-                const counts = { online: 0, offline: 0, unknown: 0 }
-                const devices = getDashboardScopedDevices(state.devices)
-                devices.forEach(d => {''',
-              '''  // Header fleet totals are global and must not change when the Dashboard's
-              // optional type/band exclusions are active. Those exclusions affect only
-              // Dashboard rendering; every page reports the same complete-inventory totals.
-              get counts() {
-                const counts = { online: 0, offline: 0, unknown: 0 }
-                const devices = Array.isArray(state.devices) ? state.devices : []
-                devices.forEach(d => {''',
-          )
-
-          replace_once(
-              "web/css/styles.css",
-              '''.header-tabs a {
-                color: var(--text-2);
-                text-decoration: none;
-                padding: 0.5rem 1rem;
-                font-size: 0.85rem;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                border-bottom: 2px solid transparent;
-                transition: all 0.2s;
-              }''',
-              '''.header-tabs a {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                gap: 0.35rem;
-                flex: 0 0 auto;
-                white-space: nowrap;
-                color: var(--text-2);
-                text-decoration: none;
-                padding: 0.5rem 1rem;
-                font-size: 0.85rem;
-                font-weight: 600;
-                line-height: 1;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                border-bottom: 2px solid transparent;
-                transition: all 0.2s;
-              }''',
+              "  // Helper: Count devices by status",
+              "  // Header fleet totals are global and must not change when the Dashboard's\n  // optional type/band exclusions are active. Those exclusions affect only\n  // Dashboard rendering; every page reports the same complete-inventory totals.",
           )
           replace_once(
-              "web/css/styles.css",
-              '''.map-container {
-                flex: 1;
-                min-height: 600px;
-                height: 600px;
-              }
-
-              .map-marker {''',
-              '''.map-container {
-                flex: 1;
-                min-height: 600px;
-                height: 600px;
-              }
-
-              /* The standard OSM raster layer is light. Darken only its tiles in dark
-                 mode; markers, popups, and AP-to-STA link overlays remain untouched. */
-              html[data-theme="dark"] .wavecontrol-map-tiles {
-                filter: invert(100%) hue-rotate(180deg) brightness(78%) contrast(90%) saturate(70%);
-              }
-
-              html[data-theme="dark"] #mapContainer .leaflet-control-attribution {
-                background: rgba(8, 31, 49, 0.9);
-                color: var(--text-2);
-              }
-
-              html[data-theme="dark"] #mapContainer .leaflet-control-attribution a {
-                color: var(--cyan);
-              }
-
-              .map-marker {''',
-          )
-          replace_once(
-              "web/css/styles.css",
-              '''.nav-alert-badge {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 16px;
-                height: 16px;
-                padding: 0 5px;
-                margin-left: 4px;
-                border-radius: 999px;
-                background: var(--red);
-                color: white;
-                font-size: 10px;
-                line-height: 1;
-                vertical-align: middle;
-              }''',
-              '''.nav-alert-badge {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                flex: 0 0 auto;
-                min-width: 16px;
-                height: 16px;
-                padding: 0 5px;
-                margin: 0;
-                border-radius: 999px;
-                background: var(--red);
-                color: white;
-                font-size: 10px;
-                line-height: 1;
-              }''',
+              "web/js/store.js",
+              "    const devices = getDashboardScopedDevices(state.devices)",
+              "    const devices = Array.isArray(state.devices) ? state.devices : []",
           )
 
-          replace_once(
-              "web/index.html",
-              '  <link rel="stylesheet" href="css/styles.css?v=59"/>',
-              '  <link rel="stylesheet" href="css/styles.css?v=60"/>',
-          )
-          replace_once(
-              "web/index.html",
-              '  <script type="module" src="js/app.js?v=121"></script>',
-              '  <script type="module" src="js/app.js?v=122"></script>',
-          )
+          old_header = "\n".join([
+              ".header-tabs a {",
+              "  color: var(--text-2);",
+              "  text-decoration: none;",
+              "  padding: 0.5rem 1rem;",
+              "  font-size: 0.85rem;",
+              "  font-weight: 600;",
+              "  text-transform: uppercase;",
+              "  letter-spacing: 0.5px;",
+              "  border-bottom: 2px solid transparent;",
+              "  transition: all 0.2s;",
+              "}",
+          ])
+          new_header = "\n".join([
+              ".header-tabs a {",
+              "  display: inline-flex;",
+              "  align-items: center;",
+              "  justify-content: center;",
+              "  gap: 0.35rem;",
+              "  flex: 0 0 auto;",
+              "  white-space: nowrap;",
+              "  color: var(--text-2);",
+              "  text-decoration: none;",
+              "  padding: 0.5rem 1rem;",
+              "  font-size: 0.85rem;",
+              "  font-weight: 600;",
+              "  line-height: 1;",
+              "  text-transform: uppercase;",
+              "  letter-spacing: 0.5px;",
+              "  border-bottom: 2px solid transparent;",
+              "  transition: all 0.2s;",
+              "}",
+          ])
+          replace_once("web/css/styles.css", old_header, new_header)
+
+          old_map_css = "\n".join([
+              ".map-container {",
+              "  flex: 1;",
+              "  min-height: 600px;",
+              "  height: 600px;",
+              "}",
+              "",
+              ".map-marker {",
+          ])
+          new_map_css = "\n".join([
+              ".map-container {",
+              "  flex: 1;",
+              "  min-height: 600px;",
+              "  height: 600px;",
+              "}",
+              "",
+              "/* The standard OSM raster layer is light. Darken only its tiles in dark",
+              "   mode; markers, popups, and AP-to-STA link overlays remain untouched. */",
+              "html[data-theme=\"dark\"] .wavecontrol-map-tiles {",
+              "  filter: invert(100%) hue-rotate(180deg) brightness(78%) contrast(90%) saturate(70%);",
+              "}",
+              "",
+              "html[data-theme=\"dark\"] #mapContainer .leaflet-control-attribution {",
+              "  background: rgba(8, 31, 49, 0.9);",
+              "  color: var(--text-2);",
+              "}",
+              "",
+              "html[data-theme=\"dark\"] #mapContainer .leaflet-control-attribution a {",
+              "  color: var(--cyan);",
+              "}",
+              "",
+              ".map-marker {",
+          ])
+          replace_once("web/css/styles.css", old_map_css, new_map_css)
+
+          old_badge = "\n".join([
+              ".nav-alert-badge {",
+              "  display: inline-flex;",
+              "  align-items: center;",
+              "  justify-content: center;",
+              "  min-width: 16px;",
+              "  height: 16px;",
+              "  padding: 0 5px;",
+              "  margin-left: 4px;",
+              "  border-radius: 999px;",
+              "  background: var(--red);",
+              "  color: white;",
+              "  font-size: 10px;",
+              "  line-height: 1;",
+              "  vertical-align: middle;",
+              "}",
+          ])
+          new_badge = "\n".join([
+              ".nav-alert-badge {",
+              "  display: inline-flex;",
+              "  align-items: center;",
+              "  justify-content: center;",
+              "  flex: 0 0 auto;",
+              "  min-width: 16px;",
+              "  height: 16px;",
+              "  padding: 0 5px;",
+              "  margin: 0;",
+              "  border-radius: 999px;",
+              "  background: var(--red);",
+              "  color: white;",
+              "  font-size: 10px;",
+              "  line-height: 1;",
+              "}",
+          ])
+          replace_once("web/css/styles.css", old_badge, new_badge)
+
+          replace_once("web/index.html", '  <link rel="stylesheet" href="css/styles.css?v=59"/>', '  <link rel="stylesheet" href="css/styles.css?v=60"/>')
+          replace_once("web/index.html", '  <script type="module" src="js/app.js?v=121"></script>', '  <script type="module" src="js/app.js?v=122"></script>')
 
           replace_once(
               "SPEC.md",
@@ -236,6 +218,7 @@ jobs:
           store = Path('web/js/store.js').read_text()
           css = Path('web/css/styles.css').read_text()
           csp = Path('cmd/server/main.go').read_text()
+          index = Path('web/index.html').read_text()
 
           assert 'basemaps.cartocdn.com' not in app
           assert 'https://tile.openstreetmap.org/{z}/{x}/{y}.png' in app
@@ -261,6 +244,12 @@ jobs:
           assert 'flex: 0 0 auto' in badge_rule
           assert 'margin: 0' in badge_rule
           assert 'vertical-align:' not in badge_rule
+
+          assert 'css/styles.css?v=60' in index
+          assert 'js/app.js?v=122' in index
+          assert "./store.js?v=16" in app
+          assert "./components.js?v=66" in app
+          assert "./virtual-integration.js?v=12" in app
           PY
 
           go test ./...
