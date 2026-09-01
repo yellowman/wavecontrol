@@ -1,0 +1,109 @@
+   COALESCE(notify_emails, ARRAY[]::TEXT[]), webhook_url, notify_recovery, COALESCE(cooldown_seconds, 0)
+ 		FROM alert_rules WHERE enabled = true
++		ORDER BY id
+ 	`)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defer rows.Close()
+ 
+ 	var rules []Rule
++	var invalidRules []invalidEnabledRule
+ 	for rows.Next() {
+ 		var r Rule
+ 		var scopeID sql.NullInt64
+@@ -187,6 +196,7 @@ func (m *Manager) loadRules() ([]Rule, error) {
+ 		if err := rows.Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable,
+ 			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhookURL,
+ 			&r.NotifyRecovery, &r.CooldownSeconds); err != nil {
++			rows.Close()
+ 			return nil, err
+ 		}
+ 		if scopeID.Valid {
+@@ -200,14 +210,84 @@ func (m *Manager) loadRules() ([]Rule, error) {
+ 		}
+ 		normalizeRule(&r)
+ 		if err := ValidateRule(&r); err != nil {
+-			return nil, fmt.Errorf("enabled alert rule %d is invalid: %w", r.ID, err)
++			invalidRules = append(invalidRules, invalidEnabledRule{rule: r, err: err})
++			continue
+ 		}
+ 		rules = append(rules, r)
+ 	}
+-	return rules, rows.Err()
++	if err := rows.Err(); err != nil {
++		rows.Close()
++		return nil, err
++	}
++	if err := rows.Close(); err != nil {
++		return nil, err
++	}
++
++	wakeNotifications := false
++	for _, invalid := range invalidRules {
+		enqueued, err := m.quarantineInvalidRule(context.Background(), invalid.rule, invalid.err)
+		if err != nil {
+			// Bad user data must not take the monitoring daemon down. Keep the
+			// rule out of memory and make the persistence failure unmissable in
+			// the service log so an operator can repair the database manually.
+			log.Printf("alert rule %d (%q) is invalid and was skipped, but could not be quarantined: %v (validation error: %v)",
+				invalid.rule.ID, invalid.rule.Name, err, invalid.err)
+			continue
+		}
+		wakeNotifications = wakeNotifications || enqueued
+		log.Printf("alert rule %d (%q) was automatically disabled: %v", invalid.rule.ID, invalid.rule.Name, invalid.err)
+	}
+	if wakeNotifications {
+		m.wakeNotificationWorker()
+	}
+
+	return rules, nil
+}
+
+func (m *Manager) quarantineInvalidRule(ctx context.Context, rule Rule, validationErr error) (bool, error) {
+	if rule.ID <= 0 {
+		return false, fmt.Errorf("invalid rule id %d", rule.ID)
+	}
+	reason := truncateError(fmt.Sprintf("Automatically disabled by WaveControl because the rule is invalid: %v", validationErr), 2048)
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE alert_rules
+		SET enabled=false, quarantine_reason=$2, quarantined_at=NOW(), updated_at=NOW()
+		WHERE id=$1 AND enabled=true
+	`, rule.ID, reason)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
++		return false, tx.Commit()
++	}
++
++	// Close any occurrence created by the old rule through the normal durable
++	// resolution path. This cancels undelivered triggers and sends a matching
++	// recovery to channels that may already have received the trigger.
++	enqueued, err := m.resolveRuleAlertsTx(ctx, tx, rule, reason)
++	if err != nil {
++		return false, err
++	}
++	if _, err := tx.ExecContext(ctx, `DDELETE FROM alert_states WHERE rule_id=$1`, rule.ID); err != nil {
++		return false, err
++	}
++	if err := tx.Commit(); err != nil {
++		return false, err
++	}
++	return enqueued, nil
+ }
+ 
+-func (m *Manager) loadStates() (map[string]*AlertState, error) {
++func (m *Manager) loadStates(activeRuleIDs map[int]struct{}) (map[string]*AlertState, error) {
+ 	rows, err := m.db.Query(`
+		SELECT s.

@@ -1,0 +1,129 @@
+oldown state: %w", err)
+ 	}
+@@ -1023,13 +1113,16 @@ func (m *Manager) GetRule(id int) (Rule, error) {
+ 	var r Rule
+ 	var scopeID sql.NullInt64
+ 	var channels, emails pq.StringArray
+-	var webhook sql.NullString
++	var webhook, quarantineReason sql.NullString
++	var quarantinedAt sql.NullTime
+ 	err := m.db.QueryRow(`
+ 		SELECT id,name,enabled,scope,scope_id,target_role,require_alertable,metric,operator,threshold,
+-		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_at,COALESCE(created_by,0)
++		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_at,
++		 COALESCE(created_by,0),quarantine_reason,quarantined_at
+ 		FROM alert_rules WHERE id=$1
+ 	`, id).Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable, &r.Metric,
+-		&r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhook, &r.NotifyRecovery, &r.CooldownSeconds, &r.CreatedAt, &r.CreatedBy)
++		&r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhook, &r.NotifyRecovery,
++		&r.CooldownSeconds, &r.CreatedAt, &r.CreatedBy, &quarantineReason, &quarantinedAt)
+ 	if errors.Is(err, sql.ErrNoRows) {
+ 		return r, ErrNotFound
+ 	}
+@@ -1045,6 +1138,13 @@ func (m *Manager) GetRule(id int) (Rule, error) {
+ 	if webhook.Valid {
+ 		r.WebhookURL = webhook.String
+ 	}
++	if quarantineReason.Valid {
++		r.QuarantineReason = quarantineReason.String
++	}
++	if quarantinedAt.Valid {
++		t := quarantinedAt.Time
++		r.QuarantinedAt = &t
++	}
+ 	normalizeRule(&r)
+ 	return r, nil
+ }
+@@ -1076,7 +1176,8 @@ func (m *Manager) UpdateRule(id int, rule *Rule) error {
+ 	if _, err := tx.Exec(`
+ 		UPDATE alert_rules SET name=$1,enabled=$2,scope=$3,scope_id=$4,target_role=$5,require_alertable=$6,
+ 		 metric=$7,operator=$8,threshold=$9,duration_seconds=$10,severity=$11,notify_channels=$12,notify_emails=$13,
+-		 webhook_url=NULLIF($14,''),notify_recovery=$15,cooldown_seconds=$16,updated_at=NOW() WHERE id=$17
++		 webhook_url=NULLIF($14,''),notify_recovery=$15,cooldown_seconds=$16,
++		 quarantine_reason=NULL,quarantined_at=NULL,updated_at=NOW() WHERE id=$17
+ 	`, rule.Name, rule.Enabled, rule.Scope, rule.ScopeID, rule.TargetRole, rule.RequireAlertable, rule.Metric, rule.Operator,
+ 		rule.Threshold, rule.DurationSeconds, rule.Severity, pq.Array(rule.NotifyChannels), pq.Array(rule.NotifyEmails), rule.WebhookURL,
+ 		rule.NotifyRecovery, rule.CooldownSeconds, id); err != nil {
+@@ -1128,7 +1229,8 @@ func (m *Manager) DeleteRule(id int) error {
+ func (m *Manager) ListRules() ([]Rule, error) {
+ 	rows, err := m.db.Query(`
+ 		SELECT id,name,enabled,scope,scope_id,target_role,require_alertable,metric,operator,threshold,
+-		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_at
++		 duration_seconds,severity,notify_channels,notify_emails,webhook_url,notify_recovery,cooldown_seconds,created_at,
++		 quarantine_reason,quarantined_at
+ 		FROM alert_rules ORDER BY name
+ 	`)
+ 	if err != nil {
+@@ -1140,10 +1242,11 @@ func (m *Manager) ListRules() ([]Rule, error) {
+ 		var r Rule
+ 		var scopeID sql.NullInt64
+ 		var channels, emails pq.StringArray
+-		var webhook sql.NullString
++		var webhook, quarantineReason sql.NullString
++		var quarantinedAt sql.NullTime
+ 		if err := rows.Scan(&r.ID, &r.Name, &r.Enabled, &r.Scope, &scopeID, &r.TargetRole, &r.RequireAlertable,
+ 			&r.Metric, &r.Operator, &r.Threshold, &r.DurationSeconds, &r.Severity, &channels, &emails, &webhook,
+-			&r.NotifyRecovery, &r.CooldownSeconds, &r.CreatedAt); err != nil {
++			&r.NotifyRecovery, &r.CooldownSeconds, &r.CreatedAt, &quarantineReason, &quarantinedAt); err != nil {
+ 			return nil, err
+ 		}
+ 		if scopeID.Valid {
+@@ -1155,6 +1258,13 @@ func (m *Manager) ListRules() ([]Rule, error) {
+ 		if webhook.Valid {
+ 			r.WebhookURL = webhook.String
+ 		}
++		if quarantineReason.Valid {
++			r.QuarantineReason = quarantineReason.String
++		}
++		if quarantinedAt.Valid {
++			t := quarantinedAt.Time
++			r.QuarantinedAt = &t
++		}
+ 		normalizeRule(&r)
+ 		rules = append(rules, r)
+ 	}
+diff --git a/internal/alerting/quarantine_test.go b/internal/alerting/quarantine_test.go
+new file mode 100644
+index 0000000..d227141
+--- /dev/null
++++ b/internal/alerting/quarantine_test.go
+@@ -0,0 +1,163 @@
++package alerting
++
++import (
++	"context"
++	"database/sql"
++	"database/sql/driver"
++	"errors"
++	"io"
++	"strings"
++	"sync"
++	"testing"
++)
++
++type quarantineTestConnector struct {
++	conn *quarantineTestConn
++}
++
++func (c quarantineTestConnector) Connect(context.Context) (driver.Conn, error) { return c.conn, nil }
++func (c quarantineTestConnector) Driver() driver.Driver                        { return quarantineTestDriver{} }
++
++type quarantineTestDriver struct{}
++
++func (quarantineTestDriver) Open(string) (driver.Conn, error) {
++	return nil, errors.New("quarantine test driver must be opened through its connector")
++}
++
++type quarantineTestConn struct {
++	mu        sync.Mutex
++	execs     []quarantineTestExec
++	committed bool
++	failExec  bool
++}
++
++type quarantineTestExec struct {
++	query string
++	args  []driver.NamedValue
++}
++
++func (c *quarantineTestConn) Prepare(string) (driver.Stmt,

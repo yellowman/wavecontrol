@@ -1,0 +1,77 @@
+
++    queueDecoration()
++    return
++  }
++  const now = Date.now()
++  if (!force && now - lastRefreshAt < minimumRefreshGapMs) {
++    queueDecoration()
++    return
++  }
++  if (refreshPromise) return refreshPromise
++
++  refreshPromise = (async () => {
++    try {
++      const rules = await api.alertRules()
++      cachedRules = Array.isArray(rules) ? rules : []
++      lastRefreshAt = Date.now()
++      if (!cachedRules.some(rule => String(rule.id) === String(activeRepairRuleID) && rule.quarantine_reason)) {
++        activeRepairRuleID = null
++      }
++      updateWarningBadge()
++      announceQuarantine()
++      queueDecoration()
++    } catch (_) {
++      // This is advisory UI. Keep the last known state on a transient API
++      // failure and never interfere with the main Alerts page.
++    } finally {
++      refreshPromise = null
++    }
++  })()
++  return refreshPromise
++}
++
++store.subscribe((next, previous) => {
++  const userChanged = next.user !== previous.user
++  const pageChanged = next.currentPage !== previous.currentPage
++  if (userChanged || pageChanged) refreshQuarantineState(true)
++  else if (next.currentPage === 'alerts') queueDecoration()
++})
++
++document.addEventListener('click', event => {
++  if (!(event.target instanceof Element)) return
++  const repairButton = event.target.closest('[data-alert-rule-edit]')
++  if (repairButton) {
++    const id = String(repairButton.dataset.alertRuleEdit || '')
++    activeRepairRuleID = quarantinedRules().some(rule => String(rule.id) === id) ? id : null
++    queueDecoration()
++    return
++  }
++  if (event.target.closest('#alertNewRule, #alertCancelEdit, [data-alert-preset]')) {
++    activeRepairRuleID = null
++    queueDecoration()
++    return
++  }
++  if (event.target.closest('[data-alert-rule-delete]')) {
++    window.setTimeout(() => refreshQuarantineState(true), 500)
++  }
++}, true)
++
++document.addEventListener('submit', event => {
++  if (!(event.target instanceof Element) || !event.target.matches('#alertRuleForm')) return
++  window.setTimeout(() => refreshQuarantineState(true), 500)
++  window.setTimeout(() => refreshQuarantineState(true), 1_500)
++}, true)
++
++window.addEventListener('wavecontrol-auth-failure', () => {
++  cachedRules = []
++  activeRepairRuleID = null
++  toastFingerprint = ''
++  updateWarningBadge()
++  queueDecoration()
++})
++
++observer = new MutationObserver(queueDecoration)
++observer.observe(document.body, { childList: true, subtree: true })
++
++window.setInterval(() => refreshQuarantineState(false), refreshIntervalMs)
++refreshQuarantineState(true)

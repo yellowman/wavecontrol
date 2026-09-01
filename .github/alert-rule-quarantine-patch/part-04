@@ -1,0 +1,185 @@
+carded rule
+ );
+ 
+ CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled);
+diff --git a/web/css/alert-quarantine.css b/web/css/alert-quarantine.css
+new file mode 100644
+index 0000000..e35c572
+--- /dev/null
++++ b/web/css/alert-quarantine.css
+@@ -0,0 +1,70 @@
++.nav-alert-rule-warning {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  min-width: 16px;
++  height: 16px;
++  padding: 0 5px;
++  margin-left: 3px;
++  border-radius: 999px;
++  background: var(--yellow);
++  color: #15110a;
++  font-size: 10px;
++  font-weight: 800;
++  line-height: 1;
++  vertical-align: middle;
++}
++
++.alert-rule-quarantine-banner,
++.alert-rule-quarantine-editor {
++  display: flex;
++  gap: 0.65rem;
++  margin: 0.75rem 0;
++  padding: 0.75rem 0.85rem;
++  border: 1px solid rgba(var(--yellow-rgb), 0.5);
++  border-radius: 8px;
++  background: rgba(var(--yellow-rgb), 0.1);
++  color: var(--text-1);
++}
++
++.alert-rule-quarantine-banner,
++.alert-rule-quarantine-editor {
++  flex-direction: column;
++  gap: 0.3rem;
++}
++
++.alert-rule-quarantine-banner strong,
++.alert-rule-quarantine-editor strong {
++  color: var(--yellow);
++}
++
++.alert-rule-quarantine-banner p,
++.alert-rule-quarantine-editor p {
++  margin: 0;
++  color: var(--text-2);
++  line-height: 1.4;
++}
++
++.alert-rule-quarantined {
++  background: rgba(var(--yellow-rgb), 0.045);
++}
++
++.alert-rule-quarantine-detail {
++  display: flex;
++  flex-direction: column;
++  gap: 0.2rem;
++  max-width: 360px;
++  margin-top: 0.35rem;
++  color: var(--yellow);
++  line-height: 1.35;
++}
++
++.alert-rule-quarantine-detail small {
++  color: var(--text-2);
++  overflow-wrap: anywhere;
++}
++
++.alert-enabled.quarantined {
++  background: rgba(var(--yellow-rgb), 0.16);
++  color: var(--yellow);
++}
+diff --git a/web/index.html b/web/index.html
+index c2a59a0..cb4b5bc 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -8,6 +8,7 @@
+   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous" />
+   <link rel="stylesheet" href="css/styles.css?v=59"/>
++  <link rel="stylesheet" href="css/alert-quarantine.css?v=1"/>
+ </head>
+ <body class="not-authed">
+   <div id="networkBanner" class="network-banner hidden">Checking connection...</div>
+@@ -468,5 +469,6 @@
+           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+   <script src="js/jszip.min.js"></script>
+   <script type="module" src="js/app.js?v=121"></script>
++  <script type="module" src="js/alert-quarantine-ui.js?v=1"></script>
+ </body>
+ </html>
+diff --git a/web/js/alert-quarantine-ui.js b/web/js/alert-quarantine-ui.js
+new file mode 100644
+index 0000000..da01574
+--- /dev/null
++++ b/web/js/alert-quarantine-ui.js
+@@ -0,0 +1,294 @@
++import { api } from './api.js'
++import { store } from './store.js'
++import { showToast } from './components.js'
++
++const refreshIntervalMs = 60_000
++const minimumRefreshGapMs = 2_000
++
++let cachedRules = []
++let refreshPromise = null
++let lastRefreshAt = 0
++let activeRepairRuleID = null
++let toastFingerprint = ''
++let decorationQueued = false
++let decorating = false
++let observer = null
++
++function isAdministrator() {
++  return (store.user?.roles || []).includes('administrator')
++}
++
++function quarantinedRules() {
++  return cachedRules.filter(rule => !rule.enabled && String(rule.quarantine_reason || '').trim())
++}
++
++function ensureWarningBadge() {
++  const alertsLink = document.querySelector('a[data-page="alerts"]')
++  if (!alertsLink) return null
++  let badge = document.getElementById('alertRuleWarningBadge')
++  if (!badge) {
++    badge = document.createElement('span')
++    badge.id = 'alertRuleWarningBadge'
++    badge.className = 'nav-alert-rule-warning hidden'
++    badge.setAttribute('aria-label', 'Alert rule configuration needs attention')
++    alertsLink.appendChild(badge)
++  }
++  return badge
++}
++
++function updateWarningBadge() {
++  const badge = ensureWarningBadge()
++  if (!badge) return
++  const rules = isAdministrator() ? quarantinedRules() : []
++  if (rules.length === 0) {
++    badge.classList.add('hidden')
++    badge.textContent = ''
++    badge.removeAttribute('title')
++    return
++  }
++  badge.textContent = rules.length > 9 ? '9+' : String(rules.length)
++  badge.title = `${rules.length} invalid alert rule${rules.length === 1 ? '' : 's'} automatically disabled`
++  badge.classList.remove('hidden')
++}
++
++function announceQuarantine() {
++  if (!isAdministrator()) {
++    toastFingerprint = ''
++    return
++  }
++  const rules = quarantinedRules()
++  if (rules.length === 0) {
++    toastFingerprint = ''
++    return
++  }
++  const fingerprint = rules.map(rule => `${rule.id}:${rule.quarantined_at || ''}`).join('|')
++  if (fingerprint === toastFingerprint) return
++  toastFingerprint = fingerprint
++  showToast(
++    `WaveControl disabled ${rules.length} invalid alert rule${rules.length === 1 ? '' : 's'}. Open Alerts to repair or delete ${rules.length === 1 ? 'it' : 'them'}.`,
++    'warning'
++  )
++}
++
++function formatQuarantineTime(value) {
++  if (!value) return ''
++  const date = new Date(value)
++  if (Number.isNaN(date.getTime())) return ''
++  return date.toLocaleString()
++}
++
++function resetR

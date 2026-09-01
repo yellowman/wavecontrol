@@ -1,0 +1,30 @@
+name: Apply alert-rule quarantine patch
+
+on:
+  push:
+    branches:
+      - fix/alert-rule-quarantine
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply verified patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat .github/alert-rule-quarantine-patch/part-* > /tmp/alert-rule-quarantine.diff
+          echo "5cc05f3458aed7f17c8a3546e0e5903e7f5b3ff03da765f747574e4c857bb8f0  /tmp/alert-rule-quarantine.diff" | sha256sum -c -
+          git apply --check /tmp/alert-rule-quarantine.diff
+          git apply --index /tmp/alert-rule-quarantine.diff
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Quarantine invalid legacy alert rules at startup"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

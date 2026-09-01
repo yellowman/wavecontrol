@@ -1,0 +1,139 @@
+uleDecorations(page) {
++  page.querySelectorAll('[data-alert-quarantine-banner], [data-alert-quarantine-editor], [data-alert-quarantine-detail]')
++    .forEach(element => element.remove())
++  page.querySelectorAll('tr.alert-rule-quarantined').forEach(row => row.classList.remove('alert-rule-quarantined'))
++
++  const rulesByID = new Map(cachedRules.map(rule => [String(rule.id), rule]))
++  page.querySelectorAll('[data-alert-rule-edit]').forEach(button => {
++    const rule = rulesByID.get(String(button.dataset.alertRuleEdit || ''))
++    if (!rule) return
++    if (button.dataset.quarantineLabel === 'true') {
++      button.textContent = 'Edit'
++      delete button.dataset.quarantineLabel
++    }
++    const row = button.closest('tr')
++    const status = row?.querySelector('.alert-enabled')
++    if (status?.classList.contains('quarantined')) {
++      status.classList.remove('quarantined')
++      status.classList.toggle('enabled', Boolean(rule.enabled))
++      status.classList.toggle('disabled', !rule.enabled)
++      status.textContent = rule.enabled ? 'enabled' : 'disabled'
++    }
++  })
++}
++
++function makeQuarantineBanner(count) {
++  const banner = document.createElement('div')
++  banner.className = 'alert-rule-quarantine-banner'
++  banner.dataset.alertQuarantineBanner = 'true'
++  banner.setAttribute('role', 'alert')
++
++  const title = document.createElement('strong')
++  title.textContent = `${count} invalid alert rule${count === 1 ? '' : 's'} automatically disabled`
++  banner.appendChild(title)
++
++  const explanation = document.createElement('p')
++  explanation.textContent = `WaveControl kept running and excluded ${count === 1 ? 'this rule' : 'these rules'} from evaluation. Repair the highlighted configuration and save it, or delete it if it is obsolete.`
++  banner.appendChild(explanation)
++  return banner
++}
++
++function addRuleDetail(row, rule) {
++  const nameCell = row.cells?.[0]
++  if (!nameCell) return
++  const detail = document.createElement('div')
++  detail.className = 'alert-rule-quarantine-detail'
++  detail.dataset.alertQuarantineDetail = 'true'
++
++  const summary = document.createElement('span')
++  const when = formatQuarantineTime(rule.quarantined_at)
++  summary.textContent = `Automatically disabled${when ? ` ${when}` : ''}`
++  detail.appendChild(summary)
++
++  const reason = document.createElement('small')
++  reason.textContent = String(rule.quarantine_reason || '')
++  detail.appendChild(reason)
++  nameCell.appendChild(detail)
++}
++
++function addEditorNotice(page, rule) {
++  const form = page.querySelector('#alertRuleForm')
++  if (!form) return
++  const notice = document.createElement('div')
++  notice.className = 'alert-rule-quarantine-editor'
++  notice.dataset.alertQuarantineEditor = 'true'
++  notice.setAttribute('role', 'alert')
++
++  const title = document.createElement('strong')
++  title.textContent = 'This rule was automatically disabled.'
++  notice.appendChild(title)
++
++  const reason = document.createElement('p')
++  reason.textContent = String(rule.quarantine_reason || '')
++  notice.appendChild(reason)
++
++  const action = document.createElement('p')
++  action.textContent = 'Correct the invalid fields below and save the rule. Saving clears this warning.'
++  notice.appendChild(action)
++
++  const header = form.querySelector('.alert-form-header')
++  if (header?.nextSibling) header.parentNode.insertBefore(notice, header.nextSibling)
++  else form.prepend(notice)
++}
++
++function decorateAlertsPage() {
++  if (decorating) return
++  decorating = true
++  observer?.disconnect()
++  try {
++    const page = document.querySelector('.alerts-page')
++    if (!page) return
++    resetRuleDecorations(page)
++    if (!isAdministrator()) return
++
++    const rules = quarantinedRules()
++    if (rules.length === 0) return
++
++    const tableWrap = page.querySelector('.alert-rules-table-wrap')
++    if (tableWrap) tableWrap.parentNode.insertBefore(makeQuarantineBanner(rules.length), tableWrap)
++
++    for (const rule of rules) {
++      const button = [...page.querySelectorAll('[data-alert-rule-edit]')]
++        .find(candidate => String(candidate.dataset.alertRuleEdit || '') === String(rule.id))
++      const row = button?.closest('tr')
++      if (!row) continue
++      row.classList.add('alert-rule-quarantined')
++      addRuleDetail(row, rule)
++
++      const status = row.querySelector('.alert-enabled')
++      if (status) {
++        status.classList.remove('enabled', 'disabled')
++        status.classList.add('quarantined')
++        status.textContent = 'needs repair'
++      }
++      button.textContent = 'Repair'
++      button.dataset.quarantineLabel = 'true'
++    }
++
++    const editingRule = rules.find(rule => String(rule.id) === String(activeRepairRuleID))
++    if (editingRule) addEditorNotice(page, editingRule)
++  } finally {
++    observer?.observe(document.body, { childList: true, subtree: true })
++    decorating = false
++  }
++}
++
++function queueDecoration() {
++  if (decorationQueued) return
++  decorationQueued = true
++  requestAnimationFrame(() => {
++    decorationQueued = false
++    decorateAlertsPage()
++  })
++}
++
++async function refreshQuarantineState(force = false) {
++  if (!isAdministrator()) {
++    cachedRules = []
++    activeRepairRuleID = null
++    updateWarningBadge()

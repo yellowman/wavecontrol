@@ -1,0 +1,91 @@
+diff --git a/cmd/server/schema_optional.go b/cmd/server/schema_optional.go
+index e9e9a0d..877dcc6 100644
+--- a/cmd/server/schema_optional.go
++++ b/cmd/server/schema_optional.go
+@@ -44,7 +44,9 @@ func ensureRuntimeSchema(db *sql.DB) error {
+ 		  ADD COLUMN IF NOT EXISTS target_role VARCHAR(16) NOT NULL DEFAULT 'all',
+ 		  ADD COLUMN IF NOT EXISTS require_alertable BOOLEAN NOT NULL DEFAULT TRUE,
+ 		  ADD COLUMN IF NOT EXISTS severity VARCHAR(20) NOT NULL DEFAULT 'auto',
+-		  ADD COLUMN IF NOT EXISTS notify_recovery BOOLEAN NOT NULL DEFAULT TRUE`,
++		  ADD COLUMN IF NOT EXISTS notify_recovery BOOLEAN NOT NULL DEFAULT TRUE,
++		  ADD COLUMN IF NOT EXISTS quarantine_reason TEXT,
++		  ADD COLUMN IF NOT EXISTS quarantined_at TIMESTAMPTZ`,
+ 		`ALTER TABLE alerts
+ 		  ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ,
+ 		  ADD COLUMN IF NOT EXISTS notify_error TEXT,
+@@ -165,7 +167,7 @@ func validateRuntimeSchema(db *sql.DB) error {
+ 		"sites":                      {"id", "name", "tower_h_m"},
+ 		"devices":                    {"id", "mac", "ip_address", "role", "managed", "alertable", "alert_silenced_until", "username", "password", "status"},
+ 		"scheduled_jobs":             {"id", "status", "progress", "total_devices", "completed_devices", "error_message"},
+-		"alert_rules":                {"id", "enabled", "scope", "scope_id", "target_role", "require_alertable", "metric", "operator", "threshold", "severity", "notify_channels", "notify_recovery"},
++		"alert_rules":                {"id", "enabled", "scope", "scope_id", "target_role", "require_alertable", "metric", "operator", "threshold", "severity", "notify_channels", "notify_recovery", "quarantine_reason", "quarantined_at"},
+ 		"alerts":                     {"id", "rule_id", "device_id", "status", "triggered_at", "resolved_at", "notified_at", "notify_error", "recovery_notified_at", "recovery_notify_error"},
+ 		"alert_states":               {"rule_id", "device_id", "first_triggered_at", "last_value", "last_checked_at", "notified"},
+ 		"alert_notification_outbox":  {"id", "alert_id", "channel", "event", "payload", "status", "attempts", "next_attempt_at", "last_error", "updated_at", "sent_at"},
+diff --git a/internal/alerting/manager.go b/internal/alerting/manager.go
+index fcdbfe6..aaaaecf 100644
+--- a/internal/alerting/manager.go
++++ b/internal/alerting/manager.go
+@@ -50,25 +50,27 @@ const (
+ var ErrNotFound = errors.New("not found")
+ 
+ type Rule struct {
+-	ID               int       `json:"id"`
+-	Name             string    `json:"name"`
+-	Enabled          bool      `json:"enabled"`
+-	Scope            string    `json:"scope"`
+-	ScopeID          *int      `json:"scope_id,omitempty"`
+-	TargetRole       string    `json:"target_role"`
+-	RequireAlertable bool      `json:"require_alertable"`
+-	Metric           string    `json:"metric"`
+-	Operator         string    `json:"operator"`
+-	Threshold        float64   `json:"threshold"`
+-	DurationSeconds  int       `json:"duration_seconds"`
+-	Severity         string    `json:"severity"`
+-	NotifyChannels   []string  `json:"notify_channels"`
+-	NotifyEmails     []string  `json:"notify_emails,omitempty"`
+-	WebhookURL       string    `json:"webhook_url,omitempty"`
+-	NotifyRecovery   bool      `json:"notify_recovery"`
+-	CooldownSeconds  int       `json:"cooldown_seconds"`
+-	CreatedAt        time.Time `json:"created_at"`
+-	CreatedBy        int       `json:"created_by,omitempty"`
++	ID               int        `json:"id"`
++	Name             string     `json:"name"`
++	Enabled          bool       `json:"enabled"`
++	Scope            string     `json:"scope"`
++	ScopeID          *int       `json:"scope_id,omitempty"`
++	TargetRole       string     `json:"target_role"`
++	RequireAlertable bool       `json:"require_alertable"`
++	Metric           string     `json:"metric"`
++	Operator         string     `json:"operator"`
++	Threshold        float64    `json:"threshold"`
++	DurationSeconds  int        `json:"duration_seconds"`
++	Severity         string     `json:"severity"`
++	NotifyChannels   []string   `json:"notify_channels"`
++	NotifyEmails     []string   `json:"notify_emails,omitempty"`
++	WebhookURL       string     `json:"webhook_url,omitempty"`
++	NotifyRecovery   bool       `json:"notify_recovery"`
++	CooldownSeconds  int        `json:"cooldown_seconds"`
++	CreatedAt        time.Time  `json:"created_at"`
++	CreatedBy        int        `json:"created_by,omitempty"`
++	QuarantineReason string     `json:"quarantine_reason,omitempty"`
++	QuarantinedAt    *time.Time `json:"quarantined_at,omitempty"`
+ }
+ 
+ type Alert struct {
+@@ -167,18 +169,25 @@ func (m *Manager) Start(ctx context.Context) {
+ 	go m.sysmonClient.Run(ctx)
+ }
+ 
++type invalidEnabledRule struct {
++	rule Rule
++	err  error
++}
++
+ func (m *Manager) loadRules() ([]Rule, error) {
+ 	rows, err := m.db.Query(`
+-		SELECT id, name, enabled, scope, scope_id, target_role, require_alertable, metric, operator, threshold,
+-		       duration_seconds, severity, notify_channels, notify_emails, webhook_url, notify_recovery, cooldown_seconds
++		SELECT id, name, enabled, COALESCE(scope, 'all'), scope_id, target_role, require_alertable, metric, operator, threshold,
++		       COALESCE(duration_seconds, 0), severity, COALESCE(notify_channels, ARRAY[]::TEXT[]),
++		    
