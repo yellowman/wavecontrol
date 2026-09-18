@@ -241,10 +241,10 @@ func main() {
 	devicePoller := poller.NewPoller(db, statsStore, wsHub, pollerCfg)
 
 	// Create scheduler
-	jobScheduler := scheduler.NewScheduler(db, fwService, wsHub)
+	jobScheduler := scheduler.NewScheduler(db, fwService, wsHub, devicePoller)
 
 	// Create job runner for async operations
-	jobRunner := jobs.NewRunner(db, fwService, wsHub)
+	jobRunner := jobs.NewRunner(db, fwService, wsHub, devicePoller)
 	jobRunner.Start() // Recover pending jobs from previous runs
 
 	// Create bulk operations controller

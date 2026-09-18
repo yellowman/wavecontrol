@@ -1,11 +1,11 @@
 import { api, auth, ws, sync } from './api.js?v=28'
-import { store } from './store.js?v=16'
+import { store } from './store.js?v=17'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=66'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=68'
 import { 
   wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, scrollToDeviceById 
-} from './virtual-integration.js?v=12'
+} from './virtual-integration.js?v=14'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
@@ -5652,6 +5652,7 @@ function formatSize(bytes) {
 let mapInstance = null
 let mapLinksLayer = null  // Layer group for links - can be toggled without reinit
 let mapMarkersLayer = null
+let mapMarkerByDeviceID = new Map()
 let mapFilterMode = 'all' // 'all', 'aps', 'stas'
 
 function updateMapMarkerSizing() {
@@ -5710,6 +5711,53 @@ function setMapFilter(mode) {
   initMap()
 }
 
+function getMapFilteredDevices() {
+  const filter = (store.treeFilter || '').trim().toLowerCase()
+  const devices = Array.isArray(store.devices) ? store.devices : []
+  const directMatches = new Set()
+  if (filter) {
+    devices.forEach(d => {
+      const matches = (d.hostname || '').toLowerCase().includes(filter) ||
+                      (d.ip_address || '').toLowerCase().includes(filter) ||
+                      (d.site_name || '').toLowerCase().includes(filter)
+      if (matches) directMatches.add(d.id)
+    })
+  }
+  return devices.filter(d => {
+    const isAP = !d.parent_id
+    if (mapFilterMode === 'aps' && !isAP) return false
+    if (mapFilterMode === 'stas' && isAP) return false
+    const status = store.getStatus(d)
+    if (status === 'online' && !store.filters.online) return false
+    if (status === 'offline' && !store.filters.offline) return false
+    if (status === 'unknown' && !store.filters.unknown) return false
+    if (!filter) return true
+    if (directMatches.has(d.id)) return true
+    if (d.parent_id && directMatches.has(d.parent_id)) return true
+    if (isAP && store.getSTAs(d.id).some(sta => directMatches.has(sta.id))) return true
+    return false
+  })
+}
+
+function focusMapDevice(deviceId, retry = 0) {
+  if (store.currentPage !== 'map') return false
+  const marker = mapMarkerByDeviceID.get(Number(deviceId))
+  if (!mapInstance || !marker) {
+    if (retry < 4) setTimeout(() => focusMapDevice(deviceId, retry + 1), 100)
+    return false
+  }
+  const latLng = marker.getLatLng()
+  const zoom = Math.max(mapInstance.getZoom?.() || 0, 15)
+  mapInstance.setView(latLng, zoom, { animate: true })
+  marker.openPopup()
+  const element = marker.getElement?.()
+  if (element) {
+    element.classList.add('search-current')
+    setTimeout(() => element.classList.remove('search-current'), 2000)
+  }
+  return true
+}
+
 function initMap() {
   const container = document.getElementById('mapContainer')
   if (!container) {
@@ -5729,51 +5777,10 @@ function initMap() {
     mapLinksLayer = null
     mapMarkersLayer = null
   }
+  mapMarkerByDeviceID.clear()
   
-  // Get filter from store
   const filter = store.treeFilter || ''
-  
-  // Filter devices based on tree filter, status filters, and AP/STA mode
-  const filteredDevices = store.devices.filter(d => {
-    // Apply AP/STA filter mode
-    const isAP = !d.parent_id
-    if (mapFilterMode === 'aps' && !isAP) return false
-    if (mapFilterMode === 'stas' && isAP) return false
-    
-    // Apply status filter
-    const status = store.getStatus(d)
-    if (status === 'online' && !store.filters.online) return false
-    if (status === 'offline' && !store.filters.offline) return false
-    if (status === 'unknown' && !store.filters.unknown) return false
-    
-    // Apply search filter
-    if (filter) {
-      const matchesDevice = (d.hostname || '').toLowerCase().includes(filter) ||
-                            (d.ip_address || '').includes(filter) ||
-                            (d.site_name || '').toLowerCase().includes(filter)
-      // Also include if parent AP matches (show AP and all its STAs)
-      if (d.parent_id) {
-        const parent = store.devices.find(p => p.id === d.parent_id)
-        if (parent) {
-          const parentMatches = (parent.hostname || '').toLowerCase().includes(filter) ||
-                                (parent.ip_address || '').includes(filter)
-          if (parentMatches) return true
-        }
-      }
-      // Include APs if any of their STAs match
-      if (!d.parent_id) {
-        const stas = store.devices.filter(s => s.parent_id === d.id)
-        const staMatches = stas.some(s => 
-          (s.hostname || '').toLowerCase().includes(filter) ||
-          (s.ip_address || '').includes(filter)
-        )
-        if (staMatches) return true
-      }
-      return matchesDevice
-    }
-    
-    return true
-  })
+  const filteredDevices = getMapFilteredDevices()
   
   console.log('Map: filtered devices =', filteredDevices.length, 'of', store.devices.length)
   
@@ -5858,6 +5865,7 @@ function initMap() {
         `)
       
       markers.push(marker)
+      mapMarkerByDeviceID.set(Number(device.id), marker)
       if (isAP) apMarkers[device.id] = marker
     })
     
@@ -11377,6 +11385,7 @@ store.on(() => {
       setTimeout(() => window.dispatchEvent(new Event('resize')), 50)
     }
   }
+  updateBulkToolbar()
 })
 
 // Nav link handlers
@@ -11384,6 +11393,8 @@ document.querySelectorAll('.header-tabs a[data-page]').forEach(link => {
   link.addEventListener('click', e => {
     e.preventDefault()
     const page = link.dataset.page
+    store.clearBulkSelection()
+    document.getElementById('bulkToolbar')?.classList.add('hidden')
     store.set({ currentPage: page, selectedDevice: null })
     renderCurrentPage()
   })
@@ -11394,6 +11405,8 @@ document.querySelectorAll('.sidebar-link[data-page]').forEach(link => {
   link.addEventListener('click', e => {
     e.preventDefault()
     const page = link.dataset.page
+    store.clearBulkSelection()
+    document.getElementById('bulkToolbar')?.classList.add('hidden')
     store.set({ currentPage: page, selectedDevice: null })
     renderCurrentPage()
   })
@@ -11478,11 +11491,36 @@ const searchInfo = document.getElementById('searchInfo')
 let searchDebounce = null
 let searchMatches = []  // Array of matched element IDs
 let currentMatchIndex = -1
+let hiddenSearchMatchCount = 0
+
+function deviceMatchesHeaderSearch(device, query) {
+  const hostname = (device.hostname || '').toLowerCase()
+  const ip = (device.ip_address || '').toLowerCase()
+  const mac = (device.mac || '').toLowerCase()
+  const product = (device.product || device.model || '').toLowerCase()
+  return hostname.includes(query) || ip.includes(query) || mac.includes(query) || product.includes(query)
+}
+
+// Header search is an in-view navigator. Keep its result set aligned with
+// devices the Dashboard can actually reveal after status/scope filters.
+function getDashboardSearchCandidates() {
+  const visibleDevices = Array.isArray(store.filteredDevices) ? store.filteredDevices : []
+  const visibleRootIds = new Set(
+    (store.aps || [])
+      .filter(device => store.filters?.[store.getStatus(device)] !== false)
+      .map(device => device.id)
+  )
+
+  return visibleDevices.filter(device =>
+    !device.parent_id || device.managed || visibleRootIds.has(device.parent_id)
+  )
+}
 
 function performSearch() {
   const query = (searchInput?.value || '').trim().toLowerCase()
   searchMatches = []
   currentMatchIndex = -1
+  hiddenSearchMatchCount = 0
   
   // Clear all highlights
   document.querySelectorAll('.search-highlight').forEach(el => el.classList.remove('search-highlight'))
@@ -11490,6 +11528,11 @@ function performSearch() {
   
   if (!query) {
     if (searchInfo) searchInfo.textContent = ''
+    // Header search temporarily reveals its target in the host tree. When the
+    // query is cleared, restore the independent sidebar tree filter.
+    if (store.currentPage === 'dashboard' || store.currentPage === 'devices') {
+      renderTree(store.treeFilter || '')
+    }
     return
   }
   
@@ -11497,15 +11540,19 @@ function performSearch() {
   const page = store.currentPage
   
   if (page === 'dashboard' || page === 'devices') {
-    // Search ALL devices in store, not just DOM
-    store.devices.forEach(d => {
-      const hostname = (d.hostname || '').toLowerCase()
-      const ip = (d.ip_address || '').toLowerCase()
-      const mac = (d.mac || '').toLowerCase()
-      const product = (d.product || d.model || '').toLowerCase()
-      
-      if (hostname.includes(query) || ip.includes(query) || mac.includes(query) || product.includes(query)) {
+    // Search only devices the current Dashboard scope/status filters can reveal.
+    // Keep track of inventory matches hidden by those filters so the UI does not
+    // claim a navigable match and then fail to scroll to it.
+    const candidates = getDashboardSearchCandidates()
+    const candidateIds = new Set(candidates.map(d => d.id))
+    candidates.forEach(d => {
+      if (deviceMatchesHeaderSearch(d, query)) {
         searchMatches.push({ type: 'device', id: d.id, device: d })
+      }
+    })
+    store.devices.forEach(d => {
+      if (!candidateIds.has(d.id) && deviceMatchesHeaderSearch(d, query)) {
+        hiddenSearchMatchCount++
       }
     })
   } else if (page === 'topology') {
@@ -11519,14 +11566,13 @@ function performSearch() {
       }
     })
   } else if (page === 'map') {
-    // Map view - match devices for map focus
-    store.devices.forEach(d => {
-      const hostname = (d.hostname || '').toLowerCase()
-      const ip = (d.ip_address || '').toLowerCase()
-      if (hostname.includes(query) || ip.includes(query)) {
-        searchMatches.push({ type: 'device', id: d.id, device: d })
-      }
-    })
+    getMapFilteredDevices()
+      .filter(d => Number.isFinite(Number(d.gps_lat)) && Number.isFinite(Number(d.gps_lon)))
+      .forEach(d => {
+        if (deviceMatchesHeaderSearch(d, query)) {
+          searchMatches.push({ type: 'device', id: d.id, device: d })
+        }
+      })
   } else if (page === 'drilldown') {
     // Drilldown view - search ONLY the currently displayed drilldown table rows
     // (not the full device inventory).
@@ -11557,7 +11603,11 @@ function updateSearchInfo() {
   
   if (searchMatches.length === 0) {
     const query = (searchInput?.value || '').trim()
-    searchInfo.textContent = query ? 'No matches' : ''
+    if (query && hiddenSearchMatchCount > 0) {
+      searchInfo.textContent = `${hiddenSearchMatchCount} ${hiddenSearchMatchCount === 1 ? 'match' : 'matches'} hidden by filters`
+    } else {
+      searchInfo.textContent = query ? 'No matches' : ''
+    }
     searchInfo.className = 'search-info' + (query ? ' no-matches' : '')
   } else {
     searchInfo.textContent = `${currentMatchIndex + 1} of ${searchMatches.length}`
@@ -11580,14 +11630,18 @@ function highlightCurrentMatch() {
     const device = match.device
     
     if (page === 'dashboard' || page === 'devices') {
-      // Expand parent if this is a STA
-      if (device.parent_id) {
+      // Expand the real parent for nested STAs. Managed STAs are root nodes.
+      if (device.parent_id && !device.managed) {
         store.treeExpanded[device.parent_id] = true
-        // Re-render tree to show expanded state
-        renderTree()
       }
-      
-      // Find and highlight the tree node
+
+      // Selection updates the detail pane. Rebuild the host tree after selection
+      // so its selected state is current and so a header search can temporarily
+      // reveal a target hidden by the independent sidebar text filter.
+      store.set({ selectedDevice: deviceId })
+      renderTree()
+
+      // Find, highlight, and center the host in the scrollable sidebar.
       const treeNode = document.querySelector(`.tree-node[data-id="${deviceId}"]`)
       if (treeNode) {
         const content = treeNode.querySelector('.tree-node-content')
@@ -11596,9 +11650,8 @@ function highlightCurrentMatch() {
         treeNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
       }
       
-      // Scroll to and highlight device in the table (works with virtual table too)
-      // Also select the device to show in detail panel
-      store.set({ selectedDevice: deviceId })
+      // Scroll to and highlight the device table row too. The small delay lets
+      // the detail pane finish changing the available virtual-table viewport.
       setTimeout(() => scrollToDevice(deviceId), 100)
     } else if (page === 'topology') {
       // Find the card or STA chip
@@ -11628,8 +11681,7 @@ function highlightCurrentMatch() {
         }
       }
     } else if (page === 'map') {
-      // Could pan map to marker - for now just show in info
-      // TODO: integrate with Leaflet map panning
+      focusMapDevice(deviceId)
     } else if (page === 'drilldown') {
       // Find and highlight the drilldown row
       const row = document.querySelector(`#drilldownBody tr[data-id="${deviceId}"]`)
@@ -12779,13 +12831,15 @@ contextMenu?.querySelectorAll('.context-item').forEach(item => {
 const bulkToolbar = document.getElementById('bulkToolbar')
 
 function getSelectedDeviceIds() {
-  const checkboxes = document.querySelectorAll('.device-table tbody input[type="checkbox"]:checked')
-  return Array.from(checkboxes).map(cb => parseInt(cb.dataset.id)).filter(id => !isNaN(id))
+  return store.bulkSelectedDeviceIds.map(id => Number(id)).filter(id => Number.isFinite(id))
 }
 
 function updateBulkToolbar() {
   const selected = getSelectedDeviceIds()
   const count = selected.length
+  document.querySelectorAll('.device-table tbody input[type="checkbox"][data-id]').forEach(cb => {
+    cb.checked = store.isBulkSelected(cb.dataset.id)
+  })
   
   if (count > 0) {
     bulkToolbar?.classList.remove('hidden')
@@ -12798,16 +12852,115 @@ function updateBulkToolbar() {
 
 // Listen for checkbox changes
 document.addEventListener('change', e => {
-  if (e.target.matches('.device-table input[type="checkbox"]')) {
+  if (e.target.matches('.device-table input[type="checkbox"][data-id]')) {
+    store.setBulkSelected(e.target.dataset.id, e.target.checked)
     updateBulkToolbar()
   }
 })
 
 document.getElementById('bulkCancel')?.addEventListener('click', () => {
-  document.querySelectorAll('.device-table input[type="checkbox"]').forEach(cb => {
-    cb.checked = false
+  store.clearBulkSelection()
+  updateBulkToolbar()
+})
+
+function resetBatchConfigForm() {
+  ;['cfgSSID', 'cfgChannel', 'cfgPower', 'cfgPassword'].forEach(id => {
+    const checkbox = document.getElementById(id)
+    if (checkbox) checkbox.checked = false
   })
-  bulkToolbar?.classList.add('hidden')
+  ;['cfgSSIDValue', 'cfgChannelValue', 'cfgPowerValue', 'cfgPasswordValue'].forEach(id => {
+    const input = document.getElementById(id)
+    if (input) input.value = ''
+  })
+  document.getElementById('batchConfigResults')?.replaceChildren()
+}
+
+function openBatchConfigForSelection() {
+  const ids = getSelectedDeviceIds()
+  if (ids.length === 0) return
+  const roles = store.user?.roles || []
+  if (!roles.includes('editor') && !roles.includes('administrator')) {
+    showToast('Batch configuration requires editor access', 'error')
+    return
+  }
+  const select = document.getElementById('batchDevices')
+  if (!select) return
+  select.replaceChildren()
+  ids.forEach(id => {
+    const device = store.getDeviceById(id)
+    if (!device) return
+    const option = document.createElement('option')
+    option.value = String(id)
+    option.selected = true
+    option.textContent = device.hostname || device.ip_address || device.mac || `Device ${id}`
+    select.appendChild(option)
+  })
+  resetBatchConfigForm()
+  openModalElement('batchConfigModal')
+}
+
+document.getElementById('bulkConfig')?.addEventListener('click', openBatchConfigForSelection)
+
+document.getElementById('confirmBatchConfig')?.addEventListener('click', async () => {
+  const button = document.getElementById('confirmBatchConfig')
+  const select = document.getElementById('batchDevices')
+  const resultHost = document.getElementById('batchConfigResults')
+  const ids = Array.from(select?.selectedOptions || []).map(option => Number(option.value)).filter(Number.isFinite)
+  if (ids.length === 0) {
+    showToast('Select at least one target device', 'error')
+    return
+  }
+  const changes = {}
+  if (document.getElementById('cfgSSID')?.checked) {
+    const value = document.getElementById('cfgSSIDValue')?.value || ''
+    if (!value.trim()) { showToast('SSID cannot be empty', 'error'); return }
+    changes.ssid = value
+  }
+  if (document.getElementById('cfgChannel')?.checked) {
+    const value = Number(document.getElementById('cfgChannelValue')?.value)
+    if (!Number.isFinite(value) || value <= 0) { showToast('Enter a valid channel', 'error'); return }
+    changes.channel = value
+  }
+  if (document.getElementById('cfgPower')?.checked) {
+    const value = Number(document.getElementById('cfgPowerValue')?.value)
+    if (!Number.isFinite(value)) { showToast('Enter a valid TX power', 'error'); return }
+    changes.tx_power = value
+  }
+  if (document.getElementById('cfgPassword')?.checked) {
+    const value = document.getElementById('cfgPasswordValue')?.value || ''
+    if (!value || value.length > 4096) { showToast(value ? 'Password is too long' : 'Password cannot be empty', 'error'); return }
+    changes.password = value
+  }
+  if (Object.keys(changes).length === 0) {
+    showToast('Enable at least one configuration change', 'error')
+    return
+  }
+  button.disabled = true
+  if (resultHost) resultHost.textContent = `Applying changes to ${ids.length} device${ids.length === 1 ? '' : 's'}...`
+  try {
+    const response = await api.batchConfig(ids, changes)
+    const results = Array.isArray(response?.results) ? response.results : []
+    if (resultHost) {
+      resultHost.replaceChildren()
+      results.forEach(result => {
+        const row = document.createElement('div')
+        row.className = `batch-result ${result.status === 'success' ? 'success' : 'failed'}`
+        const device = store.getDeviceById(result.device_id)
+        const name = device?.hostname || device?.ip_address || `Device ${result.device_id}`
+        row.textContent = result.status === 'success' ? `${name}: applied` : `${name}: ${result.error || 'failed'}`
+        resultHost.appendChild(row)
+      })
+    }
+    const succeeded = results.filter(result => result.status === 'success').map(result => Number(result.device_id))
+    await Promise.allSettled(succeeded.map(id => api.refreshDevice(id)))
+    const failed = results.length - succeeded.length
+    showToast(failed === 0 ? `Configuration applied to ${succeeded.length} device${succeeded.length === 1 ? '' : 's'}` : `Configuration applied to ${succeeded.length}; ${failed} failed`, failed === 0 ? 'success' : 'warning')
+  } catch (e) {
+    if (resultHost) resultHost.textContent = 'Batch configuration failed: ' + e.message
+    showToast('Batch configuration failed: ' + e.message, 'error')
+  } finally {
+    button.disabled = false
+  }
 })
 
 document.getElementById('bulkRefresh')?.addEventListener('click', async () => {
@@ -12982,9 +13135,10 @@ document.getElementById('bulkDelete')?.addEventListener('click', async () => {
   
   const devices = await api.devices()
   store.set({ devices, selectedDevice: null })
+  store.clearBulkSelection()
   renderTree()
   renderCurrentPage()
-  bulkToolbar?.classList.add('hidden')
+  updateBulkToolbar()
   showToast(`Deleted ${deleted} devices`, 'success')
 })
 

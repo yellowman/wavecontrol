@@ -1,4 +1,4 @@
-import { store } from './store.js?v=16'
+import { store } from './store.js?v=17'
 import { api } from './api.js?v=28'
 import { 
   VirtualTable, 
@@ -6,8 +6,9 @@ import {
   getSortedFilteredDevices,
   setVirtualTableRef,
   VIRTUAL_THRESHOLD,
-  triggerUpdateCounts
-} from './virtual-integration.js?v=12'
+  triggerUpdateCounts,
+  scrollToDeviceById
+} from './virtual-integration.js?v=14'
 
 
 async function requestConfirmation(message, options = {}) {
@@ -491,6 +492,10 @@ export function renderTree(filter = '') {
 
 // Scroll to device in table
 function scrollToDevice(id) {
+  // Large fleets use a virtual table, so the target row may not exist in the
+  // DOM until the virtual scroller is moved to it.
+  if (scrollToDeviceById(id)) return
+
   const row = document.querySelector(`tr[data-id="${id}"]`)
   if (row) {
     row.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -1101,7 +1106,7 @@ function renderDeviceRowContent(device, cols) {
   const escapedProduct = escapeHTML(device.product || device.model || '-')
   
   return `
-    <td class="cell-checkbox"><input type="checkbox" data-id="${device.id}" /></td>
+    <td class="cell-checkbox"><input type="checkbox" data-id="${device.id}" ${store.isBulkSelected(device.id) ? 'checked' : ''} /></td>
     ${cols.status !== false ? `<td class="cell-status"><span class="status-dot ${status}" title="${escapeAttr(store.getStatusReason(device) || '')}"></span></td>` : ''}
     ${cols.name !== false ? `
       <td class="cell-name">
@@ -1451,7 +1456,7 @@ function renderDeviceRow(device, cols = {}) {
   
   return `
     <tr data-id="${device.id}" data-ip="${escapedIP}" class="${isSTA ? 'sta-row' : ''} ${device.managed ? 'managed-row' : ''} ${device.alertable === false ? 'not-alertable-row' : ''} ${store.selectedDevice === device.id ? 'selected' : ''}">
-      <td class="cell-checkbox"><input type="checkbox" data-id="${device.id}" /></td>
+      <td class="cell-checkbox"><input type="checkbox" data-id="${device.id}" ${store.isBulkSelected(device.id) ? 'checked' : ''} /></td>
       ${cols.status !== false ? `<td class="cell-status"><span class="status-dot ${status}" title="${escapeAttr(store.getStatusReason(device) || '')}"></span></td>` : ''}
       ${cols.name !== false ? `
         <td class="cell-name">

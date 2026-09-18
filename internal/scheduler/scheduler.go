@@ -71,6 +71,10 @@ type UpgradeParams struct {
 	Fanout          bool   `json:"fanout"` // For APs: upgrade STAs first
 }
 
+type DeviceRefresher interface {
+	RefreshDeviceByID(deviceID int64) error
+}
+
 // MaintenanceWindow represents a maintenance window
 type MaintenanceWindow struct {
 	ID        int       `json:"id"`
@@ -92,6 +96,7 @@ type Scheduler struct {
 	db        *sql.DB
 	fwService *firmware.Service
 	wsHub     *websocket.Hub
+	refresher DeviceRefresher
 
 	mu      sync.Mutex
 	running bool
@@ -111,11 +116,12 @@ type Scheduler struct {
 }
 
 // NewScheduler creates a new scheduler
-func NewScheduler(db *sql.DB, fwService *firmware.Service, wsHub *websocket.Hub) *Scheduler {
+func NewScheduler(db *sql.DB, fwService *firmware.Service, wsHub *websocket.Hub, refresher DeviceRefresher) *Scheduler {
 	s := &Scheduler{
 		db:                 db,
 		fwService:          fwService,
 		wsHub:              wsHub,
+		refresher:          refresher,
 		maxConcurrentJobs:  5,
 		checkInterval:      10 * time.Second,
 		respectMaintenance: true,
@@ -719,11 +725,25 @@ func (s *Scheduler) runRebootJob(ctx context.Context, job ScheduledJob) error {
 	return nil
 }
 
-// runRefreshJob triggers a poll refresh for devices
+// runRefreshJob queues immediate polls for the scheduled devices.
 func (s *Scheduler) runRefreshJob(ctx context.Context, job ScheduledJob) error {
-	// This would trigger the poller to refresh specific devices
-	// For now, just log it - actual implementation would call poller.RefreshDevice()
-	log.Printf("Job %d: refresh job for %d devices", job.ID, len(job.DeviceIDs))
+	if s.refresher == nil {
+		return errors.New("device refresher is unavailable")
+	}
+	failed := 0
+	for _, deviceID := range job.DeviceIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.refresher.RefreshDeviceByID(int64(deviceID)); err != nil {
+			failed++
+			log.Printf("Job %d: refresh device %d could not be queued: %v", job.ID, deviceID, err)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d device refreshes failed to queue", failed, len(job.DeviceIDs))
+	}
+	log.Printf("Job %d: queued refresh for %d devices", job.ID, len(job.DeviceIDs))
 	return nil
 }
 

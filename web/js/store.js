@@ -219,6 +219,7 @@ let state = {
   devices: [],
   devicesVersion: 0, // Increments when devices array changes
   selectedDevice: null,
+  bulkSelected: new Set(), // Persists across virtual row recycling/live updates
   currentPage: 'dashboard',
   filters: {
     online: true,
@@ -269,6 +270,7 @@ export const store = {
   get devices() { return state.devices },
   get devicesVersion() { return state.devicesVersion },
   get selectedDevice() { return state.selectedDevice },
+  get bulkSelectedDeviceIds() { return Array.from(state.bulkSelected) },
   get currentPage() { return state.currentPage },
   get filters() { return state.filters },
   get searchQuery() { return state.searchQuery },
@@ -302,6 +304,8 @@ export const store = {
     if (updates.devices !== undefined) {
       next.devicesVersion = state.devicesVersion + 1
       rebuildDeviceIndexes(next.devices)
+      const validIDs = new Set((Array.isArray(next.devices) ? next.devices : []).map(d => Number(d.id)))
+      next.bulkSelected = new Set(Array.from(state.bulkSelected).filter(id => validIDs.has(id)))
     }
     state = next
     if (updates.dashboardExclusions !== undefined) {
@@ -315,6 +319,24 @@ export const store = {
     columns[col] = !columns[col]
     state = { ...state, columns }
     listeners.forEach(fn => fn(state))
+  },
+
+  isBulkSelected(id) {
+    return state.bulkSelected.has(Number(id))
+  },
+
+  setBulkSelected(id, selected) {
+    const deviceID = Number(id)
+    if (!Number.isFinite(deviceID)) return
+    const bulkSelected = new Set(state.bulkSelected)
+    if (selected) bulkSelected.add(deviceID)
+    else bulkSelected.delete(deviceID)
+    state = { ...state, bulkSelected }
+  },
+
+  clearBulkSelection() {
+    if (state.bulkSelected.size === 0) return
+    state = { ...state, bulkSelected: new Set() }
   },
   
   on(fn) {

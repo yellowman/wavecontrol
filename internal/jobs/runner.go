@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -100,11 +101,28 @@ type BackupParams struct {
 	IncludeConfig bool `json:"include_config"`
 }
 
+type DeviceRefresher interface {
+	RefreshDeviceByID(deviceID int64) error
+}
+
+type RefreshDeviceResult struct {
+	DeviceID int    `json:"device_id"`
+	Status   string `json:"status"`
+	Message  string `json:"message,omitempty"`
+}
+
+type RefreshJobResult struct {
+	Queued  int                   `json:"queued"`
+	Failed  int                   `json:"failed"`
+	Results []RefreshDeviceResult `json:"results"`
+}
+
 // Runner manages async job execution
 type Runner struct {
 	db        *sql.DB
 	fwService *firmware.Service
 	wsHub     *websocket.Hub
+	refresher DeviceRefresher
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // Active jobs with cancel functions
@@ -140,13 +158,14 @@ func sanitizeIPForPath(ip string) string {
 }
 
 // NewRunner creates a new job runner
-func NewRunner(db *sql.DB, fwService *firmware.Service, wsHub *websocket.Hub) *Runner {
+func NewRunner(db *sql.DB, fwService *firmware.Service, wsHub *websocket.Hub, refresher DeviceRefresher) *Runner {
 	maxJobs := 10
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		db:        db,
 		fwService: fwService,
 		wsHub:     wsHub,
+		refresher: refresher,
 		running:   make(map[string]context.CancelFunc),
 		jobSem:    make(chan struct{}, maxJobs),
 		maxJobs:   maxJobs,
@@ -331,6 +350,7 @@ func (r *Runner) executeJob(jobID string) {
 		// Check if upgrade was skipped (already at target version)
 		finalStatus := StatusCompleted
 		finalMessage := "Job completed successfully"
+		var finalError *string
 
 		// Check result for skipped status or upgrade success
 		if result != nil {
@@ -345,6 +365,16 @@ func (r *Runner) executeJob(jobID string) {
 				} else if upgradeResult.Status == "success" {
 					finalStatus = StatusRebooting
 					finalMessage = "Device rebooting"
+				}
+			}
+
+			if refreshResult, ok := result.(*RefreshJobResult); ok {
+				if refreshResult.Failed > 0 {
+					finalStatus = StatusFailed
+					finalMessage = fmt.Sprintf("Refresh queued for %d device(s); %d failed to queue", refreshResult.Queued, refreshResult.Failed)
+					finalError = &finalMessage
+				} else {
+					finalMessage = fmt.Sprintf("Refresh queued for %d device(s)", refreshResult.Queued)
 				}
 			}
 
@@ -378,7 +408,7 @@ func (r *Runner) executeJob(jobID string) {
 		}
 
 		log.Printf("Job %s: marking as %s", jobID, finalStatus)
-		r.updateStatus(jobID, finalStatus, nil)
+		r.updateStatus(jobID, finalStatus, finalError)
 		if result != nil {
 			resultJSON, _ := json.Marshal(result)
 			dbExecIgnore(r.db, `UPDATE job_runs SET result = $1 WHERE id = $2`, resultJSON, jobID)
@@ -766,12 +796,35 @@ func (r *Runner) runRebootJob(ctx context.Context, job *JobRun) (interface{}, er
 	return results, nil
 }
 
-// runRefreshJob triggers device refresh
+// runRefreshJob queues real immediate polls for the requested inventory devices.
 func (r *Runner) runRefreshJob(ctx context.Context, job *JobRun) (interface{}, error) {
-	// This would integrate with the poller to force immediate refresh
-	r.logEvent(job.ID, EventProgress, nil, fmt.Sprintf("Refreshing %d devices", len(job.DeviceIDs)), nil)
-	// TODO: integrate with poller.RefreshDevices()
-	return map[string]int{"refreshed": len(job.DeviceIDs)}, nil
+	if r.refresher == nil {
+		return nil, errors.New("device refresher is unavailable")
+	}
+
+	result := &RefreshJobResult{Results: make([]RefreshDeviceResult, 0, len(job.DeviceIDs))}
+	r.logEvent(job.ID, EventProgress, nil, fmt.Sprintf("Queueing refresh for %d devices", len(job.DeviceIDs)), nil)
+
+	for i, deviceID := range job.DeviceIDs {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		refreshResult := RefreshDeviceResult{DeviceID: deviceID}
+		if err := r.refresher.RefreshDeviceByID(int64(deviceID)); err != nil {
+			refreshResult.Status = "failed"
+			refreshResult.Message = err.Error()
+			result.Failed++
+			r.logEvent(job.ID, EventWarning, &deviceID, "Refresh could not be queued: "+err.Error(), nil)
+		} else {
+			refreshResult.Status = "queued"
+			refreshResult.Message = "Immediate poll queued"
+			result.Queued++
+			r.logEvent(job.ID, EventStepComplete, &deviceID, "Immediate poll queued", nil)
+		}
+		result.Results = append(result.Results, refreshResult)
+		r.updateProgress(job.ID, i+1, len(job.DeviceIDs))
+	}
+	return result, nil
 }
 
 // CancelJob cancels a running job
