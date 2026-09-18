@@ -2283,7 +2283,7 @@ func (s *Service) PushConfig(ip, username, password string, config []byte) error
 }
 
 // ApplyConfig applies specific configuration changes to a device
-func (s *Service) ApplyConfig(ip, username, password string, changes map[string]any) error {
+func (s *Service) ApplyConfig(deviceID int, ip, username, password string, changes map[string]any) error {
 	credential, err := s.resolveCredential(username, password, true)
 	if err != nil {
 		return err
@@ -2314,7 +2314,15 @@ func (s *Service) ApplyConfig(ip, username, password string, changes map[string]
 		}
 		payload["wireless"].(map[string]any)["txPower"] = power
 	}
+	var storedNewPassword string
 	if pass, ok := changes["password"].(string); ok && pass != "" {
+		if s.secretStore == nil {
+			return errors.New("cannot change password: secret store is unavailable")
+		}
+		storedNewPassword, err = s.secretStore.Encrypt(pass)
+		if err != nil {
+			return fmt.Errorf("encrypt new device password: %w", err)
+		}
 		payload["users"] = []map[string]any{
 			{"name": username, "password": pass},
 		}
@@ -2352,5 +2360,10 @@ func (s *Service) ApplyConfig(ip, username, password string, changes map[string]
 		return fmt.Errorf("apply returned status %d", resp.StatusCode)
 	}
 
+	if storedNewPassword != "" {
+		if _, err := s.db.Exec(`UPDATE devices SET username = $2, password = $3 WHERE id = $1`, deviceID, username, storedNewPassword); err != nil {
+			return fmt.Errorf("configuration applied but new device credential could not be persisted: %w", err)
+		}
+	}
 	return nil
 }

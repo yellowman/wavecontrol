@@ -4214,14 +4214,14 @@ func sanitizeIPForPath(ip string) string {
 	return strings.ReplaceAll(ip, ":", "-")
 }
 
-// BatchConfig pushes configuration changes to multiple devices
+// BatchConfig pushes configuration changes to multiple devices.
 func (a *API) BatchConfig(w http.ResponseWriter, r *http.Request) {
 	if !a.requireEdit(w, r) {
 		return
 	}
 	claims := getClaims(r)
 	if claims == nil {
-		http.Error(w, "unauthorized", 401)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -4229,15 +4229,63 @@ func (a *API) BatchConfig(w http.ResponseWriter, r *http.Request) {
 		DeviceIDs []int          `json:"device_ids"`
 		Changes   map[string]any `json:"changes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request", 400)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
+	if len(req.DeviceIDs) == 0 || len(req.DeviceIDs) > 2500 {
+		http.Error(w, "device_ids must contain 1-2500 devices", http.StatusBadRequest)
+		return
+	}
+	if len(req.Changes) == 0 {
+		http.Error(w, "at least one configuration change is required", http.StatusBadRequest)
+		return
+	}
+	for key, value := range req.Changes {
+		switch key {
+		case "ssid":
+			v, ok := value.(string)
+			if !ok || strings.TrimSpace(v) == "" || len([]byte(v)) > 64 {
+				http.Error(w, "invalid ssid", http.StatusBadRequest)
+				return
+			}
+		case "channel":
+			v, ok := value.(float64)
+			if !ok || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+				http.Error(w, "invalid channel", http.StatusBadRequest)
+				return
+			}
+		case "tx_power":
+			v, ok := value.(float64)
+			if !ok || math.IsNaN(v) || math.IsInf(v, 0) {
+				http.Error(w, "invalid tx_power", http.StatusBadRequest)
+				return
+			}
+		case "password":
+			v, ok := value.(string)
+			if !ok || v == "" || len(v) > 4096 {
+				http.Error(w, "invalid password", http.StatusBadRequest)
+				return
+			}
+		default:
+			http.Error(w, "unsupported configuration field: "+key, http.StatusBadRequest)
+			return
+		}
+	}
 
-	var results []map[string]any
+	changeKeys := make([]string, 0, len(req.Changes))
+	for key := range req.Changes {
+		changeKeys = append(changeKeys, key)
+	}
+	sort.Strings(changeKeys)
+	changeSummary := "Batch config applied: " + strings.Join(changeKeys, ", ")
+
+	results := make([]map[string]any, 0, len(req.DeviceIDs))
 	for _, deviceID := range req.DeviceIDs {
 		var ip, mac, username, password string
-		err := a.DB.QueryRow(`
+		err := a.DB.QueryRowContext(r.Context(), `
 			SELECT host(ip_address), mac, COALESCE(username, ''), COALESCE(password, '')
 			FROM devices WHERE id = $1
 		`, deviceID).Scan(&ip, &mac, &username, &password)
@@ -4245,19 +4293,13 @@ func (a *API) BatchConfig(w http.ResponseWriter, r *http.Request) {
 			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "not found"})
 			continue
 		}
-
-		err = a.Firmware.ApplyConfig(ip, username, password, req.Changes)
-		if err != nil {
+		if err := a.Firmware.ApplyConfig(deviceID, ip, username, password, req.Changes); err != nil {
 			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": err.Error()})
 			continue
 		}
-
-		// Log
-		a.logChangelogDevice(mac, fmt.Sprintf("Batch config applied: %v", req.Changes), claims.UserID)
-
+		a.logChangelogDevice(mac, changeSummary, claims.UserID)
 		results = append(results, map[string]any{"device_id": deviceID, "status": "success"})
 	}
-
 	writeJSON(w, map[string]any{"results": results})
 }
 
