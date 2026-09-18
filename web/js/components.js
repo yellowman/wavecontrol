@@ -6,8 +6,9 @@ import {
   getSortedFilteredDevices,
   setVirtualTableRef,
   VIRTUAL_THRESHOLD,
-  triggerUpdateCounts
-} from './virtual-integration.js?v=12'
+  triggerUpdateCounts,
+  scrollToDeviceById
+} from './virtual-integration.js?v=13'
 
 
 async function requestConfirmation(message, options = {}) {
@@ -491,6 +492,10 @@ export function renderTree(filter = '') {
 
 // Scroll to device in table
 function scrollToDevice(id) {
+  // Large fleets use a virtual table, so the target row may not exist in the
+  // DOM until the virtual scroller is moved to it.
+  if (scrollToDeviceById(id)) return
+
   const row = document.querySelector(`tr[data-id="${id}"]`)
   if (row) {
     row.scrollIntoView({ behavior: 'smooth', block: 'center' })

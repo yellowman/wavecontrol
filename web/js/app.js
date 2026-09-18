@@ -2,10 +2,10 @@ import { api, auth, ws, sync } from './api.js?v=28'
 import { store } from './store.js?v=16'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=66'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=67'
 import { 
   wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, scrollToDeviceById 
-} from './virtual-integration.js?v=12'
+} from './virtual-integration.js?v=13'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
@@ -11478,11 +11478,36 @@ const searchInfo = document.getElementById('searchInfo')
 let searchDebounce = null
 let searchMatches = []  // Array of matched element IDs
 let currentMatchIndex = -1
+let hiddenSearchMatchCount = 0
+
+function deviceMatchesHeaderSearch(device, query) {
+  const hostname = (device.hostname || '').toLowerCase()
+  const ip = (device.ip_address || '').toLowerCase()
+  const mac = (device.mac || '').toLowerCase()
+  const product = (device.product || device.model || '').toLowerCase()
+  return hostname.includes(query) || ip.includes(query) || mac.includes(query) || product.includes(query)
+}
+
+// Header search is an in-view navigator. Keep its result set aligned with
+// devices the Dashboard can actually reveal after status/scope filters.
+function getDashboardSearchCandidates() {
+  const visibleDevices = Array.isArray(store.filteredDevices) ? store.filteredDevices : []
+  const visibleRootIds = new Set(
+    (store.aps || [])
+      .filter(device => store.filters?.[store.getStatus(device)] !== false)
+      .map(device => device.id)
+  )
+
+  return visibleDevices.filter(device =>
+    !device.parent_id || device.managed || visibleRootIds.has(device.parent_id)
+  )
+}
 
 function performSearch() {
   const query = (searchInput?.value || '').trim().toLowerCase()
   searchMatches = []
   currentMatchIndex = -1
+  hiddenSearchMatchCount = 0
   
   // Clear all highlights
   document.querySelectorAll('.search-highlight').forEach(el => el.classList.remove('search-highlight'))
@@ -11490,6 +11515,11 @@ function performSearch() {
   
   if (!query) {
     if (searchInfo) searchInfo.textContent = ''
+    // Header search temporarily reveals its target in the host tree. When the
+    // query is cleared, restore the independent sidebar tree filter.
+    if (store.currentPage === 'dashboard' || store.currentPage === 'devices') {
+      renderTree(store.treeFilter || '')
+    }
     return
   }
   
@@ -11497,15 +11527,19 @@ function performSearch() {
   const page = store.currentPage
   
   if (page === 'dashboard' || page === 'devices') {
-    // Search ALL devices in store, not just DOM
-    store.devices.forEach(d => {
-      const hostname = (d.hostname || '').toLowerCase()
-      const ip = (d.ip_address || '').toLowerCase()
-      const mac = (d.mac || '').toLowerCase()
-      const product = (d.product || d.model || '').toLowerCase()
-      
-      if (hostname.includes(query) || ip.includes(query) || mac.includes(query) || product.includes(query)) {
+    // Search only devices the current Dashboard scope/status filters can reveal.
+    // Keep track of inventory matches hidden by those filters so the UI does not
+    // claim a navigable match and then fail to scroll to it.
+    const candidates = getDashboardSearchCandidates()
+    const candidateIds = new Set(candidates.map(d => d.id))
+    candidates.forEach(d => {
+      if (deviceMatchesHeaderSearch(d, query)) {
         searchMatches.push({ type: 'device', id: d.id, device: d })
+      }
+    })
+    store.devices.forEach(d => {
+      if (!candidateIds.has(d.id) && deviceMatchesHeaderSearch(d, query)) {
+        hiddenSearchMatchCount++
       }
     })
   } else if (page === 'topology') {
@@ -11557,7 +11591,11 @@ function updateSearchInfo() {
   
   if (searchMatches.length === 0) {
     const query = (searchInput?.value || '').trim()
-    searchInfo.textContent = query ? 'No matches' : ''
+    if (query && hiddenSearchMatchCount > 0) {
+      searchInfo.textContent = `${hiddenSearchMatchCount} ${hiddenSearchMatchCount === 1 ? 'match' : 'matches'} hidden by filters`
+    } else {
+      searchInfo.textContent = query ? 'No matches' : ''
+    }
     searchInfo.className = 'search-info' + (query ? ' no-matches' : '')
   } else {
     searchInfo.textContent = `${currentMatchIndex + 1} of ${searchMatches.length}`
@@ -11580,14 +11618,18 @@ function highlightCurrentMatch() {
     const device = match.device
     
     if (page === 'dashboard' || page === 'devices') {
-      // Expand parent if this is a STA
-      if (device.parent_id) {
+      // Expand the real parent for nested STAs. Managed STAs are root nodes.
+      if (device.parent_id && !device.managed) {
         store.treeExpanded[device.parent_id] = true
-        // Re-render tree to show expanded state
-        renderTree()
       }
-      
-      // Find and highlight the tree node
+
+      // Selection updates the detail pane. Rebuild the host tree after selection
+      // so its selected state is current and so a header search can temporarily
+      // reveal a target hidden by the independent sidebar text filter.
+      store.set({ selectedDevice: deviceId })
+      renderTree()
+
+      // Find, highlight, and center the host in the scrollable sidebar.
       const treeNode = document.querySelector(`.tree-node[data-id="${deviceId}"]`)
       if (treeNode) {
         const content = treeNode.querySelector('.tree-node-content')
@@ -11596,9 +11638,8 @@ function highlightCurrentMatch() {
         treeNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
       }
       
-      // Scroll to and highlight device in the table (works with virtual table too)
-      // Also select the device to show in detail panel
-      store.set({ selectedDevice: deviceId })
+      // Scroll to and highlight the device table row too. The small delay lets
+      // the detail pane finish changing the available virtual-table viewport.
       setTimeout(() => scrollToDevice(deviceId), 100)
     } else if (page === 'topology') {
       // Find the card or STA chip

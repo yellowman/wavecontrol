@@ -440,22 +440,30 @@ export class VirtualTable {
   
   scrollToId(id) {
     const item = this.dataById.get(id)
-    if (!item) return false
+    if (!item || !this.scrollContainer) return false
     
     const index = this.data.indexOf(item)
     if (index === -1) return false
-    
-    const targetY = index * this.rowHeight - (this.viewportHeight / 2)
+
+    // Update our internal scroll position immediately instead of waiting for the
+    // browser's scroll event/RAF path. Search navigation can otherwise race the
+    // virtual renderer and try to highlight a row that has not been created yet.
+    const viewportHeight = this.scrollContainer.clientHeight || this.viewportHeight || this.rowHeight
+    this.viewportHeight = viewportHeight
+    const targetY = index * this.rowHeight - Math.max(0, (viewportHeight - this.rowHeight) / 2)
     this.scrollContainer.scrollTop = Math.max(0, targetY)
+    this.scrollTop = this.scrollContainer.scrollTop
+    this._renderViewport()
     
-    // Highlight after scroll
-    setTimeout(() => {
+    // The target row is now in the rendered buffer. Highlight on the next frame
+    // so the scroll position is painted before the animation begins.
+    requestAnimationFrame(() => {
       const cached = this.rowCache.get(id)
       if (cached) {
         cached.element.classList.add('highlighted')
         setTimeout(() => cached.element.classList.remove('highlighted'), 2000)
       }
-    }, 100)
+    })
     
     return true
   }
