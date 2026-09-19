@@ -2,10 +2,10 @@ import { api, auth, ws, sync } from './api.js?v=28'
 import { store } from './store.js?v=17'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=68'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=69'
 import { 
-  wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, scrollToDeviceById 
-} from './virtual-integration.js?v=14'
+  wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, setVirtualBatchFlushCallback, scrollToDeviceById 
+} from './virtual-integration.js?v=15'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
@@ -623,6 +623,13 @@ async function init() {
     ws.startPing()
     lastFullReconcileAt = Date.now()
     setUpdateCountsCallback(updateCounts)
+    setVirtualBatchFlushCallback(() => {
+      try {
+        updateWarningsPanel(computeActiveWarnings())
+      } catch (e) {
+        console.warn('warning panel update failed', e)
+      }
+    })
   } catch (e) {
     auth.clear()
     store.set({ user: null })
@@ -1235,6 +1242,7 @@ ws.on(msg => {
         if (!currentDevices.some(d => d.mac === newDevice.mac)) {
           store.set({ devices: [...currentDevices, newDevice] })
           renderTree()
+          if (['dashboard', 'devices'].includes(store.currentPage)) renderCurrentPage()
           
           // Show toast notification
           const name = newDevice.hostname || newDevice.ip_address || newDevice.mac

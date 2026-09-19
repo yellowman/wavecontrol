@@ -9565,3 +9565,17 @@ body.drilldown-active .main-content {
     min-width: 760px;
   }
 }
+
+
+.virtual-empty-state {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  pointer-events: none;
+}
+.virtual-empty-state.hidden {
+  display: none;
+}
