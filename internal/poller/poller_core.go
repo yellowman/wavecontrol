@@ -479,33 +479,52 @@ func (p *Poller) syncLastSeenToDB() {
 		return
 	}
 
-	values := make([]string, 0, len(lastSeenBatch))
-	args := make([]any, 0, len(lastSeenBatch)*2)
+	type checkpoint struct {
+		mac      string
+		lastSeen time.Time
+	}
+	checkpoints := make([]checkpoint, 0, len(lastSeenBatch))
 	for mac, lastSeen := range lastSeenBatch {
 		mac = strings.ToLower(strings.TrimSpace(mac))
 		if mac == "" || lastSeen.IsZero() {
 			continue
 		}
-		args = append(args, mac, lastSeen)
-		values = append(values, fmt.Sprintf("($%d::text, $%d::timestamp)", len(args)-1, len(args)))
+		checkpoints = append(checkpoints, checkpoint{mac: mac, lastSeen: lastSeen})
 	}
-	if len(values) == 0 {
+	if len(checkpoints) == 0 {
 		return
 	}
 
-	query := `
-		UPDATE devices AS d
-		SET last_seen = v.last_seen
-		FROM (VALUES ` + strings.Join(values, ",") + `) AS v(mac, last_seen)
-		WHERE lower(d.mac) = v.mac
-		  AND v.last_seen > COALESCE(d.last_seen, TIMESTAMP 'epoch')
-		  AND (d.last_seen IS NULL OR d.last_seen < NOW() - INTERVAL '55 minutes')
-	`
-	if _, err := dbExecCtx(p.db, dbCtxForOp("sync_last_seen"), query, args...); err != nil {
-		p.logDebug("syncLastSeenToDB: update failed: %v", err)
-		return
+	// Two bind parameters per row. Keep statements comfortably below
+	// PostgreSQL's 65535-parameter limit.
+	const chunkSize = 2000
+	for start := 0; start < len(checkpoints); start += chunkSize {
+		end := start + chunkSize
+		if end > len(checkpoints) {
+			end = len(checkpoints)
+		}
+
+		values := make([]string, 0, end-start)
+		args := make([]any, 0, (end-start)*2)
+		for _, cp := range checkpoints[start:end] {
+			args = append(args, cp.mac, cp.lastSeen)
+			values = append(values, fmt.Sprintf("($%d::text, $%d::timestamptz)", len(args)-1, len(args)))
+		}
+
+		query := `
+			UPDATE devices AS d
+			SET last_seen = v.last_seen
+			FROM (VALUES ` + strings.Join(values, ",") + `) AS v(mac, last_seen)
+			WHERE lower(d.mac) = v.mac
+			  AND v.last_seen > COALESCE(d.last_seen, TIMESTAMP 'epoch')
+			  AND (d.last_seen IS NULL OR d.last_seen < NOW() - INTERVAL '55 minutes')
+		`
+		if _, err := dbExecCtx(p.db, dbCtxForOp("sync_last_seen"), query, args...); err != nil {
+			p.logDebug("syncLastSeenToDB: chunk %d-%d failed: %v", start, end, err)
+			return
+		}
 	}
-	p.logDebug("syncLastSeenToDB: checkpointed %d in-memory last-seen values", len(values))
+	p.logDebug("syncLastSeenToDB: checkpointed %d in-memory last-seen values", len(checkpoints))
 }
 
 // cleanCircuitBreakers removes old entries

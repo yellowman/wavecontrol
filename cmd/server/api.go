@@ -6093,13 +6093,14 @@ func (a *API) DryRunOperation(w http.ResponseWriter, r *http.Request) {
 			Compatible: true,
 		}
 
-		// Get device info from database
-		var ip, hostname, product, firmware, flavor, status string
+		// Get durable inventory only. Runtime eligibility comes exclusively
+		// from the in-memory stats store.
+		var ip, mac, hostname, product, firmware, flavor string
 		err := a.DB.QueryRow(`
-			SELECT host(ip_address), COALESCE(hostname, ''), COALESCE(product, ''), 
-			       COALESCE(firmware, ''), COALESCE(flavor, ''), COALESCE(status, 'unknown')
+			SELECT host(ip_address), lower(mac), COALESCE(hostname, ''), COALESCE(product, ''),
+			       COALESCE(firmware, ''), COALESCE(flavor, '')
 			FROM devices WHERE id = $1
-		`, deviceID).Scan(&ip, &hostname, &product, &firmware, &flavor, &status)
+		`, deviceID).Scan(&ip, &mac, &hostname, &product, &firmware, &flavor)
 
 		if err != nil {
 			result.Compatible = false
@@ -6113,15 +6114,13 @@ func (a *API) DryRunOperation(w http.ResponseWriter, r *http.Request) {
 		result.CurrentVer = firmware
 		result.Flavor = flavor
 
-		// Check device is online using stats store (real-time) or database status (fallback)
-		online := false
-		if stats := a.Stats.Get(ip); stats != nil {
-			online = stats.Online
-		} else {
-			online = status == "online"
-		}
-
-		if !online {
+		// No live sample means the device is not eligible yet; never revive
+		// stale status from the inventory row after a restart.
+		live := a.Stats.GetByMAC(mac)
+		if live == nil {
+			result.Compatible = false
+			result.Issues = append(result.Issues, "Device has no live status")
+		} else if !live.Online {
 			result.Compatible = false
 			result.Issues = append(result.Issues, "Device is offline")
 		}

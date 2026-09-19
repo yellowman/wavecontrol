@@ -59,3 +59,39 @@ func TestBindIdentityByMACCanClearSiteIdentity(t *testing.T) {
 		t.Fatalf("SiteID = %d, want 0 after explicit clear", got.SiteID)
 	}
 }
+
+
+func TestSetStatusByMACChangedReportsVisibleStateChanges(t *testing.T) {
+	store := NewStore()
+	const mac = "28:70:4e:e1:e8:b5"
+	const ip = "172.20.66.7"
+
+	store.BindIdentityByMAC(mac, ip, 89, 12)
+
+	leftOnline, changed := store.SetStatusByMACChanged(mac, ip, StatusOffline, "not_associated", "", false)
+	if leftOnline {
+		t.Fatal("initial unknown->offline transition must not report leftOnline")
+	}
+	if !changed {
+		t.Fatal("initial offline/not_associated state must report changed")
+	}
+
+	leftOnline, changed = store.SetStatusByMACChanged(mac, ip, StatusOffline, "not_associated", "", false)
+	if leftOnline {
+		t.Fatal("repeated offline state must not report leftOnline")
+	}
+	if changed {
+		t.Fatal("identical repeated status/reason must not report changed")
+	}
+
+	_, changed = store.SetStatusByMACChanged(mac, ip, StatusOffline, "parent_offline", "", false)
+	if !changed {
+		t.Fatal("reason-only change must report changed")
+	}
+
+	store.SetStatusByMAC(mac, ip, StatusOnline, "", "", true)
+	leftOnline, changed = store.SetStatusByMACChanged(mac, ip, StatusOffline, "not_associated", "", false)
+	if !leftOnline || !changed {
+		t.Fatalf("online->offline = leftOnline %v, changed %v; want true,true", leftOnline, changed)
+	}
+}

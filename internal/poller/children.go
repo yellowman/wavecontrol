@@ -499,8 +499,8 @@ func (p *Poller) markMissingSTAsOffline(apID int64, associatedMACs []string) {
 			continue
 		}
 		p.store.BindIdentityByMAC(mac, ip, int(id), siteID)
-		p.store.SetStatusByMAC(mac, ip, stats.StatusOffline, "not_associated", "", false)
-		if p.wsHub != nil {
+		_, changed := p.store.SetStatusByMACChanged(mac, ip, stats.StatusOffline, "not_associated", "", false)
+		if changed && p.wsHub != nil {
 			p.wsHub.BroadcastDeviceUpdate(int(id), ip, map[string]any{
 				"id": id, "status": "offline", "db_status": "offline", "status_reason": "not_associated",
 			})

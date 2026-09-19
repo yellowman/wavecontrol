@@ -855,6 +855,13 @@ or its WAL into a 30-second telemetry sink. The live API may return a newer in-m
 
 This rule applies uniformly to Wave, LTU, airMAX AC/M, and AirFiber.
 
+**GPS persistence:** poller-learned AirMAX GPS coordinates are fill-once inventory.
+Once durable `gps_lat/gps_lon` are populated, ordinary polling does not rewrite
+them for GPS jitter or physical relocation. While the process is running, the API
+overlays current live GPS from memory. After a restart, the durable coordinates
+are shown until a successful poll provides the live overlay. Durable location
+changes should be explicit inventory actions rather than telemetry side effects.
+
 ### Device Identification
 
 **MAC address is the authoritative unique identifier for all devices.**
