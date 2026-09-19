@@ -511,4 +511,3 @@ func (p *Poller) markMissingSTAsOffline(apID int64, associatedMACs []string) {
 	}
 
 }
-}
