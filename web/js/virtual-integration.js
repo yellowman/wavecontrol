@@ -9,7 +9,7 @@
 // 4. Re-exports VirtualTable class
 //
 
-import { VirtualTable } from './virtual-table.js?v=8'
+import { VirtualTable } from './virtual-table.js?v=9'
 import { store } from './store.js?v=17'
 
 // Re-export for components.js

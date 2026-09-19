@@ -2,13 +2,15 @@ import { api, auth, ws, sync } from './api.js?v=28'
 import { store } from './store.js?v=17'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=69'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable, refreshDeviceTableRow } from './components.js?v=70'
 import { 
   wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, setVirtualBatchFlushCallback, scrollToDeviceById, refreshVirtualRowClasses 
-} from './virtual-integration.js?v=15'
+} from './virtual-integration.js?v=16'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
+let antennaLiveUpdateCallback = null
+
 function debouncedRenderTree(filter = '') {
   clearTimeout(renderTreeTimeout)
   renderTreeTimeout = setTimeout(() => {
@@ -628,6 +630,11 @@ async function init() {
         updateWarningsPanel(computeActiveWarnings())
       } catch (e) {
         console.warn('warning panel update failed', e)
+      }
+      try {
+        antennaLiveUpdateCallback?.()
+      } catch (e) {
+        console.warn('antenna live update failed', e)
       }
     })
   } catch (e) {
@@ -1293,163 +1300,38 @@ ws.on(msg => {
   }
 })
 
-// Incremental update of a single device row - surgically updates DOM without re-render
-// Prefer updating by unique device id; fall back to ip only when no id exists.
+// Incremental update of one device using the canonical dashboard row renderer.
+// The tree still gets a tiny targeted patch, but table cells/classes are rebuilt
+// from the authoritative in-memory device object in both table modes.
 function updateDeviceRow(id, ip, data) {
   const statusVal = data.status || (data.online === true ? 'online' : (data.online === false ? 'offline' : 'unknown'))
+  const fullDevice = (id !== undefined && id !== null)
+    ? store.getDeviceById(id)
+    : (ip ? store.getDeviceByIp(ip) : null)
 
-  // Prefer the canonical device object from the store for derived UI (e.g. directional diagnosis)
-  const fullDevice = (id !== undefined && id !== null) ? store.getDeviceById(id) : (ip ? store.getDeviceByIp(ip) : null)
+  const treeSelector = (id !== undefined && id !== null)
+    ? `.tree-node[data-id="${id}"]`
+    : (ip ? `.tree-node[data-ip="${ip}"]` : null)
 
-  // Update tree nodes
-  const treeSelector = (id !== undefined && id !== null) ? `.tree-node[data-id="${id}"]` : (ip ? `.tree-node[data-ip="${ip}"]` : null)
   if (treeSelector) {
     document.querySelectorAll(treeSelector).forEach(node => {
-    const statusDot = node.querySelector('.tree-status')
-    if (statusDot) {
-			const newStatus = statusVal
-      if (!statusDot.classList.contains(newStatus)) {
-        statusDot.className = `tree-status ${newStatus}`
+      const statusDot = node.querySelector('.tree-status')
+      if (statusDot && !statusDot.classList.contains(statusVal)) {
+        statusDot.className = `tree-status ${statusVal}`
       }
-    }
-    // Update tree label if hostname provided
-    if (data.hostname) {
-      const label = node.querySelector('.tree-label')
-      if (label && label.textContent !== data.hostname) {
-        label.textContent = data.hostname
+      if (data.hostname) {
+        const label = node.querySelector('.tree-label')
+        if (label && label.textContent !== data.hostname) label.textContent = data.hostname
       }
-    }
-	})
+    })
   }
-  
-  // Update table rows
-  const rowSelector = (id !== undefined && id !== null) ? `tr[data-id="${id}"]` : (ip ? `tr[data-ip="${ip}"]` : null)
-  if (!rowSelector) return
-  document.querySelectorAll(rowSelector).forEach(row => {
-    // Update status dot
-    const statusDot = row.querySelector('.status-dot')
-    if (statusDot) {
-		  const newStatus = statusVal
-      if (!statusDot.classList.contains(newStatus)) {
-        statusDot.className = `status-dot ${newStatus}`
-      }
-    }
-    
-    // Update device name if hostname provided
-    if (data.hostname) {
-      const nameEl = row.querySelector('.device-name')
-      if (nameEl && nameEl.textContent !== data.hostname) {
-        nameEl.textContent = data.hostname
-      }
-    }
-    
-    // Update 60GHz signal cell - prefer server-computed quality
-    const signal60Cell = row.querySelector('.cell-signal-60')
-    if (signal60Cell) {
-      const sig60 = data.signal_60ghz
-      if (typeof sig60 === 'number' && sig60 !== 0) {
-        const newText = `${sig60} dBm`
-        const quality = data.radio_60ghz?.signal_quality
-        const cls = quality ? `signal-${quality}` : getSignalClass60(sig60)
-        const newClass = `cell-signal cell-signal-60 ${cls}`
-        if (signal60Cell.textContent !== newText) signal60Cell.textContent = newText
-        if (signal60Cell.className !== newClass) signal60Cell.className = newClass
-      }
-    }
-    
-    // Update 5GHz combined signal cell - prefer server-computed quality
-    const signal5Cell = row.querySelector('.cell-signal-5ghz')
-    if (signal5Cell) {
-      const sig5 = get5GHzCombined(data)
-      if (sig5 && sig5 !== 0) {
-        const newText = `${sig5} dBm`
-        const quality = data.radio_5ghz?.signal_quality || data.radio_ltu?.signal_quality
-        const cls = quality ? `signal-${quality}` : getSignalClass5(sig5)
-        const newClass = `cell-signal cell-signal-5ghz ${cls}`
-        if (signal5Cell.textContent !== newText) signal5Cell.textContent = newText
-        if (signal5Cell.className !== newClass) signal5Cell.className = newClass
-      }
-    }
-    
-    // Update 5GHz chain cells (no server quality for per-chain)
-    const c0Cell = row.querySelector('.cell-signal-c0')
-    const c1Cell = row.querySelector('.cell-signal-c1')
-    const chains = get5GHzChains(data)
-    if (c0Cell && typeof chains[0] === 'number' && chains[0] !== 0) {
-      const newText = `${chains[0]}`
-      const newClass = `cell-signal cell-signal-c0 ${getSignalClass5(chains[0])}`
-      if (c0Cell.textContent !== newText) c0Cell.textContent = newText
-      if (c0Cell.className !== newClass) c0Cell.className = newClass
-    }
-    if (c1Cell && typeof chains[1] === 'number' && chains[1] !== 0) {
-      const newText = `${chains[1]}`
-      const newClass = `cell-signal cell-signal-c1 ${getSignalClass5(chains[1])}`
-      if (c1Cell.textContent !== newText) c1Cell.textContent = newText
-      if (c1Cell.className !== newClass) c1Cell.className = newClass
-    }
-    
-    // Update health bars (based on primary signal)
-    const healthCell = row.querySelector('.cell-health')
-    if (healthCell) {
-      const primarySignal = data.signal_60ghz || get5GHzCombined(data) || 0
-      const band = data.signal_60ghz ? '60ghz' : '5ghz'
-      if (primarySignal) {
-        healthCell.innerHTML = getSignalBarsHTML(primarySignal, band)
-      }
-    }
-    
-    // Update distance
-    const distCell = row.querySelector('.cell-distance')
-    if (distCell && data.distance) {
-      const newText = `${(data.distance / 1000).toFixed(2)} km`
-      if (distCell.textContent !== newText) distCell.textContent = newText
-    }
-    
-    // Update capacity
-    const capCell = row.querySelector('.cell-capacity')
-    const cap = data.capacity_60ghz || data.capacity_ltu || data.capacity_5ghz
-    if (capCell && cap) {
-      const newText = `${(cap / 1e6).toFixed(0)} Mbps`
-      if (capCell.textContent !== newText) capCell.textContent = newText
-    }
-    
-    // Update directional diagnosis (derived)
-    if (store.columns.dir && fullDevice) {
-      const dirCell = row.querySelector('.cell-dir')
-      if (dirCell) {
-        dirCell.innerHTML = renderDirectionalCell(fullDevice)
-      }
-    }
-  })
 
-  // If a STA changed, refresh the parent's directional summary (if visible)
-  if (store.columns.dir && fullDevice && fullDevice.parent_id) {
-    const parent = store.getDeviceById(fullDevice.parent_id)
-    if (parent) {
-      document.querySelectorAll(`tr[data-id="${parent.id}"]`).forEach(pRow => {
-        const dirCell = pRow.querySelector('.cell-dir')
-        if (dirCell) {
-          dirCell.innerHTML = renderDirectionalCell(parent)
-        }
-      })
-    }
-  }
-}
+  if (!fullDevice) return
+  refreshDeviceTableRow(fullDevice.id)
 
-// Generate signal bars HTML for health column
-function getSignalBarsHTML(level, band = '5ghz') {
-  if (!level) return '<div class="signal-bars"></div>'
-  const t = SIGNAL_THRESHOLDS[band] || SIGNAL_THRESHOLDS['5ghz']
-  // 5 bars: excellent (>good+5), very good (>good), good (>good-5), fair (>fair), poor
-  let bars = 0
-  if (level >= t.good + 5) bars = 5
-  else if (level >= t.good) bars = 4
-  else if (level >= t.good - 5) bars = 3
-  else if (level >= t.fair) bars = 2
-  else bars = 1
-  const cls = bars >= 4 ? 'excellent' : (bars >= 3 ? 'good' : (bars >= 2 ? 'fair' : 'poor'))
-  return `<div class="signal-bars ${cls}">${[1,2,3,4,5].map(i => 
-    `<div class="signal-bar ${i <= bars ? 'active' : ''}"></div>`).join('')}</div>`
+  // Directional diagnosis on an AP depends on its STA state, so refresh the
+  // parent row as well when a child changes.
+  if (fullDevice.parent_id) refreshDeviceTableRow(fullDevice.parent_id)
 }
 
 // Incremental update of detail panel - updates values without full re-render
@@ -8183,6 +8065,9 @@ function showAntennaConfigModal() {
       clearTimeout(filterTimer)
       filterTimer = null
     }
+    if (antennaLiveUpdateCallback === scheduleUpdate) {
+      antennaLiveUpdateCallback = null
+    }
   }
   const closeBtn = document.getElementById('closeAntennaConfig')
   const closeFooter = document.getElementById('closeAntennaConfigFooter')
@@ -8835,6 +8720,7 @@ function showAntennaConfigModal() {
   }
 
   applyFilter('')
+  antennaLiveUpdateCallback = scheduleUpdate
 
   unsubscribe = store.subscribe((st, oldSt) => {
     if (modal.classList.contains('hidden')) return

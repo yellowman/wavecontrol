@@ -7687,9 +7687,14 @@ html[data-theme="dark"] #mapContainer .leaflet-control-attribution a {
   overflow: hidden;
 }
 
-/* Header table - fixed at top, not scrolled */
-.virtual-header-table {
+/* Header stays fixed vertically while its viewport mirrors body scrollLeft. */
+.virtual-header-viewport {
   flex-shrink: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.virtual-header-table {
   width: 100%;
   table-layout: fixed;
   border-collapse: collapse;
@@ -7705,8 +7710,7 @@ html[data-theme="dark"] #mapContainer .leaflet-control-attribution a {
 .virtual-scroll-container {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: auto;
   position: relative;
   -webkit-overflow-scrolling: touch;
 }
@@ -7723,7 +7727,6 @@ html[data-theme="dark"] #mapContainer .leaflet-control-attribution a {
   position: absolute;
   top: 0;
   left: 0;
-  right: 0;
   width: 100%;
   table-layout: fixed;
   border-collapse: collapse;

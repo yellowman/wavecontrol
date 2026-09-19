@@ -8,7 +8,7 @@ import {
   VIRTUAL_THRESHOLD,
   triggerUpdateCounts,
   scrollToDeviceById
-} from './virtual-integration.js?v=15'
+} from './virtual-integration.js?v=16'
 
 
 async function requestConfirmation(message, options = {}) {
@@ -266,9 +266,10 @@ function setupDashboardScopeHandlers(container) {
     })
   }
 
-  // Close menus when the dashboard/table scrolls or viewport changes
-  const wrapper = container.querySelector('.device-table-wrapper')
-  wrapper?.addEventListener('scroll', closeAllMenus, { passive: true })
+  // Scroll does not bubble, so listen in capture phase on the stable page
+  // container. This covers both the regular wrapper and virtual scroller even
+  // after their DOM is rebuilt.
+  container.addEventListener('scroll', closeAllMenus, { passive: true, capture: true })
   window.addEventListener('resize', closeAllMenus)
 
   container.addEventListener('click', (e) => {
@@ -675,29 +676,32 @@ function renderDevicesRegular(container) {
     })
   })
   
-  // Row actions
-  container.querySelectorAll('.btn-refresh').forEach(btn => {
+  bindRegularRowActions(container, container)
+}
+
+function bindRegularRowActions(root, renderContainer) {
+  root.querySelectorAll('.btn-refresh').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation()
       await handleRefreshClick(parseInt(btn.dataset.id), btn)
     })
   })
-  
-  container.querySelectorAll('.btn-upgrade').forEach(btn => {
+
+  root.querySelectorAll('.btn-upgrade').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation()
       const id = parseInt(btn.dataset.id)
       if (window.showUpgradeModal) window.showUpgradeModal(id)
     })
   })
-  
-  container.querySelectorAll('.btn-delete').forEach(btn => {
+
+  root.querySelectorAll('.btn-delete').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation()
-      await handleDeleteClick(parseInt(btn.dataset.id), container)
+      await handleDeleteClick(parseInt(btn.dataset.id), renderContainer)
     })
   })
-}
+
 
 // Get 5GHz signal (combined from chains) - works for Wave, airMAX, LTU
 // Uses pre-computed signal_combined from Go when available
@@ -1129,8 +1133,7 @@ function setupColumnMenuHandlers(container) {
     })
   }
 
-  const wrapper = container.querySelector('.device-table-wrapper')
-  wrapper?.addEventListener('scroll', closeAllColumnMenus, { passive: true })
+  container.addEventListener('scroll', closeAllColumnMenus, { passive: true, capture: true })
   window.addEventListener('resize', closeAllColumnMenus)
 
   container.addEventListener('click', (e) => {
@@ -1259,6 +1262,46 @@ function renderDeviceRow(device, cols = {}) {
       ${renderDeviceRowContent(device, cols)}
     </tr>
   `
+}
+
+export function refreshDeviceTableRow(deviceId) {
+  const id = Number(deviceId)
+  if (!Number.isFinite(id)) return false
+
+  const device = store.getDeviceById(id)
+  if (!device) return false
+
+  // In virtual mode, keep using its batching/update path.
+  if (virtualTableInstance) {
+    virtualTableInstance.updateById(id, {})
+    return true
+  }
+
+  const row = document.querySelector(`.devices-split-view .device-table tbody tr[data-id="${id}"]`)
+  if (!row) return false
+
+  const transient = ['highlighted', 'context-menu-target'].filter(cls => row.classList.contains(cls))
+  const active = document.activeElement
+  let focusSelector = null
+  if (active && row.contains(active)) {
+    if (active.matches('input[type="checkbox"][data-id]')) {
+      focusSelector = `input[type="checkbox"][data-id="${active.dataset.id}"]`
+    } else if (active.matches('button[data-id]')) {
+      const actionClass = ['btn-refresh', 'btn-upgrade', 'btn-delete'].find(cls => active.classList.contains(cls))
+      if (actionClass) focusSelector = `button.${actionClass}[data-id="${active.dataset.id}"]`
+    }
+  }
+
+  row.dataset.ip = device.ip_address || ''
+  row.className = getDeviceRowClasses(device)
+  transient.forEach(cls => row.classList.add(cls))
+  row.innerHTML = renderDeviceRowContent(device, store.columns)
+
+  const renderContainer = row.closest('.devices-split-view')?.parentElement || document.getElementById('app')
+  if (renderContainer) bindRegularRowActions(row, renderContainer)
+
+  if (focusSelector) row.querySelector(focusSelector)?.focus({ preventScroll: true })
+  return true
 }
 
 // Signal thresholds - must match app.js SIGNAL_THRESHOLDS and Go store.go

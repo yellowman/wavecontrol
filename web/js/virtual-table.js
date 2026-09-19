@@ -61,6 +61,7 @@ export class VirtualTable {
     
     // DOM references (set in mount())
     this.wrapper = null
+    this.headerViewport = null
     this.headerTable = null
     this.scrollContainer = null
     this.spacer = null
@@ -106,9 +107,11 @@ export class VirtualTable {
     // Build DOM structure
     this.container.innerHTML = `
       <div class="virtual-table-wrapper">
-        <table class="device-table virtual-header-table">
-          <thead></thead>
-        </table>
+        <div class="virtual-header-viewport">
+          <table class="device-table virtual-header-table">
+            <thead></thead>
+          </table>
+        </div>
         <div class="virtual-scroll-container">
           <div class="virtual-spacer"></div>
           <table class="device-table virtual-body-table">
@@ -121,6 +124,7 @@ export class VirtualTable {
     
     // Cache DOM references
     this.wrapper = this.container.querySelector('.virtual-table-wrapper')
+    this.headerViewport = this.container.querySelector('.virtual-header-viewport')
     this.headerTable = this.container.querySelector('.virtual-header-table')
     this.scrollContainer = this.container.querySelector('.virtual-scroll-container')
     this.spacer = this.container.querySelector('.virtual-spacer')
@@ -261,16 +265,27 @@ export class VirtualTable {
   }
 
   _syncHeaderWidth() {
-    if (!this.headerTable || !this.scrollContainer) return
+    if (!this.headerTable || !this.bodyTable || !this.scrollContainer) return
 
-    // clientWidth excludes the vertical scrollbar, which is exactly the width
-    // the body table is laid out against.
-    const w = this.scrollContainer.clientWidth
-    if (w && w > 0) {
-      this.headerTable.style.width = `${w}px`
-    } else {
-      this.headerTable.style.width = '100%'
-    }
+    const viewportWidth = this.scrollContainer.clientWidth
+    let minimumWidth = 0
+    this.headerTable.querySelectorAll('thead th').forEach(cell => {
+      const style = getComputedStyle(cell)
+      const min = parseFloat(style.minWidth)
+      const width = parseFloat(style.width)
+      const base = Number.isFinite(min) && min > 0
+        ? min
+        : (Number.isFinite(width) && width > 0 ? width : cell.getBoundingClientRect().width)
+      const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)
+      minimumWidth += Math.max(0, base) + padding
+    })
+
+    const tableWidth = Math.max(viewportWidth || 0, Math.ceil(minimumWidth))
+    const widthValue = tableWidth > 0 ? `${tableWidth}px` : '100%'
+    this.headerTable.style.width = widthValue
+    this.bodyTable.style.width = widthValue
+    if (this.spacer) this.spacer.style.width = widthValue
+    if (this.headerViewport) this.headerViewport.scrollLeft = this.scrollContainer.scrollLeft
   }
 
   _installResizeObserver() {
@@ -450,7 +465,11 @@ export class VirtualTable {
   // ===========================================================================
   
   _onScroll() {
-    // Use RAF to batch scroll handling - prevents multiple renders per frame
+    // Horizontal movement must track immediately so the fixed header stays
+    // aligned with the body. Vertical row recycling remains RAF-batched.
+    if (this.headerViewport) {
+      this.headerViewport.scrollLeft = this.scrollContainer.scrollLeft
+    }
     if (this._scrollRAF) return
     this._scrollRAF = requestAnimationFrame(() => {
       this._scrollRAF = null
