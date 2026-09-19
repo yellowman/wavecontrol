@@ -2370,7 +2370,13 @@ func (s *Service) ApplyConfigContext(ctx context.Context, deviceID int, ip, user
 	}
 
 	if storedNewPassword != "" {
-		if _, err := s.db.ExecContext(ctx, `UPDATE devices SET username = $2, password = $3 WHERE id = $1`, deviceID, username, storedNewPassword); err != nil {
+		// The device has already accepted the new password at this point. Do not
+		// let a client disconnect cancel persistence of the credential we now
+		// need for future management access. Preserve context values, but bound
+		// this post-accept commit independently.
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, err := s.db.ExecContext(persistCtx, `UPDATE devices SET username = $2, password = $3 WHERE id = $1`, deviceID, username, storedNewPassword); err != nil {
 			return fmt.Errorf("configuration applied but new device credential could not be persisted: %w", err)
 		}
 	}
