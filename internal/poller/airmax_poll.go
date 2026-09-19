@@ -730,8 +730,8 @@ func (p *Poller) updateAirMAXDeviceInfo(deviceID int64, ip string, status *airma
 			ssid = $9,
 			frequency = $10,
 			channel_width = $11,
-			gps_lat = $12,
-			gps_lon = $13
+			gps_lat = COALESCE(gps_lat, $12),
+			gps_lon = COALESCE(gps_lon, $13)
 		WHERE id = $14 AND (
 			hostname IS DISTINCT FROM $1 OR
 			product IS DISTINCT FROM $3 OR
@@ -743,8 +743,8 @@ func (p *Poller) updateAirMAXDeviceInfo(deviceID int64, ip string, status *airma
 			ssid IS DISTINCT FROM $9 OR
 			frequency IS DISTINCT FROM $10 OR
 			channel_width IS DISTINCT FROM $11 OR
-			gps_lat IS DISTINCT FROM $12 OR
-			gps_lon IS DISTINCT FROM $13 OR
+			(gps_lat IS NULL AND $12 IS NOT NULL) OR
+			(gps_lon IS NULL AND $13 IS NOT NULL) OR
 			(
 				NULLIF($2, '') IS NOT NULL
 				AND NOT EXISTS (SELECT 1 FROM devices d2 WHERE d2.mac = $2 AND d2.id <> $14)
@@ -787,8 +787,6 @@ func (p *Poller) updateAirMAXDeviceInfo(deviceID int64, ip string, status *airma
 				"ssid":             ssid,
 				"frequency":        status.Wireless.GetFrequency(),
 				"channel_width":    status.Wireless.GetChanBW(),
-				"gps_lat":          lat,
-				"gps_lon":          lon,
 			}
 			if !macConflict && mac != "" {
 				patch["mac"] = mac
