@@ -9,6 +9,7 @@ import {
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
+let deviceMembershipRenderTimeout = null
 let antennaLiveUpdateCallback = null
 
 function debouncedRenderTree(filter = '') {
@@ -16,6 +17,31 @@ function debouncedRenderTree(filter = '') {
   renderTreeTimeout = setTimeout(() => {
     renderTree(filter || store.treeFilter || '')
   }, 100)
+}
+
+function scheduleDeviceMembershipRender() {
+  clearTimeout(deviceMembershipRenderTimeout)
+  deviceMembershipRenderTimeout = setTimeout(() => {
+    deviceMembershipRenderTimeout = null
+    if (!['dashboard', 'devices'].includes(store.currentPage)) return
+
+    const currentScroller =
+      document.querySelector('.virtual-scroll-container') ||
+      document.querySelector('.device-table-wrapper')
+    const scrollTop = currentScroller?.scrollTop || 0
+    const scrollLeft = currentScroller?.scrollLeft || 0
+
+    renderCurrentPage()
+
+    requestAnimationFrame(() => {
+      const nextScroller =
+        document.querySelector('.virtual-scroll-container') ||
+        document.querySelector('.device-table-wrapper')
+      if (!nextScroller) return
+      nextScroller.scrollTop = scrollTop
+      nextScroller.scrollLeft = scrollLeft
+    })
+  }, 250)
 }
 
 // HTML escaping to prevent XSS from device-controlled fields
@@ -1248,8 +1274,8 @@ ws.on(msg => {
         // Check if already exists (by MAC)
         if (!currentDevices.some(d => d.mac === newDevice.mac)) {
           store.set({ devices: [...currentDevices, newDevice] })
-          renderTree()
-          if (['dashboard', 'devices'].includes(store.currentPage)) renderCurrentPage()
+          debouncedRenderTree()
+          scheduleDeviceMembershipRender()
           
           // Show toast notification
           const name = newDevice.hostname || newDevice.ip_address || newDevice.mac
@@ -9068,65 +9094,8 @@ window.restoreConfig = async function(deviceId, path) {
 }
 
 function showBatchConfigModal() {
-  const modal = document.getElementById('batchConfigModal')
-  if (!modal) return
-  
-  // Populate device list
-  const select = modal.querySelector('#batchDevices')
-  if (select) {
-    select.innerHTML = ''
-    store.devices.forEach(d => {
-      const opt = document.createElement('option')
-      opt.value = d.id
-      opt.textContent = `${d.hostname || d.ip_address} (${d.product || 'Unknown'})`
-      select.appendChild(opt)
-    })
-  }
-  
-  modal.classList.remove('hidden')
+  openBatchConfigForDevices(store.devices.map(device => device.id), false)
 }
-
-// Batch config submit
-document.getElementById('confirmBatchConfig')?.addEventListener('click', async () => {
-  const modal = document.getElementById('batchConfigModal')
-  const select = modal?.querySelector('#batchDevices')
-  const deviceIds = Array.from(select?.selectedOptions || []).map(o => parseInt(o.value))
-  
-  if (deviceIds.length === 0) {
-    showToast('Select at least one device', 'error')
-    return
-  }
-  
-  const changes = {}
-  if (document.getElementById('cfgSSID')?.checked) {
-    changes.ssid = document.getElementById('cfgSSIDValue')?.value
-  }
-  if (document.getElementById('cfgChannel')?.checked) {
-    changes.channel = parseInt(document.getElementById('cfgChannelValue')?.value)
-  }
-  if (document.getElementById('cfgPower')?.checked) {
-    changes.tx_power = parseInt(document.getElementById('cfgPowerValue')?.value)
-  }
-  if (document.getElementById('cfgPassword')?.checked) {
-    changes.password = document.getElementById('cfgPasswordValue')?.value
-  }
-  
-  if (Object.keys(changes).length === 0) {
-    showToast('Select at least one configuration option', 'error')
-    return
-  }
-  
-  showToast(`Applying config to ${deviceIds.length} devices...`, 'info')
-  
-  try {
-    const result = await api.batchConfig(deviceIds, changes)
-    const success = result.results?.filter(r => r.status === 'success').length || 0
-    showToast(`Config applied: ${success}/${deviceIds.length} success`, success > 0 ? 'success' : 'error')
-    modal?.classList.add('hidden')
-  } catch (e) {
-    showToast('Config failed: ' + e.message, 'error')
-  }
-})
 
 // ===== REPORTS PAGE =====
 // Drilldown page state
@@ -12770,28 +12739,36 @@ function resetBatchConfigForm() {
   document.getElementById('batchConfigResults')?.replaceChildren()
 }
 
-function openBatchConfigForSelection() {
-  const ids = getSelectedDeviceIds()
-  if (ids.length === 0) return
+function openBatchConfigForDevices(deviceIds, preselect = true) {
   const roles = store.user?.roles || []
   if (!roles.includes('editor') && !roles.includes('administrator')) {
     showToast('Batch configuration requires editor access', 'error')
     return
   }
+
   const select = document.getElementById('batchDevices')
   if (!select) return
+
+  const ids = Array.from(new Set((deviceIds || []).map(Number).filter(Number.isFinite)))
   select.replaceChildren()
   ids.forEach(id => {
     const device = store.getDeviceById(id)
     if (!device) return
     const option = document.createElement('option')
     option.value = String(id)
-    option.selected = true
+    option.selected = preselect
     option.textContent = device.hostname || device.ip_address || device.mac || `Device ${id}`
     select.appendChild(option)
   })
+
   resetBatchConfigForm()
   openModalElement('batchConfigModal')
+}
+
+function openBatchConfigForSelection() {
+  const ids = getSelectedDeviceIds()
+  if (ids.length === 0) return
+  openBatchConfigForDevices(ids, true)
 }
 
 document.getElementById('bulkConfig')?.addEventListener('click', openBatchConfigForSelection)
@@ -12808,12 +12785,14 @@ document.getElementById('confirmBatchConfig')?.addEventListener('click', async (
   const changes = {}
   if (document.getElementById('cfgSSID')?.checked) {
     const value = document.getElementById('cfgSSIDValue')?.value || ''
+    const byteLength = new TextEncoder().encode(value).length
     if (!value.trim()) { showToast('SSID cannot be empty', 'error'); return }
+    if (byteLength > 32) { showToast('SSID must be at most 32 bytes', 'error'); return }
     changes.ssid = value
   }
   if (document.getElementById('cfgChannel')?.checked) {
     const value = Number(document.getElementById('cfgChannelValue')?.value)
-    if (!Number.isFinite(value) || value <= 0) { showToast('Enter a valid channel', 'error'); return }
+    if (!Number.isInteger(value) || value <= 0) { showToast('Enter a positive integer channel', 'error'); return }
     changes.channel = value
   }
   if (document.getElementById('cfgPower')?.checked) {

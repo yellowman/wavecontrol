@@ -1255,9 +1255,13 @@ func (s *Service) doUpgradeAirMAX(ctx context.Context, deviceID int64, ip, usern
 	return nil
 }
 
-// login authenticates to a Wave device and returns the auth token
-// host should be just the IP/hostname, not a full URL
+// login authenticates to a Wave device and returns the auth token.
 func (s *Service) login(host, username, password string) (string, error) {
+	return s.loginContext(context.Background(), host, username, password)
+}
+
+// loginContext is the cancellation-aware form used by long-running callers.
+func (s *Service) loginContext(ctx context.Context, host, username, password string) (string, error) {
 	baseURL := fmt.Sprintf("https://%s", host)
 	loginURL := baseURL + "/api/v1.0/user/login"
 
@@ -1266,7 +1270,7 @@ func (s *Service) login(host, username, password string) (string, error) {
 		"password": password,
 	})
 
-	req, err := http.NewRequest("POST", loginURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", loginURL, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create login request: %w", err)
 	}
@@ -2282,8 +2286,13 @@ func (s *Service) PushConfig(ip, username, password string, config []byte) error
 	return nil
 }
 
-// ApplyConfig applies specific configuration changes to a device
+// ApplyConfig applies specific configuration changes to a device.
 func (s *Service) ApplyConfig(deviceID int, ip, username, password string, changes map[string]any) error {
+	return s.ApplyConfigContext(context.Background(), deviceID, ip, username, password, changes)
+}
+
+// ApplyConfigContext is the cancellation-aware form used by request/job callers.
+func (s *Service) ApplyConfigContext(ctx context.Context, deviceID int, ip, username, password string, changes map[string]any) error {
 	credential, err := s.resolveCredential(username, password, true)
 	if err != nil {
 		return err
@@ -2291,7 +2300,7 @@ func (s *Service) ApplyConfig(deviceID int, ip, username, password string, chang
 	username, password = credential.Username, credential.Password
 
 	// Login to Wave device
-	token, err := s.login(ip, username, password)
+	token, err := s.loginContext(ctx, ip, username, password)
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
 	}
@@ -2338,7 +2347,7 @@ func (s *Service) ApplyConfig(deviceID int, ip, username, password string, chang
 	}
 
 	url := fmt.Sprintf("https://%s/api/v1.0/system/config", ip)
-	req, err := http.NewRequest("PATCH", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "PATCH", url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -2361,7 +2370,7 @@ func (s *Service) ApplyConfig(deviceID int, ip, username, password string, chang
 	}
 
 	if storedNewPassword != "" {
-		if _, err := s.db.Exec(`UPDATE devices SET username = $2, password = $3 WHERE id = $1`, deviceID, username, storedNewPassword); err != nil {
+		if _, err := s.db.ExecContext(ctx, `UPDATE devices SET username = $2, password = $3 WHERE id = $1`, deviceID, username, storedNewPassword); err != nil {
 			return fmt.Errorf("configuration applied but new device credential could not be persisted: %w", err)
 		}
 	}

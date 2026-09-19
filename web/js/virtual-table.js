@@ -270,14 +270,8 @@ export class VirtualTable {
     const viewportWidth = this.scrollContainer.clientWidth
     let minimumWidth = 0
     this.headerTable.querySelectorAll('thead th').forEach(cell => {
-      const style = getComputedStyle(cell)
-      const min = parseFloat(style.minWidth)
-      const width = parseFloat(style.width)
-      const base = Number.isFinite(min) && min > 0
-        ? min
-        : (Number.isFinite(width) && width > 0 ? width : cell.getBoundingClientRect().width)
-      const padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)
-      minimumWidth += Math.max(0, base) + padding
+      const min = parseFloat(getComputedStyle(cell).minWidth)
+      if (Number.isFinite(min) && min > 0) minimumWidth += min
     })
 
     const tableWidth = Math.max(viewportWidth || 0, Math.ceil(minimumWidth))
@@ -285,7 +279,10 @@ export class VirtualTable {
     this.headerTable.style.width = widthValue
     this.bodyTable.style.width = widthValue
     if (this.spacer) this.spacer.style.width = widthValue
-    if (this.headerViewport) this.headerViewport.scrollLeft = this.scrollContainer.scrollLeft
+    if (this.headerViewport) {
+      this.headerViewport.style.width = viewportWidth > 0 ? `${viewportWidth}px` : '100%'
+      this.headerViewport.scrollLeft = this.scrollContainer.scrollLeft
+    }
   }
 
   _installResizeObserver() {

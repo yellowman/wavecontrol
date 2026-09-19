@@ -847,6 +847,7 @@ body.page-devices #app.main-content {
 .device-table .cell-site { width: 60px; min-width: 50px; }
 .device-table .cell-signal { width: 65px; min-width: 55px; text-align: center; }
 .device-table .cell-health { width: 60px; min-width: 50px; }
+.device-table .cell-dir { width: 60px; min-width: 50px; }
 .device-table .cell-distance { width: 60px; min-width: 50px; }
 .device-table .cell-capacity { width: 75px; min-width: 65px; }
 .device-table .cell-firmware { width: 100px; min-width: 80px; font-size: 0.8rem; }
@@ -7783,6 +7784,9 @@ html[data-theme="dark"] #mapContainer .leaflet-control-attribution a {
 
 .virtual-header-table .cell-health,
 .virtual-body-table .cell-health { width: 60px; min-width: 50px; max-width: 70px; }
+
+.virtual-header-table .cell-dir,
+.virtual-body-table .cell-dir { width: 60px; min-width: 50px; max-width: 70px; }
 
 .virtual-header-table .cell-distance,
 .virtual-body-table .cell-distance { width: 60px; min-width: 50px; max-width: 70px; }
