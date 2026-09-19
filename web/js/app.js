@@ -4,7 +4,7 @@ import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirect
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
          addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=69'
 import { 
-  wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, setVirtualBatchFlushCallback, scrollToDeviceById 
+  wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, setVirtualBatchFlushCallback, scrollToDeviceById, refreshVirtualRowClasses 
 } from './virtual-integration.js?v=15'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
@@ -11393,6 +11393,7 @@ store.on(() => {
       setTimeout(() => window.dispatchEvent(new Event('resize')), 50)
     }
   }
+  refreshVirtualRowClasses()
   updateBulkToolbar()
 })
 

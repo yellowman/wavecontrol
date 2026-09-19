@@ -50,9 +50,13 @@ export function setVirtualTableRef(vt) {
 // Scroll to and highlight a device by ID in the virtual table
 export function scrollToDeviceById(id) {
   if (virtualTableRef && typeof virtualTableRef.scrollToId === 'function') {
-    return virtualTableRef.scrollToId(id)  // Returns true if found and scrolled
+    return virtualTableRef.scrollToId(id)
   }
   return false
+}
+
+export function refreshVirtualRowClasses() {
+  virtualTableRef?.refreshRowClasses?.()
 }
 
 const wsBatcher = {
