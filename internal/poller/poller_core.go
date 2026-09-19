@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lib/pq"
 	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
 	"github.com/yellowman/wavecontrol/internal/udebug"
@@ -480,36 +479,33 @@ func (p *Poller) syncLastSeenToDB() {
 		return
 	}
 
-	now := time.Now()
-	freshWindow := 5 * time.Minute
-	if interval := p.cfgSnapshot().interval * 3; interval > freshWindow {
-		freshWindow = interval
-	}
-
-	recentMACs := make([]string, 0, len(lastSeenBatch))
+	values := make([]string, 0, len(lastSeenBatch))
+	args := make([]any, 0, len(lastSeenBatch)*2)
 	for mac, lastSeen := range lastSeenBatch {
+		mac = strings.ToLower(strings.TrimSpace(mac))
 		if mac == "" || lastSeen.IsZero() {
 			continue
 		}
-		if now.Sub(lastSeen) <= freshWindow {
-			recentMACs = append(recentMACs, mac)
-		}
+		args = append(args, mac, lastSeen)
+		values = append(values, fmt.Sprintf("($%d::text, $%d::timestamp)", len(args)-1, len(args)))
 	}
-	if len(recentMACs) == 0 {
+	if len(values) == 0 {
 		return
 	}
 
-	_, err := dbExecCtx(p.db, dbCtxForOp("sync_last_seen"), `
-		UPDATE devices
-		SET last_seen = NOW()
-		WHERE mac = ANY($1)
-		  AND (last_seen IS NULL OR last_seen < NOW() - INTERVAL '55 minutes')
-	`, pq.Array(recentMACs))
-	if err != nil {
+	query := `
+		UPDATE devices AS d
+		SET last_seen = v.last_seen
+		FROM (VALUES ` + strings.Join(values, ",") + `) AS v(mac, last_seen)
+		WHERE lower(d.mac) = v.mac
+		  AND v.last_seen > COALESCE(d.last_seen, TIMESTAMP 'epoch')
+		  AND (d.last_seen IS NULL OR d.last_seen < NOW() - INTERVAL '55 minutes')
+	`
+	if _, err := dbExecCtx(p.db, dbCtxForOp("sync_last_seen"), query, args...); err != nil {
 		p.logDebug("syncLastSeenToDB: update failed: %v", err)
 		return
 	}
-	p.logDebug("syncLastSeenToDB: refreshed %d recently available devices", len(recentMACs))
+	p.logDebug("syncLastSeenToDB: checkpointed %d in-memory last-seen values", len(values))
 }
 
 // cleanCircuitBreakers removes old entries
