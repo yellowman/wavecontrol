@@ -172,9 +172,11 @@ CREATE TABLE IF NOT EXISTS devices (
     username VARCHAR(64),
     password TEXT,
     
-    -- Status tracking (basic, real-time stats in memory)
-    status VARCHAR(16) DEFAULT 'unknown',  -- online, offline, upgrading, unknown
-    status_reason VARCHAR(128),            -- short reason for unknown/offline (optional)
+    -- Runtime status is kept in memory. These columns remain only for schema
+    -- compatibility and are not read/written by the poller.
+    status VARCHAR(16) DEFAULT 'unknown',
+    status_reason VARCHAR(128),
+    -- Coarse durable "last available" marker, updated infrequently in batches.
     last_seen TIMESTAMP,
     
     created_at TIMESTAMP DEFAULT NOW(),
