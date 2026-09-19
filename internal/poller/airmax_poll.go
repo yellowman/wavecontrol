@@ -108,32 +108,10 @@ func (p *Poller) pollDeviceAirMAX(job pollJob) pollResult {
 			p.wsHub.BroadcastStatsUpdate(int(job.DeviceID), job.MAC, job.IP, map[string]any{"online": false, "status": status, "db_status": status, "status_reason": reason, "last_error": err.Error()})
 		}
 
-		// Persist status to DB when:
-		//  1) we just left "online" (online -> unknown/offline),
-		//  2) the device responded and should be "unknown" (offline -> unknown), OR
-		//  3) we just crossed the offline threshold (unknown -> offline).
 		becameOffline := prevStatus != stats.StatusOffline && status == "offline"
-		shouldUpdate := leftOnline || becameOffline || (!unreachable && status == "unknown")
-		if shouldUpdate {
-			p.logDebug("AirMAX %s: updating DB to '%s' (leftOnline=%v, becameOffline=%v, unreachable=%v)", job.IP, status, leftOnline, becameOffline, unreachable)
-			// Only advance last_seen when the device actually responded (e.g. auth failure, TCP RST).
-			// For truly unreachable failures we intentionally do NOT advance last_seen.
-			var result sql.Result
-			var dbErr error
-			if unreachable {
-				result, dbErr = dbExecCtx(p.db, dbCtxForJob(job, "airmax_update_status_auth_fail_unreachable"), `UPDATE devices SET status = $1, status_reason = $3 WHERE id = $2`, status, job.DeviceID, reason)
-			} else {
-				result, dbErr = dbExecCtx(p.db, dbCtxForJob(job, "airmax_update_status_auth_fail"), `UPDATE devices SET status = $1, status_reason = $3, last_seen = NOW() WHERE id = $2`, status, job.DeviceID, reason)
-			}
-			if dbErr != nil {
-				log.Printf("WARN: AirMAX %s: DB update failed: %v", job.IP, dbErr)
-			} else if rows, _ := result.RowsAffected(); rows == 0 {
-				log.Printf("WARN: AirMAX %s: DB update affected 0 rows (device ID %d)", job.IP, job.DeviceID)
-			}
-			// Also update children (STAs) to same status
+		if leftOnline || becameOffline || (!unreachable && status == "unknown") {
+			// Parent/child runtime state is memory/WebSocket-only.
 			p.updateChildrenStatus(job.DeviceID, status)
-		} else {
-			p.logDebug("AirMAX %s: NOT updating DB (leftOnline=%v, unreachable=%v, status=%s)", job.IP, leftOnline, unreachable, status)
 		}
 		return pollNotThisType // Auth failed - might not be AirMAX
 	}
@@ -157,7 +135,6 @@ func (p *Poller) pollDeviceAirMAX(job pollJob) pollResult {
 		if leftOnline {
 			p.updateChildrenStatus(job.DeviceID, "unknown")
 		}
-		dbExecIgnoreCtx(p.db, dbCtxForJob(job, "airmax_mark_unknown_status_failed"), `UPDATE devices SET status = 'unknown', status_reason = $2, last_seen = NOW() WHERE id = $1`, job.DeviceID, "status_failed")
 		return pollFailed // Auth succeeded but status failed
 	}
 
@@ -266,7 +243,6 @@ func (p *Poller) pollDeviceAirMAX(job pollJob) pollResult {
 		p.updateAirMAXDeviceInfo(job.DeviceID, job.IP, status, client, deviceStats.MAC)
 		if becameOnline {
 			p.clearIdentityMismatch(job.DeviceID)
-			dbExecIgnoreCtx(p.db, dbCtxForJob(job, "airmax_mark_online"), `UPDATE devices SET status = 'online', status_reason = NULL, last_seen = NOW() WHERE id = $1`, job.DeviceID)
 		}
 	}
 	// If already online and nothing changed, no DB write needed

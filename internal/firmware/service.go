@@ -1093,7 +1093,6 @@ func (s *Service) UpgradeDevice(ctx context.Context, deviceID int64, firmwareFil
 	result.Status = "success"
 	result.Message = "upgrade initiated, device rebooting"
 	dbExecIgnore(s.db, `UPDATE firmware_jobs SET status = 'success', completed_at = NOW() WHERE id = $1`, jobID)
-	dbExecIgnore(s.db, `UPDATE devices SET status = 'upgrading' WHERE id = $1`, deviceID)
 
 	return result, nil
 }
@@ -1999,7 +1998,6 @@ func (s *Service) RetryUpgradeWithCredentials(ctx context.Context, deviceIDs []i
 				result.Status = "success"
 				result.Message = "upgrade initiated, device rebooting"
 				dbExecIgnore(s.db, `UPDATE firmware_jobs SET status = 'success', completed_at = NOW() WHERE id = $1`, jobID)
-				dbExecIgnore(s.db, `UPDATE devices SET status = 'upgrading' WHERE id = $1`, id)
 				// Persist the successful credential only in encrypted form.
 				storedPassword := password
 				if s.secretStore != nil {

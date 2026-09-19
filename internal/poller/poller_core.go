@@ -471,49 +471,45 @@ func (p *Poller) getDeviceStatus(ip string, unreachable bool) string {
 	return "unknown"
 }
 
-// batchSyncToDB syncs last_seen and status to database periodically
-// This provides persistence for crash recovery without per-poll DB writes
-func (p *Poller) batchSyncToDB() {
+// syncLastSeenToDB persists only a coarse "last available" marker.
+// Real-time status is memory-only. This runs infrequently so the devices
+// inventory table does not become a telemetry write stream.
+func (p *Poller) syncLastSeenToDB() {
 	lastSeenBatch := p.store.LastSeenBatch()
-	statusBatch := p.store.OnlineStatusBatch()
-
 	if len(lastSeenBatch) == 0 {
 		return
 	}
 
-	// Build batch update - one query for online, one for offline
-	onlineMACs := make([]string, 0)
-	offlineMACs := make([]string, 0)
-
-	for mac, online := range statusBatch {
-		if online {
-			onlineMACs = append(onlineMACs, mac)
-		} else {
-			offlineMACs = append(offlineMACs, mac)
-		}
+	now := time.Now()
+	freshWindow := 5 * time.Minute
+	if interval := p.cfgSnapshot().interval * 3; interval > freshWindow {
+		freshWindow = interval
 	}
 
-	// Update online devices
-	if len(onlineMACs) > 0 {
-		_, err := dbExecCtx(p.db, dbCtxForOp("batch_sync_last_seen"), `UPDATE devices SET last_seen = NOW() WHERE mac = ANY($1)`, pq.Array(onlineMACs))
-		if err != nil {
-			p.logDebug("batchSyncToDB: online update failed: %v", err)
+	recentMACs := make([]string, 0, len(lastSeenBatch))
+	for mac, lastSeen := range lastSeenBatch {
+		if mac == "" || lastSeen.IsZero() {
+			continue
+		}
+		if now.Sub(lastSeen) <= freshWindow {
+			recentMACs = append(recentMACs, mac)
 		}
 	}
-
-	// Update offline devices (with their actual last_seen time from memory)
-	// This is more complex - we need individual updates or a CTE
-	// For simplicity, we'll just ensure status is correct
-	// Important: only transition from 'online' to 'offline', not from 'unknown' to 'offline'
-	// Devices with 'unknown' status responded somehow (e.g., auth failed) so they're reachable
-	if len(offlineMACs) > 0 {
-		_, err := dbExecCtx(p.db, dbCtxForOp("batch_sync_mark_offline"), `UPDATE devices SET status = 'offline' WHERE mac = ANY($1) AND status = 'online'`, pq.Array(offlineMACs))
-		if err != nil {
-			p.logDebug("batchSyncToDB: offline update failed: %v", err)
-		}
+	if len(recentMACs) == 0 {
+		return
 	}
 
-	p.logDebug("batchSyncToDB: synced %d online, %d offline devices", len(onlineMACs), len(offlineMACs))
+	_, err := dbExecCtx(p.db, dbCtxForOp("sync_last_seen"), `
+		UPDATE devices
+		SET last_seen = NOW()
+		WHERE mac = ANY($1)
+		  AND (last_seen IS NULL OR last_seen < NOW() - INTERVAL '55 minutes')
+	`, pq.Array(recentMACs))
+	if err != nil {
+		p.logDebug("syncLastSeenToDB: update failed: %v", err)
+		return
+	}
+	p.logDebug("syncLastSeenToDB: refreshed %d recently available devices", len(recentMACs))
 }
 
 // cleanCircuitBreakers removes old entries
@@ -557,18 +553,20 @@ func (p *Poller) Start(ctx context.Context) {
 	// Initial poll
 	p.pollAllDevices()
 
-	// Main poll loop with dynamic interval support
+	// Main poll loop with dynamic interval support.
 	ticker := time.NewTicker(p.cfgSnapshot().interval)
 	defer ticker.Stop()
+	lastSeenTicker := time.NewTicker(time.Hour)
+	defer lastSeenTicker.Stop()
 
-	// Cleanup stale STAs every 5 poll cycles, circuit breakers every 10, DB sync every 20
+	// Cleanup stale STAs every 5 poll cycles and circuit breakers every 10.
 	cleanupCounter := 0
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Final sync before shutdown
-			p.batchSyncToDB()
+			// One final coarse availability sync before shutdown.
+			p.syncLastSeenToDB()
 			close(p.jobs)
 			p.wg.Wait()
 			return
@@ -576,6 +574,8 @@ func (p *Poller) Start(ctx context.Context) {
 			// Reset ticker with new interval
 			ticker.Reset(newInterval)
 			p.logDebug("Poll interval changed to %v", newInterval)
+		case <-lastSeenTicker.C:
+			p.syncLastSeenToDB()
 		case <-ticker.C:
 			p.pollAllDevices()
 
@@ -589,11 +589,6 @@ func (p *Poller) Start(ctx context.Context) {
 			// Clean circuit breakers every 10 cycles (~5 min)
 			if cleanupCounter%10 == 0 {
 				p.cleanCircuitBreakers()
-			}
-			// Batch sync last_seen to DB every 20 cycles (~10 min)
-			// This provides persistence without per-poll writes
-			if cleanupCounter%20 == 0 {
-				p.batchSyncToDB()
 			}
 		}
 	}
