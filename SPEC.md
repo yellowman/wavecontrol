@@ -844,8 +844,10 @@ compatibility. Polling code must not read or write them.
 
 `last_seen` is the one polling-derived value retained in `devices`. It is deliberately
 low-frequency: an hourly wall-clock task takes the in-memory last-seen snapshot and
-performs one batch update for devices seen recently. Rows whose durable timestamp was
-updated within roughly the previous hour are skipped.
+performs one batch update using each device's actual in-memory timestamp. Rows whose
+durable timestamp was updated within roughly the previous hour are skipped; an offline
+device can therefore eventually persist its exact final availability time without any
+per-poll writes.
 
 This keeps a useful "last available" marker across restarts without turning PostgreSQL
 or its WAL into a 30-second telemetry sink. The live API may return a newer in-memory
