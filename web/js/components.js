@@ -701,7 +701,7 @@ function bindRegularRowActions(root, renderContainer) {
       await handleDeleteClick(parseInt(btn.dataset.id), renderContainer)
     })
   })
-
+}
 
 // Get 5GHz signal (combined from chains) - works for Wave, airMAX, LTU
 // Uses pre-computed signal_combined from Go when available
