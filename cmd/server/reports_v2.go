@@ -41,7 +41,6 @@ type reportInventoryDevice struct {
 	Product        string
 	Firmware       string
 	Flavor         string
-	Status         string
 	Platform       string
 	Region         string
 	Site           string
@@ -75,10 +74,17 @@ func normalizeReportStatus(value string) string {
 	}
 }
 
+func reportLiveStatus(live *stats.DeviceStats) string {
+	if live == nil {
+		return "unknown"
+	}
+	return normalizeReportStatus(string(live.Status))
+}
+
 func (a *API) loadReportInventory(ctx context.Context) ([]reportInventoryDevice, error) {
 	rows, err := a.DB.QueryContext(ctx, `
 		SELECT d.id, d.hostname, host(d.ip_address), d.mac, d.product, d.firmware,
-		       d.flavor, d.status, d.platform, d.parent_id,
+		       d.flavor, d.platform, d.parent_id,
 		       p.hostname, host(p.ip_address), r.name, s.name, d.last_seen
 		FROM devices d
 		LEFT JOIN devices p ON d.parent_id = p.id
@@ -94,13 +100,13 @@ func (a *API) loadReportInventory(ctx context.Context) ([]reportInventoryDevice,
 	devices := make([]reportInventoryDevice, 0)
 	for rows.Next() {
 		var d reportInventoryDevice
-		var hostname, product, firmware, flavor, status, platform sql.NullString
+		var hostname, product, firmware, flavor, platform sql.NullString
 		var parentID sql.NullInt64
 		var parentHostname, parentIP, region, site sql.NullString
 		var lastSeen sql.NullTime
 		if err := rows.Scan(
 			&d.ID, &hostname, &d.IP, &d.MAC, &product, &firmware,
-			&flavor, &status, &platform, &parentID,
+			&flavor, &platform, &parentID,
 			&parentHostname, &parentIP, &region, &site, &lastSeen,
 		); err != nil {
 			return nil, fmt.Errorf("inventory row scan failed: %w", err)
@@ -109,7 +115,6 @@ func (a *API) loadReportInventory(ctx context.Context) ([]reportInventoryDevice,
 		d.Product = product.String
 		d.Firmware = firmware.String
 		d.Flavor = flavor.String
-		d.Status = normalizeReportStatus(status.String)
 		d.Platform = platform.String
 		d.Region = region.String
 		d.Site = site.String
@@ -416,7 +421,8 @@ func (a *API) buildHealthReport(ctx context.Context) (map[string]any, error) {
 
 	for _, device := range inventory {
 		inventoryByIP[device.IP] = device
-		status := normalizeReportStatus(device.Status)
+		live := liveByMAC[strings.ToLower(device.MAC)]
+		status := reportLiveStatus(live)
 		statusCounts[status]++
 		if device.IsSTA() {
 			staCount++
@@ -457,7 +463,6 @@ func (a *API) buildHealthReport(ctx context.Context) (map[string]any, error) {
 			site.APs++
 		}
 
-		live := liveByMAC[strings.ToLower(device.MAC)]
 		if live != nil {
 			metricDevices++
 			site.Metrics++
@@ -657,6 +662,7 @@ func (a *API) buildInventoryReport(ctx context.Context) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
+	liveByMAC := reportStatsByMAC(a.Stats)
 
 	devices := make([]map[string]any, 0, len(inventory))
 	statusCounts := map[string]int{"online": 0, "offline": 0, "unknown": 0}
@@ -667,7 +673,8 @@ func (a *API) buildInventoryReport(ctx context.Context) (map[string]any, error) 
 	siteAggregates := make(map[string]*reportSiteAggregate)
 
 	for _, device := range inventory {
-		status := normalizeReportStatus(device.Status)
+		live := liveByMAC[strings.ToLower(device.MAC)]
+		status := reportLiveStatus(live)
 		statusCounts[status]++
 		if device.IsSTA() {
 			staCount++
@@ -722,8 +729,12 @@ func (a *API) buildInventoryReport(ctx context.Context) (map[string]any, error) 
 			row["parent_hostname"] = device.ParentHostname
 			row["parent_ip"] = device.ParentIP
 		}
-		if device.HasLastSeen {
-			row["last_seen"] = device.LastSeen
+		lastSeen := device.LastSeen
+		if live != nil && !live.LastSeen.IsZero() && (lastSeen.IsZero() || live.LastSeen.After(lastSeen)) {
+			lastSeen = live.LastSeen
+		}
+		if !lastSeen.IsZero() {
+			row["last_seen"] = lastSeen
 		}
 		devices = append(devices, row)
 	}
@@ -809,7 +820,7 @@ func (a *API) buildPerformanceReport(ctx context.Context) (map[string]any, error
 		if live == nil {
 			missingDevices = append(missingDevices, map[string]any{
 				"id": device.ID, "hostname": device.DisplayName(), "ip": device.IP,
-				"site": siteKey, "status": device.Status, "is_sta": device.IsSTA(),
+				"site": siteKey, "status": "unknown", "is_sta": device.IsSTA(),
 			})
 			continue
 		}
@@ -874,7 +885,7 @@ func (a *API) buildPerformanceReport(ctx context.Context) (map[string]any, error
 			memUsage = int(live.MemUsage)
 		}
 
-		status := normalizeReportStatus(device.Status)
+		status := reportLiveStatus(live)
 		row := map[string]any{
 			"id": device.ID, "ip": ip, "hostname": hostname, "product": device.Product,
 			"flavor": device.Flavor, "platform": platformKey, "site": siteKey, "region": device.Region,
