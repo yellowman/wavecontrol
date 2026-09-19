@@ -2,18 +2,46 @@ import { api, auth, ws, sync } from './api.js?v=28'
 import { store } from './store.js?v=17'
 import { renderDevices, renderTree, renderLogs, renderDeviceDetail, renderDirectionalCell, showToast, updateWarningsPanel,
          showJobPanel, hideJobPanel, toggleJobPanel, updateJobProgress, updateJobStatus,
-         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable } from './components.js?v=68'
+         addJobEvent, startTrackedJob, trackJob, getActiveJobCount, cleanupVirtualTable, refreshDeviceTableRow } from './components.js?v=70'
 import { 
-  wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, scrollToDeviceById 
-} from './virtual-integration.js?v=14'
+  wsBatcher, shouldUseVirtualTable, setUpdateCountsCallback, setVirtualBatchFlushCallback, scrollToDeviceById, refreshVirtualRowClasses 
+} from './virtual-integration.js?v=16'
 
 // Debounced renderTree - prevents excessive re-renders with many devices
 let renderTreeTimeout = null
+let deviceMembershipRenderTimeout = null
+let antennaLiveUpdateCallback = null
+
 function debouncedRenderTree(filter = '') {
   clearTimeout(renderTreeTimeout)
   renderTreeTimeout = setTimeout(() => {
     renderTree(filter || store.treeFilter || '')
   }, 100)
+}
+
+function scheduleDeviceMembershipRender() {
+  clearTimeout(deviceMembershipRenderTimeout)
+  deviceMembershipRenderTimeout = setTimeout(() => {
+    deviceMembershipRenderTimeout = null
+    if (!['dashboard', 'devices'].includes(store.currentPage)) return
+
+    const currentScroller =
+      document.querySelector('.virtual-scroll-container') ||
+      document.querySelector('.device-table-wrapper')
+    const scrollTop = currentScroller?.scrollTop || 0
+    const scrollLeft = currentScroller?.scrollLeft || 0
+
+    renderCurrentPage()
+
+    requestAnimationFrame(() => {
+      const nextScroller =
+        document.querySelector('.virtual-scroll-container') ||
+        document.querySelector('.device-table-wrapper')
+      if (!nextScroller) return
+      nextScroller.scrollTop = scrollTop
+      nextScroller.scrollLeft = scrollLeft
+    })
+  }, 250)
 }
 
 // HTML escaping to prevent XSS from device-controlled fields
@@ -623,6 +651,18 @@ async function init() {
     ws.startPing()
     lastFullReconcileAt = Date.now()
     setUpdateCountsCallback(updateCounts)
+    setVirtualBatchFlushCallback(() => {
+      try {
+        updateWarningsPanel(computeActiveWarnings())
+      } catch (e) {
+        console.warn('warning panel update failed', e)
+      }
+      try {
+        antennaLiveUpdateCallback?.()
+      } catch (e) {
+        console.warn('antenna live update failed', e)
+      }
+    })
   } catch (e) {
     auth.clear()
     store.set({ user: null })
@@ -1234,7 +1274,8 @@ ws.on(msg => {
         // Check if already exists (by MAC)
         if (!currentDevices.some(d => d.mac === newDevice.mac)) {
           store.set({ devices: [...currentDevices, newDevice] })
-          renderTree()
+          debouncedRenderTree()
+          scheduleDeviceMembershipRender()
           
           // Show toast notification
           const name = newDevice.hostname || newDevice.ip_address || newDevice.mac
@@ -1285,163 +1326,38 @@ ws.on(msg => {
   }
 })
 
-// Incremental update of a single device row - surgically updates DOM without re-render
-// Prefer updating by unique device id; fall back to ip only when no id exists.
+// Incremental update of one device using the canonical dashboard row renderer.
+// The tree still gets a tiny targeted patch, but table cells/classes are rebuilt
+// from the authoritative in-memory device object in both table modes.
 function updateDeviceRow(id, ip, data) {
   const statusVal = data.status || (data.online === true ? 'online' : (data.online === false ? 'offline' : 'unknown'))
+  const fullDevice = (id !== undefined && id !== null)
+    ? store.getDeviceById(id)
+    : (ip ? store.getDeviceByIp(ip) : null)
 
-  // Prefer the canonical device object from the store for derived UI (e.g. directional diagnosis)
-  const fullDevice = (id !== undefined && id !== null) ? store.getDeviceById(id) : (ip ? store.getDeviceByIp(ip) : null)
+  const treeSelector = (id !== undefined && id !== null)
+    ? `.tree-node[data-id="${id}"]`
+    : (ip ? `.tree-node[data-ip="${ip}"]` : null)
 
-  // Update tree nodes
-  const treeSelector = (id !== undefined && id !== null) ? `.tree-node[data-id="${id}"]` : (ip ? `.tree-node[data-ip="${ip}"]` : null)
   if (treeSelector) {
     document.querySelectorAll(treeSelector).forEach(node => {
-    const statusDot = node.querySelector('.tree-status')
-    if (statusDot) {
-			const newStatus = statusVal
-      if (!statusDot.classList.contains(newStatus)) {
-        statusDot.className = `tree-status ${newStatus}`
+      const statusDot = node.querySelector('.tree-status')
+      if (statusDot && !statusDot.classList.contains(statusVal)) {
+        statusDot.className = `tree-status ${statusVal}`
       }
-    }
-    // Update tree label if hostname provided
-    if (data.hostname) {
-      const label = node.querySelector('.tree-label')
-      if (label && label.textContent !== data.hostname) {
-        label.textContent = data.hostname
+      if (data.hostname) {
+        const label = node.querySelector('.tree-label')
+        if (label && label.textContent !== data.hostname) label.textContent = data.hostname
       }
-    }
-	})
+    })
   }
-  
-  // Update table rows
-  const rowSelector = (id !== undefined && id !== null) ? `tr[data-id="${id}"]` : (ip ? `tr[data-ip="${ip}"]` : null)
-  if (!rowSelector) return
-  document.querySelectorAll(rowSelector).forEach(row => {
-    // Update status dot
-    const statusDot = row.querySelector('.status-dot')
-    if (statusDot) {
-		  const newStatus = statusVal
-      if (!statusDot.classList.contains(newStatus)) {
-        statusDot.className = `status-dot ${newStatus}`
-      }
-    }
-    
-    // Update device name if hostname provided
-    if (data.hostname) {
-      const nameEl = row.querySelector('.device-name')
-      if (nameEl && nameEl.textContent !== data.hostname) {
-        nameEl.textContent = data.hostname
-      }
-    }
-    
-    // Update 60GHz signal cell - prefer server-computed quality
-    const signal60Cell = row.querySelector('.cell-signal-60')
-    if (signal60Cell) {
-      const sig60 = data.signal_60ghz
-      if (typeof sig60 === 'number' && sig60 !== 0) {
-        const newText = `${sig60} dBm`
-        const quality = data.radio_60ghz?.signal_quality
-        const cls = quality ? `signal-${quality}` : getSignalClass60(sig60)
-        const newClass = `cell-signal cell-signal-60 ${cls}`
-        if (signal60Cell.textContent !== newText) signal60Cell.textContent = newText
-        if (signal60Cell.className !== newClass) signal60Cell.className = newClass
-      }
-    }
-    
-    // Update 5GHz combined signal cell - prefer server-computed quality
-    const signal5Cell = row.querySelector('.cell-signal-5ghz')
-    if (signal5Cell) {
-      const sig5 = get5GHzCombined(data)
-      if (sig5 && sig5 !== 0) {
-        const newText = `${sig5} dBm`
-        const quality = data.radio_5ghz?.signal_quality || data.radio_ltu?.signal_quality
-        const cls = quality ? `signal-${quality}` : getSignalClass5(sig5)
-        const newClass = `cell-signal cell-signal-5ghz ${cls}`
-        if (signal5Cell.textContent !== newText) signal5Cell.textContent = newText
-        if (signal5Cell.className !== newClass) signal5Cell.className = newClass
-      }
-    }
-    
-    // Update 5GHz chain cells (no server quality for per-chain)
-    const c0Cell = row.querySelector('.cell-signal-c0')
-    const c1Cell = row.querySelector('.cell-signal-c1')
-    const chains = get5GHzChains(data)
-    if (c0Cell && typeof chains[0] === 'number' && chains[0] !== 0) {
-      const newText = `${chains[0]}`
-      const newClass = `cell-signal cell-signal-c0 ${getSignalClass5(chains[0])}`
-      if (c0Cell.textContent !== newText) c0Cell.textContent = newText
-      if (c0Cell.className !== newClass) c0Cell.className = newClass
-    }
-    if (c1Cell && typeof chains[1] === 'number' && chains[1] !== 0) {
-      const newText = `${chains[1]}`
-      const newClass = `cell-signal cell-signal-c1 ${getSignalClass5(chains[1])}`
-      if (c1Cell.textContent !== newText) c1Cell.textContent = newText
-      if (c1Cell.className !== newClass) c1Cell.className = newClass
-    }
-    
-    // Update health bars (based on primary signal)
-    const healthCell = row.querySelector('.cell-health')
-    if (healthCell) {
-      const primarySignal = data.signal_60ghz || get5GHzCombined(data) || 0
-      const band = data.signal_60ghz ? '60ghz' : '5ghz'
-      if (primarySignal) {
-        healthCell.innerHTML = getSignalBarsHTML(primarySignal, band)
-      }
-    }
-    
-    // Update distance
-    const distCell = row.querySelector('.cell-distance')
-    if (distCell && data.distance) {
-      const newText = `${(data.distance / 1000).toFixed(2)} km`
-      if (distCell.textContent !== newText) distCell.textContent = newText
-    }
-    
-    // Update capacity
-    const capCell = row.querySelector('.cell-capacity')
-    const cap = data.capacity_60ghz || data.capacity_ltu || data.capacity_5ghz
-    if (capCell && cap) {
-      const newText = `${(cap / 1e6).toFixed(0)} Mbps`
-      if (capCell.textContent !== newText) capCell.textContent = newText
-    }
-    
-    // Update directional diagnosis (derived)
-    if (store.columns.dir && fullDevice) {
-      const dirCell = row.querySelector('.cell-dir')
-      if (dirCell) {
-        dirCell.innerHTML = renderDirectionalCell(fullDevice)
-      }
-    }
-  })
 
-  // If a STA changed, refresh the parent's directional summary (if visible)
-  if (store.columns.dir && fullDevice && fullDevice.parent_id) {
-    const parent = store.getDeviceById(fullDevice.parent_id)
-    if (parent) {
-      document.querySelectorAll(`tr[data-id="${parent.id}"]`).forEach(pRow => {
-        const dirCell = pRow.querySelector('.cell-dir')
-        if (dirCell) {
-          dirCell.innerHTML = renderDirectionalCell(parent)
-        }
-      })
-    }
-  }
-}
+  if (!fullDevice) return
+  refreshDeviceTableRow(fullDevice.id)
 
-// Generate signal bars HTML for health column
-function getSignalBarsHTML(level, band = '5ghz') {
-  if (!level) return '<div class="signal-bars"></div>'
-  const t = SIGNAL_THRESHOLDS[band] || SIGNAL_THRESHOLDS['5ghz']
-  // 5 bars: excellent (>good+5), very good (>good), good (>good-5), fair (>fair), poor
-  let bars = 0
-  if (level >= t.good + 5) bars = 5
-  else if (level >= t.good) bars = 4
-  else if (level >= t.good - 5) bars = 3
-  else if (level >= t.fair) bars = 2
-  else bars = 1
-  const cls = bars >= 4 ? 'excellent' : (bars >= 3 ? 'good' : (bars >= 2 ? 'fair' : 'poor'))
-  return `<div class="signal-bars ${cls}">${[1,2,3,4,5].map(i => 
-    `<div class="signal-bar ${i <= bars ? 'active' : ''}"></div>`).join('')}</div>`
+  // Directional diagnosis on an AP depends on its STA state, so refresh the
+  // parent row as well when a child changes.
+  if (fullDevice.parent_id) refreshDeviceTableRow(fullDevice.parent_id)
 }
 
 // Incremental update of detail panel - updates values without full re-render
@@ -8175,6 +8091,9 @@ function showAntennaConfigModal() {
       clearTimeout(filterTimer)
       filterTimer = null
     }
+    if (antennaLiveUpdateCallback === scheduleUpdate) {
+      antennaLiveUpdateCallback = null
+    }
   }
   const closeBtn = document.getElementById('closeAntennaConfig')
   const closeFooter = document.getElementById('closeAntennaConfigFooter')
@@ -8827,6 +8746,7 @@ function showAntennaConfigModal() {
   }
 
   applyFilter('')
+  antennaLiveUpdateCallback = scheduleUpdate
 
   unsubscribe = store.subscribe((st, oldSt) => {
     if (modal.classList.contains('hidden')) return
@@ -9174,65 +9094,8 @@ window.restoreConfig = async function(deviceId, path) {
 }
 
 function showBatchConfigModal() {
-  const modal = document.getElementById('batchConfigModal')
-  if (!modal) return
-  
-  // Populate device list
-  const select = modal.querySelector('#batchDevices')
-  if (select) {
-    select.innerHTML = ''
-    store.devices.forEach(d => {
-      const opt = document.createElement('option')
-      opt.value = d.id
-      opt.textContent = `${d.hostname || d.ip_address} (${d.product || 'Unknown'})`
-      select.appendChild(opt)
-    })
-  }
-  
-  modal.classList.remove('hidden')
+  openBatchConfigForDevices(store.devices.map(device => device.id), false)
 }
-
-// Batch config submit
-document.getElementById('confirmBatchConfig')?.addEventListener('click', async () => {
-  const modal = document.getElementById('batchConfigModal')
-  const select = modal?.querySelector('#batchDevices')
-  const deviceIds = Array.from(select?.selectedOptions || []).map(o => parseInt(o.value))
-  
-  if (deviceIds.length === 0) {
-    showToast('Select at least one device', 'error')
-    return
-  }
-  
-  const changes = {}
-  if (document.getElementById('cfgSSID')?.checked) {
-    changes.ssid = document.getElementById('cfgSSIDValue')?.value
-  }
-  if (document.getElementById('cfgChannel')?.checked) {
-    changes.channel = parseInt(document.getElementById('cfgChannelValue')?.value)
-  }
-  if (document.getElementById('cfgPower')?.checked) {
-    changes.tx_power = parseInt(document.getElementById('cfgPowerValue')?.value)
-  }
-  if (document.getElementById('cfgPassword')?.checked) {
-    changes.password = document.getElementById('cfgPasswordValue')?.value
-  }
-  
-  if (Object.keys(changes).length === 0) {
-    showToast('Select at least one configuration option', 'error')
-    return
-  }
-  
-  showToast(`Applying config to ${deviceIds.length} devices...`, 'info')
-  
-  try {
-    const result = await api.batchConfig(deviceIds, changes)
-    const success = result.results?.filter(r => r.status === 'success').length || 0
-    showToast(`Config applied: ${success}/${deviceIds.length} success`, success > 0 ? 'success' : 'error')
-    modal?.classList.add('hidden')
-  } catch (e) {
-    showToast('Config failed: ' + e.message, 'error')
-  }
-})
 
 // ===== REPORTS PAGE =====
 // Drilldown page state
@@ -11385,6 +11248,7 @@ store.on(() => {
       setTimeout(() => window.dispatchEvent(new Event('resize')), 50)
     }
   }
+  refreshVirtualRowClasses()
   updateBulkToolbar()
 })
 
@@ -12875,28 +12739,36 @@ function resetBatchConfigForm() {
   document.getElementById('batchConfigResults')?.replaceChildren()
 }
 
-function openBatchConfigForSelection() {
-  const ids = getSelectedDeviceIds()
-  if (ids.length === 0) return
+function openBatchConfigForDevices(deviceIds, preselect = true) {
   const roles = store.user?.roles || []
   if (!roles.includes('editor') && !roles.includes('administrator')) {
     showToast('Batch configuration requires editor access', 'error')
     return
   }
+
   const select = document.getElementById('batchDevices')
   if (!select) return
+
+  const ids = Array.from(new Set((deviceIds || []).map(Number).filter(Number.isFinite)))
   select.replaceChildren()
   ids.forEach(id => {
     const device = store.getDeviceById(id)
     if (!device) return
     const option = document.createElement('option')
     option.value = String(id)
-    option.selected = true
+    option.selected = preselect
     option.textContent = device.hostname || device.ip_address || device.mac || `Device ${id}`
     select.appendChild(option)
   })
+
   resetBatchConfigForm()
   openModalElement('batchConfigModal')
+}
+
+function openBatchConfigForSelection() {
+  const ids = getSelectedDeviceIds()
+  if (ids.length === 0) return
+  openBatchConfigForDevices(ids, true)
 }
 
 document.getElementById('bulkConfig')?.addEventListener('click', openBatchConfigForSelection)
@@ -12913,12 +12785,14 @@ document.getElementById('confirmBatchConfig')?.addEventListener('click', async (
   const changes = {}
   if (document.getElementById('cfgSSID')?.checked) {
     const value = document.getElementById('cfgSSIDValue')?.value || ''
+    const byteLength = new TextEncoder().encode(value).length
     if (!value.trim()) { showToast('SSID cannot be empty', 'error'); return }
+    if (byteLength > 32) { showToast('SSID must be at most 32 bytes', 'error'); return }
     changes.ssid = value
   }
   if (document.getElementById('cfgChannel')?.checked) {
     const value = Number(document.getElementById('cfgChannelValue')?.value)
-    if (!Number.isFinite(value) || value <= 0) { showToast('Enter a valid channel', 'error'); return }
+    if (!Number.isInteger(value) || value <= 0) { showToast('Enter a positive integer channel', 'error'); return }
     changes.channel = value
   }
   if (document.getElementById('cfgPower')?.checked) {

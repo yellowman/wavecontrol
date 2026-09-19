@@ -8,7 +8,7 @@ import {
   VIRTUAL_THRESHOLD,
   triggerUpdateCounts,
   scrollToDeviceById
-} from './virtual-integration.js?v=14'
+} from './virtual-integration.js?v=16'
 
 
 async function requestConfirmation(message, options = {}) {
@@ -266,9 +266,10 @@ function setupDashboardScopeHandlers(container) {
     })
   }
 
-  // Close menus when the dashboard/table scrolls or viewport changes
-  const wrapper = container.querySelector('.device-table-wrapper')
-  wrapper?.addEventListener('scroll', closeAllMenus, { passive: true })
+  // Scroll does not bubble, so listen in capture phase on the stable page
+  // container. This covers both the regular wrapper and virtual scroller even
+  // after their DOM is rebuilt.
+  container.addEventListener('scroll', closeAllMenus, { passive: true, capture: true })
   window.addEventListener('resize', closeAllMenus)
 
   container.addEventListener('click', (e) => {
@@ -517,83 +518,16 @@ export function renderDevices(container) {
     renderDevicesVirtual(container)
     return
   }
-  
+
+  cleanupVirtualTableInstance()
   renderDevicesRegular(container)
 }
 
 // Regular (non-virtual) device rendering
 function renderDevicesRegular(container) {
-  const devices = store.filteredDevices
-  const query = store.searchQuery.toLowerCase()
-  
-  // Get selected device
-  const selectedDevice = store.selectedDevice 
-    ? devices.find(d => d.id === store.selectedDevice) 
-    : null
-  
-  // Filter by search
-  const filtered = query ? devices.filter(d => 
-    (d.hostname || '').toLowerCase().includes(query) ||
-    (d.ip_address || '').toLowerCase().includes(query) ||
-    (d.product || '').toLowerCase().includes(query) ||
-    (d.mac || '').toLowerCase().includes(query) ||
-    (d.flavor || '').toLowerCase().includes(query)
-  ) : devices
-  
-  // Current sort state - null means hierarchical (tree) view
+  const sorted = getSortedFilteredDevices()
   const sortCol = store.sortColumn
   const sortDir = store.sortDirection || 'asc'
-  
-  let sorted
-  
-  // If sorting by column, do flat sort (skip hierarchical grouping)
-  if (sortCol) {
-    sorted = [...filtered].sort((a, b) => {
-      let av, bv
-      // Sort by what's displayed in the column (same value regardless of device type)
-      switch (sortCol) {
-        case 'hostname': av = a.hostname || ''; bv = b.hostname || ''; break
-        case 'ip': av = a.ip_address || ''; bv = b.ip_address || ''; break
-        case 'mac': av = a.mac || ''; bv = b.mac || ''; break
-        case 'product': av = a.product || a.model || ''; bv = b.product || b.model || ''; break
-        case 'signal_60ghz': av = a.signal_60ghz || -999; bv = b.signal_60ghz || -999; break
-        case 'sta_60ghz': av = getSTASignal60GHz(a) || -999; bv = getSTASignal60GHz(b) || -999; break
-        case 'signal_5ghz': av = getSignal5GHz(a) || -999; bv = getSignal5GHz(b) || -999; break
-        case 'signal_5ghz_c0': av = getSignal5GHzChain(a, 0) || -999; bv = getSignal5GHzChain(b, 0) || -999; break
-        case 'signal_5ghz_c1': av = getSignal5GHzChain(a, 1) || -999; bv = getSignal5GHzChain(b, 1) || -999; break
-        case 'sta_5ghz': av = getSTASignal5GHz(a) || -999; bv = getSTASignal5GHz(b) || -999; break
-        case 'sta_5ghz_c0': av = getSTASignal5GHzChain(a, 0) || -999; bv = getSTASignal5GHzChain(b, 0) || -999; break
-        case 'sta_5ghz_c1': av = getSTASignal5GHzChain(a, 1) || -999; bv = getSTASignal5GHzChain(b, 1) || -999; break
-        case 'distance': av = a.distance || 0; bv = b.distance || 0; break
-        case 'capacity': av = a.capacity_60ghz || a.capacity_ltu || a.capacity_5ghz || 0; bv = b.capacity_60ghz || b.capacity_ltu || b.capacity_5ghz || 0; break
-        case 'firmware': av = a.firmware_version || a.firmware || ''; bv = b.firmware_version || b.firmware || ''; break
-        case 'site': av = a.site_name || ''; bv = b.site_name || ''; break
-        default: av = a.hostname || ''; bv = b.hostname || ''
-      }
-      if (typeof av === 'string') {
-        return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av)
-      }
-      return sortDir === 'asc' ? av - bv : bv - av
-    })
-  } else {
-	    // No column sort - use hierarchical grouping (root devices first, then their STAs).
-	    // Managed devices (added via Add IP/Bulk) are treated as root-level even if they have a parent_id.
-	    const aps = filtered.filter(d => !d.parent_id || d.managed)
-    const grouped = []
-    
-    aps.forEach(ap => {
-      grouped.push(ap)
-	      const stas = filtered.filter(d => d.parent_id === ap.id && !d.managed)
-      stas.sort((a, b) => (a.hostname || '').localeCompare(b.hostname || ''))
-      grouped.push(...stas)
-    })
-    
-    // Add orphan STAs
-	    const orphans = filtered.filter(d => d.parent_id && !d.managed && !aps.find(ap => ap.id === d.parent_id))
-    grouped.push(...orphans)
-    
-    sorted = grouped
-  }
   
   const sortIcon = (col) => sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''
   const cols = store.columns
@@ -742,62 +676,29 @@ function renderDevicesRegular(container) {
     })
   })
   
-  // Row actions
-  container.querySelectorAll('.btn-refresh').forEach(btn => {
+  bindRegularRowActions(container, container)
+}
+
+function bindRegularRowActions(root, renderContainer) {
+  root.querySelectorAll('.btn-refresh').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation()
-      const id = parseInt(btn.dataset.id)
-      try {
-        btn.disabled = true
-        await api.refreshDevice(id)
-        showToast('Refreshing...', 'info')
-        setTimeout(async () => {
-          const devices = await api.devices()
-          store.set({ devices })
-          renderTree()
-          renderDevices(container)
-        }, 2000)
-      } catch (e) {
-        showToast('Refresh failed: ' + e.message, 'error')
-        btn.disabled = false
-      }
+      await handleRefreshClick(parseInt(btn.dataset.id), btn)
     })
   })
-  
-  container.querySelectorAll('.btn-upgrade').forEach(btn => {
+
+  root.querySelectorAll('.btn-upgrade').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation()
       const id = parseInt(btn.dataset.id)
       if (window.showUpgradeModal) window.showUpgradeModal(id)
     })
   })
-  
-  container.querySelectorAll('.btn-delete').forEach(btn => {
+
+  root.querySelectorAll('.btn-delete').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation()
-      const id = parseInt(btn.dataset.id)
-      const confirmed = await requestConfirmation(
-        'This device and its WaveControl inventory record will be removed. Discovered child devices may also disappear from the current view.',
-        {
-          title: 'Delete device?',
-          eyebrow: 'Inventory change',
-          confirmText: 'Delete device',
-          tone: 'danger',
-          calloutTitle: 'This action removes the selected device from WaveControl.'
-        }
-      )
-      if (!confirmed) return
-      
-      try {
-        await api.deleteDevice(id)
-        const devices = await api.devices()
-        store.set({ devices, selectedDevice: null })
-        renderTree()
-        renderDevices(container)
-        showToast('Device deleted', 'success')
-      } catch (e) {
-        showToast('Delete failed: ' + e.message, 'error')
-      }
+      await handleDeleteClick(parseInt(btn.dataset.id), renderContainer)
     })
   })
 }
@@ -927,6 +828,8 @@ function renderDevicesVirtual(container) {
         bufferSize: 100,
         renderRow: (d) => renderDeviceRowContent(d, cols),
         renderHeader: () => renderVirtualHeader(cols, sortCol, sortDir),
+        getRowClass: (d) => getDeviceRowClasses(d),
+        emptyMessage: 'No devices found',
         onRowClick: handleVirtualRowClick,
         getRowId: d => d.id,
         getRowIp: d => d.ip_address
@@ -1033,7 +936,16 @@ function renderVirtualHeader(cols, sortCol, sortDir) {
   `
 }
 
-// Render row content (innerHTML without <tr> wrapper) for virtual table
+function getDeviceRowClasses(device) {
+  const classes = []
+  if (device.parent_id && !device.managed) classes.push('sta-row')
+  if (device.managed) classes.push('managed-row')
+  if (device.alertable === false) classes.push('not-alertable-row')
+  if (store.selectedDevice === device.id) classes.push('selected')
+  return classes.join(' ')
+}
+
+// Render canonical row cells for both table modes.
 function renderDeviceRowContent(device, cols) {
   const isSTA = !!device.parent_id && !device.managed
   const isOnline = device.online
@@ -1146,7 +1058,7 @@ function handleVirtualRowClick(device, tr, e) {
   const btn = e.target.closest('button')
   if (btn) {
     if (btn.classList.contains('btn-refresh')) {
-      handleRefreshClick(device.id)
+      handleRefreshClick(device.id, btn)
     } else if (btn.classList.contains('btn-upgrade')) {
       if (window.showUpgradeModal) window.showUpgradeModal(device.id)
     } else if (btn.classList.contains('btn-delete')) {
@@ -1169,6 +1081,7 @@ function handleVirtualRowClick(device, tr, e) {
       detailPanel.classList.remove('hidden')
     }
   }
+  virtualTableInstance?.refreshRowClasses()
 }
 
 // Handle context menu in virtual table
@@ -1220,8 +1133,7 @@ function setupColumnMenuHandlers(container) {
     })
   }
 
-  const wrapper = container.querySelector('.device-table-wrapper')
-  wrapper?.addEventListener('scroll', closeAllColumnMenus, { passive: true })
+  container.addEventListener('scroll', closeAllColumnMenus, { passive: true, capture: true })
   window.addEventListener('resize', closeAllColumnMenus)
 
   container.addEventListener('click', (e) => {
@@ -1270,17 +1182,20 @@ function cleanupVirtualTableInstance() {
 }
 
 // Handle refresh button click
-async function handleRefreshClick(deviceId) {
+async function handleRefreshClick(deviceId, button = null) {
   try {
+    if (button) button.disabled = true
     await api.refreshDevice(deviceId)
     showToast('Refreshing...', 'info')
   } catch (e) {
     showToast('Refresh failed: ' + e.message, 'error')
+  } finally {
+    if (button?.isConnected) button.disabled = false
   }
 }
 
 // Handle delete button click  
-async function handleDeleteClick(deviceId) {
+async function handleDeleteClick(deviceId, renderContainer = null) {
   const confirmed = await requestConfirmation(
     'This device and its WaveControl inventory record will be removed. Discovered child devices may also disappear from the current view.',
     {
@@ -1307,9 +1222,13 @@ async function handleDeleteClick(deviceId) {
     const selectedStillExists = selected ? newDevices.some(d => d.id === selected) : true
     store.set({ devices: newDevices, selectedDevice: selectedStillExists ? selected : null })
 
-    // Update tree + virtual table without tearing down the scroll container.
     try { renderTree() } catch (e) {}
-    if (virtualTableInstance) {
+    const container = renderContainer ||
+      virtualTableInstance?.container?.closest('.devices-split-view')?.parentElement ||
+      null
+    if (container) {
+      renderDevices(container)
+    } else if (virtualTableInstance) {
       virtualTableInstance.setData(getSortedFilteredDevices())
     }
 
@@ -1335,159 +1254,54 @@ export function cleanupVirtualTable() {
 // End Virtual Table Renderer
 // ==========================================================================
 
-// Render a single device row
+// Render a regular table row around the canonical cell renderer.
 function renderDeviceRow(device, cols = {}) {
-  const isSTA = !!device.parent_id && !device.managed
-  const isOnline = device.online
-  const status = isOnline ? 'online' : (device.db_status === 'offline' ? 'offline' : 'unknown')
-  
-  // Device name - prefer hostname, then product+IP combo, then just IP
-  const deviceName = escapeHTML(device.hostname || (device.product ? `${device.product} (${device.ip_address})` : device.ip_address) || device.mac || 'Unknown')
-
-  // APs are already visually top-level, so only directly managed stations
-  // need role badges. Alertability is shown in the host pane rather than as a
-  // persistent dashboard pill; temporary silences remain visible here.
-  const inferredRole = String(device.role || (device.parent_id ? 'sta' : 'ap')).toLowerCase()
-  const directBadge = (device.managed && inferredRole !== 'ap')
-    ? `<span class="direct-badge" title="Directly managed (Add IP/Bulk)">DIRECT</span>`
-    : ''
-  const managedStaBadge = (device.managed && inferredRole === 'sta') ? `<span class="role-badge sta">STA</span>` : ''
-  const alertSilenced = device.alert_silenced_until && new Date(device.alert_silenced_until).getTime() > Date.now()
-  const alertSilencedBadge = alertSilenced ? `<span class="role-badge muted" title="Alerts temporarily silenced">SILENCED</span>` : ''
-  
-  // 60GHz signal (Wave devices) - prefer server-computed quality
-  const signal60 = device.signal_60ghz || 0
-  const signal60Display = signal60 ? `${signal60} dBm` : '-'
-  const signal60Quality = device.radio_60ghz?.signal_quality
-  const signal60Class = signal60 ? getSignalClassFromQuality(signal60Quality, signal60, '60ghz') : ''
-  
-  // STA 60GHz signal (remote - what STA receives from AP)
-  const sta60 = getSTASignal60GHz(device)
-  const sta60Quality = device.radio_60ghz?.remote_signal_quality
-  const colSta60 = cols.sta60 ? (() => {
-    const display = sta60 ? `${sta60} dBm` : '-'
-    const cls = sta60 ? getSignalClassFromQuality(sta60Quality, sta60, '60ghz') : ''
-    return `<td class="cell-signal cell-signal-sta60 ${cls}">${display}</td>`
-  })() : ''
-  
-  // 5GHz signals (all platforms: Wave backup, airMAX, LTU) - prefer server-computed quality
-  const chains = getSignal5GHzChains(device)
-  const signal5Combined = getSignal5GHz(device)
-  const signal5Quality = device.radio_5ghz?.signal_quality || device.radio_ltu?.signal_quality
-  const signal5C0 = chains[0] || 0
-  const signal5C1 = chains[1] || 0
-  
-  // 5GHz combined column
-  const col5Combined = cols.signal5 ? (() => {
-    const display = signal5Combined ? `${signal5Combined} dBm` : '-'
-    const cls = signal5Combined ? getSignalClassFromQuality(signal5Quality, signal5Combined, '5ghz') : ''
-    return `<td class="cell-signal cell-signal-5ghz ${cls}">${display}</td>`
-  })() : ''
-  
-  // 5GHz C0 column (no server quality for per-chain)
-  const col5C0 = cols.signal5c0 ? (() => {
-    const display = signal5C0 ? `${signal5C0}` : '-'
-    const cls = signal5C0 ? getSignalClass5(signal5C0) : ''
-    return `<td class="cell-signal cell-signal-c0 ${cls}">${display}</td>`
-  })() : ''
-  
-  // 5GHz C1 column (no server quality for per-chain)
-  const col5C1 = cols.signal5c1 ? (() => {
-    const display = signal5C1 ? `${signal5C1}` : '-'
-    const cls = signal5C1 ? getSignalClass5(signal5C1) : ''
-    return `<td class="cell-signal cell-signal-c1 ${cls}">${display}</td>`
-  })() : ''
-  
-  // STA 5GHz signals (remote - what STA receives from AP)
-  const staChains = getSTASignal5GHzChains(device)
-  const sta5Combined = getSTASignal5GHz(device)
-  const sta5Quality = device.radio_5ghz?.remote_signal_quality || device.radio_ltu?.remote_signal_quality || device.remote_signal_quality
-  const sta5C0 = staChains[0] || 0
-  const sta5C1 = staChains[1] || 0
-  
-  // STA 5GHz combined column
-  const colSta5Combined = cols.sta5 ? (() => {
-    const display = sta5Combined ? `${sta5Combined} dBm` : '-'
-    const cls = sta5Combined ? getSignalClassFromQuality(sta5Quality, sta5Combined, '5ghz') : ''
-    return `<td class="cell-signal cell-signal-sta5 ${cls}">${display}</td>`
-  })() : ''
-  
-  // STA 5GHz C0 column (no server quality for per-chain)
-  const colSta5C0 = cols.sta5c0 ? (() => {
-    const display = sta5C0 ? `${sta5C0}` : '-'
-    const cls = sta5C0 ? getSignalClass5(sta5C0) : ''
-    return `<td class="cell-signal cell-signal-sta-c0 ${cls}">${display}</td>`
-  })() : ''
-  
-  // STA 5GHz C1 column (no server quality for per-chain)
-  const colSta5C1 = cols.sta5c1 ? (() => {
-    const display = sta5C1 ? `${sta5C1}` : '-'
-    const cls = sta5C1 ? getSignalClass5(sta5C1) : ''
-    return `<td class="cell-signal cell-signal-sta-c1 ${cls}">${display}</td>`
-  })() : ''
-
-  // Directional diagnosis (DL/UL) - computed client-side from CINR/SNR/EVM if available
-  const colDir = cols.dir ? `<td class="cell-dir">${renderDirectionalCell(device)}</td>` : ''
-  
-  // Health column - signal bars for primary signal
-  const healthCol = cols.health ? (() => {
-    const primarySignal = signal60 || signal5Combined || 0
-    const band = signal60 ? '60ghz' : '5ghz'
-    return `<td class="cell-health">${getSignalBars(primarySignal, band)}</td>`
-  })() : ''
-  
-  // Site - escape for XSS protection
-  const siteName = escapeHTML(device.site_name || '-')
-  
-  // Distance
-  const distanceStr = device.distance ? `${(device.distance / 1000).toFixed(2)} km` : '-'
-  
-  // Capacity  
-  const capacity = device.capacity_60ghz || device.capacity_ltu || device.capacity_5ghz || 0
-  const capacityStr = capacity ? `${(capacity / 1e6).toFixed(0)} Mbps` : '-'
-  
-  // Firmware - use helper to extract clean version
-  const firmware = escapeHTML(getDisplayFirmware(device))
-  
-  // Escape all device-controlled attribute values
   const escapedIP = escapeAttr(device.ip_address || '')
-  const escapedMAC = escapeHTML(device.mac || '-')
-  const escapedProduct = escapeHTML(device.product || device.model || '-')
-  
   return `
-    <tr data-id="${device.id}" data-ip="${escapedIP}" class="${isSTA ? 'sta-row' : ''} ${device.managed ? 'managed-row' : ''} ${device.alertable === false ? 'not-alertable-row' : ''} ${store.selectedDevice === device.id ? 'selected' : ''}">
-      <td class="cell-checkbox"><input type="checkbox" data-id="${device.id}" ${store.isBulkSelected(device.id) ? 'checked' : ''} /></td>
-      ${cols.status !== false ? `<td class="cell-status"><span class="status-dot ${status}" title="${escapeAttr(store.getStatusReason(device) || '')}"></span></td>` : ''}
-      ${cols.name !== false ? `
-        <td class="cell-name">
-          ${isSTA ? '<span class="sta-indent">+-</span>' : ''}
-          <span class="device-name">${deviceName}</span>${directBadge}${managedStaBadge}${alertSilencedBadge}
-        </td>
-      ` : ''}
-      ${cols.ip !== false ? `<td class="cell-ip">${escapeHTML(device.ip_address || '-')}</td>` : ''}
-      ${cols.mac ? `<td class="cell-mac">${escapedMAC}</td>` : ''}
-      ${cols.product !== false ? `<td class="cell-product">${escapedProduct}</td>` : ''}
-      ${cols.site !== false ? `<td class="cell-site">${siteName}</td>` : ''}
-      ${cols.signal60 !== false ? `<td class="cell-signal cell-signal-60 ${signal60Class}">${signal60Display}</td>` : ''}
-      ${colSta60}
-      ${col5Combined}
-      ${col5C0}
-      ${col5C1}
-      ${colSta5Combined}
-      ${colSta5C0}
-      ${colSta5C1}
-      ${colDir}
-      ${healthCol}
-      ${cols.distance !== false ? `<td class="cell-distance">${distanceStr}</td>` : ''}
-      ${cols.capacity !== false ? `<td class="cell-capacity">${capacityStr}</td>` : ''}
-      ${cols.firmware !== false ? `<td class="cell-firmware">${firmware}</td>` : ''}
-      <td class="cell-actions">
-        <button class="btn btn-icon-xs btn-refresh" data-id="${device.id}" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>
-        <button class="btn btn-icon-xs btn-upgrade" data-id="${device.id}" title="Upgrade"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg></button>
-        <button class="btn btn-icon-xs btn-danger btn-delete" data-id="${device.id}" title="Delete"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></button>
-      </td>
+    <tr data-id="${device.id}" data-ip="${escapedIP}" class="${getDeviceRowClasses(device)}">
+      ${renderDeviceRowContent(device, cols)}
     </tr>
   `
+}
+
+export function refreshDeviceTableRow(deviceId) {
+  const id = Number(deviceId)
+  if (!Number.isFinite(id)) return false
+
+  const device = store.getDeviceById(id)
+  if (!device) return false
+
+  // In virtual mode, keep using its batching/update path.
+  if (virtualTableInstance) {
+    virtualTableInstance.updateById(id, {})
+    return true
+  }
+
+  const row = document.querySelector(`.devices-split-view .device-table tbody tr[data-id="${id}"]`)
+  if (!row) return false
+
+  const transient = ['highlighted', 'context-menu-target'].filter(cls => row.classList.contains(cls))
+  const active = document.activeElement
+  let focusSelector = null
+  if (active && row.contains(active)) {
+    if (active.matches('input[type="checkbox"][data-id]')) {
+      focusSelector = `input[type="checkbox"][data-id="${active.dataset.id}"]`
+    } else if (active.matches('button[data-id]')) {
+      const actionClass = ['btn-refresh', 'btn-upgrade', 'btn-delete'].find(cls => active.classList.contains(cls))
+      if (actionClass) focusSelector = `button.${actionClass}[data-id="${active.dataset.id}"]`
+    }
+  }
+
+  row.dataset.ip = device.ip_address || ''
+  row.className = getDeviceRowClasses(device)
+  transient.forEach(cls => row.classList.add(cls))
+  row.innerHTML = renderDeviceRowContent(device, store.columns)
+
+  const renderContainer = row.closest('.devices-split-view')?.parentElement || document.getElementById('app')
+  if (renderContainer) bindRegularRowActions(row, renderContainer)
+
+  if (focusSelector) row.querySelector(focusSelector)?.focus({ preventScroll: true })
+  return true
 }
 
 // Signal thresholds - must match app.js SIGNAL_THRESHOLDS and Go store.go

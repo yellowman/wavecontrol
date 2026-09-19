@@ -4247,13 +4247,13 @@ func (a *API) BatchConfig(w http.ResponseWriter, r *http.Request) {
 		switch key {
 		case "ssid":
 			v, ok := value.(string)
-			if !ok || strings.TrimSpace(v) == "" || len([]byte(v)) > 64 {
+			if !ok || strings.TrimSpace(v) == "" || len([]byte(v)) > 32 {
 				http.Error(w, "invalid ssid", http.StatusBadRequest)
 				return
 			}
 		case "channel":
 			v, ok := value.(float64)
-			if !ok || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			if !ok || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 || math.Trunc(v) != v {
 				http.Error(w, "invalid channel", http.StatusBadRequest)
 				return
 			}
@@ -4293,7 +4293,7 @@ func (a *API) BatchConfig(w http.ResponseWriter, r *http.Request) {
 			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": "not found"})
 			continue
 		}
-		if err := a.Firmware.ApplyConfig(deviceID, ip, username, password, req.Changes); err != nil {
+		if err := a.Firmware.ApplyConfigContext(r.Context(), deviceID, ip, username, password, req.Changes); err != nil {
 			results = append(results, map[string]any{"device_id": deviceID, "status": "failed", "error": err.Error()})
 			continue
 		}

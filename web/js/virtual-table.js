@@ -42,9 +42,11 @@ export class VirtualTable {
     // Optional with defaults
     this.rowHeight = options.rowHeight || 40
     this.bufferSize = options.bufferSize || 100
-    this.onRowClick = options.onRowClick    // (item, tr, event) => void
+    this.onRowClick = options.onRowClick
     this.getRowId = options.getRowId || (d => d.id)
     this.getRowIp = options.getRowIp || (d => d.ip_address)
+    this.getRowClass = options.getRowClass || (() => '')
+    this.emptyMessage = options.emptyMessage || 'No rows found'
     
     // Internal state
     this.data = []
@@ -59,11 +61,13 @@ export class VirtualTable {
     
     // DOM references (set in mount())
     this.wrapper = null
+    this.headerViewport = null
     this.headerTable = null
     this.scrollContainer = null
     this.spacer = null
     this.bodyTable = null
     this.tbody = null
+    this.emptyState = null
     
     // Row cache: id -> { element, index }
     this.rowCache = new Map()
@@ -103,25 +107,31 @@ export class VirtualTable {
     // Build DOM structure
     this.container.innerHTML = `
       <div class="virtual-table-wrapper">
-        <table class="device-table virtual-header-table">
-          <thead></thead>
-        </table>
+        <div class="virtual-header-viewport">
+          <table class="device-table virtual-header-table">
+            <thead></thead>
+          </table>
+        </div>
         <div class="virtual-scroll-container">
           <div class="virtual-spacer"></div>
           <table class="device-table virtual-body-table">
             <tbody></tbody>
           </table>
+          <div class="virtual-empty-state empty-state hidden"></div>
         </div>
       </div>
     `
     
     // Cache DOM references
     this.wrapper = this.container.querySelector('.virtual-table-wrapper')
+    this.headerViewport = this.container.querySelector('.virtual-header-viewport')
     this.headerTable = this.container.querySelector('.virtual-header-table')
     this.scrollContainer = this.container.querySelector('.virtual-scroll-container')
     this.spacer = this.container.querySelector('.virtual-spacer')
     this.bodyTable = this.container.querySelector('.virtual-body-table')
     this.tbody = this.container.querySelector('tbody')
+    this.emptyState = this.container.querySelector('.virtual-empty-state')
+    if (this.emptyState) this.emptyState.textContent = this.emptyMessage
     
     // Render header
     const thead = this.container.querySelector('thead')
@@ -198,6 +208,7 @@ export class VirtualTable {
     this.data = data || []
     this._rebuildIndexes()
     this._updateSpacerHeight()
+    this._syncEmptyState()
 
     // Data length changes can cause the vertical scrollbar to appear/disappear.
     // That changes scrollContainer.clientWidth without changing its border-box size,
@@ -234,6 +245,18 @@ export class VirtualTable {
     this._log('Spacer height set to', totalHeight)
   }
   
+  _syncEmptyState() {
+    if (!this.emptyState) return
+    this.emptyState.classList.toggle('hidden', this.data.length !== 0)
+  }
+
+  _syncRowClass(tr, item) {
+    if (!tr) return
+    const transient = ['highlighted', 'context-menu-target'].filter(cls => tr.classList.contains(cls))
+    tr.className = this.getRowClass(item) || ''
+    transient.forEach(cls => tr.classList.add(cls))
+  }
+
   _updateViewportHeight() {
     if (!this.scrollContainer) return
     
@@ -242,15 +265,23 @@ export class VirtualTable {
   }
 
   _syncHeaderWidth() {
-    if (!this.headerTable || !this.scrollContainer) return
+    if (!this.headerTable || !this.bodyTable || !this.scrollContainer) return
 
-    // clientWidth excludes the vertical scrollbar, which is exactly the width
-    // the body table is laid out against.
-    const w = this.scrollContainer.clientWidth
-    if (w && w > 0) {
-      this.headerTable.style.width = `${w}px`
-    } else {
-      this.headerTable.style.width = '100%'
+    const viewportWidth = this.scrollContainer.clientWidth
+    let minimumWidth = 0
+    this.headerTable.querySelectorAll('thead th').forEach(cell => {
+      const min = parseFloat(getComputedStyle(cell).minWidth)
+      if (Number.isFinite(min) && min > 0) minimumWidth += min
+    })
+
+    const tableWidth = Math.max(viewportWidth || 0, Math.ceil(minimumWidth))
+    const widthValue = tableWidth > 0 ? `${tableWidth}px` : '100%'
+    this.headerTable.style.width = widthValue
+    this.bodyTable.style.width = widthValue
+    if (this.spacer) this.spacer.style.width = widthValue
+    if (this.headerViewport) {
+      this.headerViewport.style.width = viewportWidth > 0 ? `${viewportWidth}px` : '100%'
+      this.headerViewport.scrollLeft = this.scrollContainer.scrollLeft
     }
   }
 
@@ -352,6 +383,7 @@ export class VirtualTable {
     
     tr.dataset.id = id
     if (ip) tr.dataset.ip = ip
+    this._syncRowClass(tr, item)
     
     // Set styles inline - faster than multiple style assignments
     tr.style.cssText = 'position:absolute;top:0;left:0;right:0;height:' + this.rowHeight + 'px;transform:translateY(' + yPos + 'px)'
@@ -407,8 +439,19 @@ export class VirtualTable {
     for (const [id, item] of this.pendingUpdates) {
       const cached = this.rowCache.get(id)
       if (cached) {
-        // Re-render row content
+        const active = document.activeElement
+        let focusSelector = null
+        if (active && cached.element.contains(active)) {
+          if (active.matches('input[type="checkbox"][data-id]')) {
+            focusSelector = `input[type="checkbox"][data-id="${active.dataset.id}"]`
+          } else if (active.matches('button[data-id]')) {
+            const actionClass = ['btn-refresh', 'btn-upgrade', 'btn-delete'].find(cls => active.classList.contains(cls))
+            if (actionClass) focusSelector = `button.${actionClass}[data-id="${active.dataset.id}"]`
+          }
+        }
         cached.element.innerHTML = this.renderRow(item)
+        this._syncRowClass(cached.element, item)
+        if (focusSelector) cached.element.querySelector(focusSelector)?.focus({ preventScroll: true })
       }
     }
     this.pendingUpdates.clear()
@@ -419,7 +462,11 @@ export class VirtualTable {
   // ===========================================================================
   
   _onScroll() {
-    // Use RAF to batch scroll handling - prevents multiple renders per frame
+    // Horizontal movement must track immediately so the fixed header stays
+    // aligned with the body. Vertical row recycling remains RAF-batched.
+    if (this.headerViewport) {
+      this.headerViewport.scrollLeft = this.scrollContainer.scrollLeft
+    }
     if (this._scrollRAF) return
     this._scrollRAF = requestAnimationFrame(() => {
       this._scrollRAF = null
@@ -438,6 +485,13 @@ export class VirtualTable {
   // PUBLIC METHODS
   // ===========================================================================
   
+  refreshRowClasses() {
+    for (const [id, cached] of this.rowCache) {
+      const item = this.dataById.get(id)
+      if (item) this._syncRowClass(cached.element, item)
+    }
+  }
+
   scrollToId(id) {
     const item = this.dataById.get(id)
     if (!item || !this.scrollContainer) return false
@@ -454,6 +508,7 @@ export class VirtualTable {
     this.scrollContainer.scrollTop = Math.max(0, targetY)
     this.scrollTop = this.scrollContainer.scrollTop
     this._renderViewport()
+    this.refreshRowClasses()
     
     // The target row is now in the rendered buffer. Highlight on the next frame
     // so the scroll position is painted before the animation begins.

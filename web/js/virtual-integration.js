@@ -9,7 +9,7 @@
 // 4. Re-exports VirtualTable class
 //
 
-import { VirtualTable } from './virtual-table.js?v=7'
+import { VirtualTable } from './virtual-table.js?v=9'
 import { store } from './store.js?v=17'
 
 // Re-export for components.js
@@ -50,9 +50,13 @@ export function setVirtualTableRef(vt) {
 // Scroll to and highlight a device by ID in the virtual table
 export function scrollToDeviceById(id) {
   if (virtualTableRef && typeof virtualTableRef.scrollToId === 'function') {
-    return virtualTableRef.scrollToId(id)  // Returns true if found and scrolled
+    return virtualTableRef.scrollToId(id)
   }
   return false
+}
+
+export function refreshVirtualRowClasses() {
+  virtualTableRef?.refreshRowClasses?.()
 }
 
 const wsBatcher = {
@@ -68,6 +72,9 @@ const wsBatcher = {
   countsTimer: null,
   lastCountsAt: 0,
   countsMinIntervalMs: 1000,
+  derivedTimer: null,
+  lastDerivedAt: 0,
+  derivedMinIntervalMs: 500,
   
   add(id, updates) {
     if (id === undefined || id === null) return
@@ -102,6 +109,7 @@ const wsBatcher = {
     }
     
     this.pending.clear()
+    scheduleVirtualBatchFlushCallback(this)
 
     // Trigger counts update (throttled)
     if (this.countsDirty && typeof updateCountsCallback === 'function') {
@@ -131,6 +139,24 @@ export { wsBatcher }
 let updateCountsCallback = null
 export function setUpdateCountsCallback(fn) {
   updateCountsCallback = fn
+}
+
+let virtualBatchFlushCallback = null
+export function setVirtualBatchFlushCallback(fn) {
+  virtualBatchFlushCallback = fn
+}
+
+function scheduleVirtualBatchFlushCallback(state) {
+  if (typeof virtualBatchFlushCallback !== 'function') return
+  const now = Date.now()
+  const elapsed = now - (state.lastDerivedAt || 0)
+  const run = () => {
+    state.lastDerivedAt = Date.now()
+    state.derivedTimer = null
+    try { virtualBatchFlushCallback() } catch (e) {}
+  }
+  if (elapsed >= state.derivedMinIntervalMs) run()
+  else if (!state.derivedTimer) state.derivedTimer = setTimeout(run, state.derivedMinIntervalMs - elapsed)
 }
 
 // Allow other modules (e.g. components.js) to trigger a counts refresh
@@ -298,7 +324,7 @@ export function getSortedFilteredDevices() {
       grouped.push(d)
       const kids = childrenByParent.get(d.id)
       if (kids && kids.length) {
-        // Maintain insertion order (AP, then its STAs)
+        kids.sort((a, b) => (a.hostname || '').localeCompare(b.hostname || ''))
         for (let k = 0; k < kids.length; k++) {
           grouped.push(kids[k])
         }
