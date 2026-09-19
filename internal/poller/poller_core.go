@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lib/pq"
 	"github.com/yellowman/wavecontrol/internal/secrets"
 	"github.com/yellowman/wavecontrol/internal/stats"
 	"github.com/yellowman/wavecontrol/internal/udebug"
@@ -471,49 +470,61 @@ func (p *Poller) getDeviceStatus(ip string, unreachable bool) string {
 	return "unknown"
 }
 
-// batchSyncToDB syncs last_seen and status to database periodically
-// This provides persistence for crash recovery without per-poll DB writes
-func (p *Poller) batchSyncToDB() {
+// syncLastSeenToDB persists only a coarse "last available" marker.
+// Real-time status is memory-only. This runs infrequently so the devices
+// inventory table does not become a telemetry write stream.
+func (p *Poller) syncLastSeenToDB() {
 	lastSeenBatch := p.store.LastSeenBatch()
-	statusBatch := p.store.OnlineStatusBatch()
-
 	if len(lastSeenBatch) == 0 {
 		return
 	}
 
-	// Build batch update - one query for online, one for offline
-	onlineMACs := make([]string, 0)
-	offlineMACs := make([]string, 0)
-
-	for mac, online := range statusBatch {
-		if online {
-			onlineMACs = append(onlineMACs, mac)
-		} else {
-			offlineMACs = append(offlineMACs, mac)
+	type checkpoint struct {
+		mac      string
+		lastSeen time.Time
+	}
+	checkpoints := make([]checkpoint, 0, len(lastSeenBatch))
+	for mac, lastSeen := range lastSeenBatch {
+		mac = strings.ToLower(strings.TrimSpace(mac))
+		if mac == "" || lastSeen.IsZero() {
+			continue
 		}
+		checkpoints = append(checkpoints, checkpoint{mac: mac, lastSeen: lastSeen})
+	}
+	if len(checkpoints) == 0 {
+		return
 	}
 
-	// Update online devices
-	if len(onlineMACs) > 0 {
-		_, err := dbExecCtx(p.db, dbCtxForOp("batch_sync_last_seen"), `UPDATE devices SET last_seen = NOW() WHERE mac = ANY($1)`, pq.Array(onlineMACs))
-		if err != nil {
-			p.logDebug("batchSyncToDB: online update failed: %v", err)
+	// Two bind parameters per row. Keep statements comfortably below
+	// PostgreSQL's 65535-parameter limit.
+	const chunkSize = 2000
+	for start := 0; start < len(checkpoints); start += chunkSize {
+		end := start + chunkSize
+		if end > len(checkpoints) {
+			end = len(checkpoints)
+		}
+
+		values := make([]string, 0, end-start)
+		args := make([]any, 0, (end-start)*2)
+		for _, cp := range checkpoints[start:end] {
+			args = append(args, cp.mac, cp.lastSeen)
+			values = append(values, fmt.Sprintf("($%d::text, $%d::timestamptz)", len(args)-1, len(args)))
+		}
+
+		query := `
+			UPDATE devices AS d
+			SET last_seen = v.last_seen
+			FROM (VALUES ` + strings.Join(values, ",") + `) AS v(mac, last_seen)
+			WHERE lower(d.mac) = v.mac
+			  AND v.last_seen > COALESCE(d.last_seen, TIMESTAMP 'epoch')
+			  AND (d.last_seen IS NULL OR d.last_seen < NOW() - INTERVAL '55 minutes')
+		`
+		if _, err := dbExecCtx(p.db, dbCtxForOp("sync_last_seen"), query, args...); err != nil {
+			p.logDebug("syncLastSeenToDB: chunk %d-%d failed: %v", start, end, err)
+			return
 		}
 	}
-
-	// Update offline devices (with their actual last_seen time from memory)
-	// This is more complex - we need individual updates or a CTE
-	// For simplicity, we'll just ensure status is correct
-	// Important: only transition from 'online' to 'offline', not from 'unknown' to 'offline'
-	// Devices with 'unknown' status responded somehow (e.g., auth failed) so they're reachable
-	if len(offlineMACs) > 0 {
-		_, err := dbExecCtx(p.db, dbCtxForOp("batch_sync_mark_offline"), `UPDATE devices SET status = 'offline' WHERE mac = ANY($1) AND status = 'online'`, pq.Array(offlineMACs))
-		if err != nil {
-			p.logDebug("batchSyncToDB: offline update failed: %v", err)
-		}
-	}
-
-	p.logDebug("batchSyncToDB: synced %d online, %d offline devices", len(onlineMACs), len(offlineMACs))
+	p.logDebug("syncLastSeenToDB: checkpointed %d in-memory last-seen values", len(checkpoints))
 }
 
 // cleanCircuitBreakers removes old entries
@@ -557,18 +568,20 @@ func (p *Poller) Start(ctx context.Context) {
 	// Initial poll
 	p.pollAllDevices()
 
-	// Main poll loop with dynamic interval support
+	// Main poll loop with dynamic interval support.
 	ticker := time.NewTicker(p.cfgSnapshot().interval)
 	defer ticker.Stop()
+	lastSeenTicker := time.NewTicker(time.Hour)
+	defer lastSeenTicker.Stop()
 
-	// Cleanup stale STAs every 5 poll cycles, circuit breakers every 10, DB sync every 20
+	// Cleanup stale STAs every 5 poll cycles and circuit breakers every 10.
 	cleanupCounter := 0
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Final sync before shutdown
-			p.batchSyncToDB()
+			// One final coarse availability sync before shutdown.
+			p.syncLastSeenToDB()
 			close(p.jobs)
 			p.wg.Wait()
 			return
@@ -576,6 +589,8 @@ func (p *Poller) Start(ctx context.Context) {
 			// Reset ticker with new interval
 			ticker.Reset(newInterval)
 			p.logDebug("Poll interval changed to %v", newInterval)
+		case <-lastSeenTicker.C:
+			p.syncLastSeenToDB()
 		case <-ticker.C:
 			p.pollAllDevices()
 
@@ -589,11 +604,6 @@ func (p *Poller) Start(ctx context.Context) {
 			// Clean circuit breakers every 10 cycles (~5 min)
 			if cleanupCounter%10 == 0 {
 				p.cleanCircuitBreakers()
-			}
-			// Batch sync last_seen to DB every 20 cycles (~10 min)
-			// This provides persistence without per-poll writes
-			if cleanupCounter%20 == 0 {
-				p.batchSyncToDB()
 			}
 		}
 	}

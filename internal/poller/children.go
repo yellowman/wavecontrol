@@ -12,25 +12,22 @@ import (
 	"github.com/yellowman/wavecontrol/internal/websocket"
 )
 
-// updateChildrenStatus updates status of all STAs associated with an AP.
-// Database, in-memory stats, and WebSocket state are updated from the same
-// RETURNING rows so the application cannot present contradictory child status.
+// updateChildrenStatus updates live status of all STAs associated with an AP.
+// PostgreSQL supplies stable identity/hierarchy only; operational status stays
+// in the in-memory stats store and is broadcast over WebSocket.
 func (p *Poller) updateChildrenStatus(apID int64, status string) {
 	reason := ""
 	if status != string(stats.StatusOnline) {
 		reason = "parent_" + status
 	}
 	rows, err := p.db.Query(`
-		UPDATE devices
-		SET status = $1,
-		    status_reason = NULLIF($2, '')
-		WHERE parent_id = $3
+		SELECT id, COALESCE(lower(mac), ''), COALESCE(host(ip_address), ''), COALESCE(site_id, 0)
+		FROM devices
+		WHERE parent_id = $1
 		  AND role = 'sta'
-		  AND (status IS DISTINCT FROM $1 OR status_reason IS DISTINCT FROM NULLIF($2, ''))
-		RETURNING id, COALESCE(lower(mac), ''), COALESCE(host(ip_address), ''), COALESCE(site_id, 0)
-	`, status, reason, apID)
+	`, apID)
 	if err != nil {
-		p.logDebug("updateChildrenStatus: failed to update children of AP %d: %v", apID, err)
+		p.logDebug("updateChildrenStatus: failed to load children of AP %d: %v", apID, err)
 		return
 	}
 	defer rows.Close()
@@ -57,9 +54,10 @@ func (p *Poller) updateChildrenStatus(apID int64, status string) {
 		p.logDebug("updateChildrenStatus: iterate children of AP %d: %v", apID, err)
 	}
 	if count > 0 {
-		p.logDebug("updateChildrenStatus: updated %d children of AP %d to status '%s'", count, apID, status)
+		p.logDebug("updateChildrenStatus: updated live state for %d children of AP %d to '%s'", count, apID, status)
 	}
 }
+
 func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges map[string]string) {
 	// Get AP's MAC, site_id, SSID and platform for inheritance
 	var apMAC sql.NullString
@@ -253,10 +251,7 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 							parent_mac = $8,
 							ssid = COALESCE(NULLIF($9, ''), ssid),
 							role = 'sta',
-							site_id = NULL,
-							status = 'online',
-							status_reason = NULL,
-							last_seen = NOW()
+							site_id = NULL
 						WHERE lower(mac) = $10
 					`, newIP, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, peerMAC)
 				} else {
@@ -271,10 +266,7 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 							parent_mac = $7,
 							ssid = COALESCE(NULLIF($8, ''), ssid),
 							role = 'sta',
-							site_id = NULL,
-							status = 'online',
-							status_reason = NULL,
-							last_seen = NOW()
+							site_id = NULL
 						WHERE lower(mac) = $9
 					`, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, peerMAC)
 				}
@@ -300,10 +292,7 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 							parent_mac = $8,
 							ssid = COALESCE(NULLIF($9, ''), ssid),
 							site_id = COALESCE(site_id, $10),
-							role = 'sta',
-							status = 'online',
-							status_reason = NULL,
-							last_seen = NOW()
+							role = 'sta'
 						WHERE lower(mac) = $11
 					`, newIP, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, newSiteID, peerMAC)
 				} else {
@@ -318,11 +307,20 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 							parent_mac = $7,
 							ssid = COALESCE(NULLIF($8, ''), ssid),
 							site_id = COALESCE(site_id, $9),
-							role = 'sta',
-							status = 'online',
-							status_reason = NULL,
-							last_seen = NOW()
+							role = 'sta'
 						WHERE lower(mac) = $10
+						  AND (
+							hostname IS DISTINCT FROM COALESCE(NULLIF($1, ''), hostname)
+							OR model IS DISTINCT FROM COALESCE(NULLIF($2, ''), model)
+							OR platform IS DISTINCT FROM COALESCE(NULLIF($3, ''), platform)
+							OR flavor IS DISTINCT FROM COALESCE(NULLIF($4, ''), flavor)
+							OR firmware IS DISTINCT FROM COALESCE(NULLIF($5, ''), firmware)
+							OR parent_id IS DISTINCT FROM $6
+							OR parent_mac IS DISTINCT FROM $7
+							OR ssid IS DISTINCT FROM COALESCE(NULLIF($8, ''), ssid)
+							OR site_id IS DISTINCT FROM COALESCE(site_id, $9)
+							OR role IS DISTINCT FROM 'sta'
+						  )
 					`, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, newSiteID, peerMAC)
 				}
 			}
@@ -393,8 +391,8 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 			ctx := dbCtxForMAC(peerMAC, staHost, "sta_upsert", 0)
 			if ipChanged {
 				err = dbQueryRowCtx(p.db, ctx, `
-					INSERT INTO devices (mac, ip_address, hostname, model, platform, flavor, firmware, parent_id, parent_mac, ssid, site_id, role, alertable, status, status_reason, last_seen)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'sta', FALSE, 'online', NULL, NOW())
+					INSERT INTO devices (mac, ip_address, hostname, model, platform, flavor, firmware, parent_id, parent_mac, ssid, site_id, role, alertable, last_seen)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'sta', FALSE, NOW())
 					ON CONFLICT (mac) DO UPDATE SET
 							ip_address = CASE WHEN devices.role = 'ap' THEN devices.ip_address ELSE EXCLUDED.ip_address END,
 							hostname = CASE WHEN devices.role = 'ap' THEN devices.hostname ELSE COALESCE(NULLIF(EXCLUDED.hostname, ''), devices.hostname) END,
@@ -406,16 +404,13 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 							parent_mac = CASE WHEN devices.role = 'ap' THEN NULL ELSE EXCLUDED.parent_mac END,
 							ssid = CASE WHEN devices.role = 'ap' THEN devices.ssid ELSE COALESCE(NULLIF(EXCLUDED.ssid, ''), devices.ssid) END,
 							site_id = CASE WHEN devices.role = 'ap' THEN devices.site_id ELSE COALESCE(devices.site_id, EXCLUDED.site_id) END,
-							role = CASE WHEN devices.role = 'ap' THEN devices.role ELSE 'sta' END,
-							status = CASE WHEN devices.role = 'ap' THEN devices.status ELSE 'online' END,
-							status_reason = CASE WHEN devices.role = 'ap' THEN devices.status_reason ELSE NULL END,
-							last_seen = CASE WHEN devices.role = 'ap' THEN devices.last_seen ELSE NOW() END
+							role = CASE WHEN devices.role = 'ap' THEN devices.role ELSE 'sta' END
 					RETURNING id, (xmax = 0) AS inserted
 				`, []any{&newID, &inserted}, peerMAC, newIP, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, apSiteID)
 			} else {
 				err = dbQueryRowCtx(p.db, ctx, `
-					INSERT INTO devices (mac, ip_address, hostname, model, platform, flavor, firmware, parent_id, parent_mac, ssid, site_id, role, alertable, status, status_reason, last_seen)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'sta', FALSE, 'online', NULL, NOW())
+					INSERT INTO devices (mac, ip_address, hostname, model, platform, flavor, firmware, parent_id, parent_mac, ssid, site_id, role, alertable, last_seen)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'sta', FALSE, NOW())
 					ON CONFLICT (mac) DO UPDATE SET
 							hostname = CASE WHEN devices.role = 'ap' THEN devices.hostname ELSE COALESCE(NULLIF(EXCLUDED.hostname, ''), devices.hostname) END,
 							model = CASE WHEN devices.role = 'ap' THEN devices.model ELSE COALESCE(NULLIF(EXCLUDED.model, ''), devices.model) END,
@@ -426,10 +421,7 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 							parent_mac = CASE WHEN devices.role = 'ap' THEN NULL ELSE EXCLUDED.parent_mac END,
 							ssid = CASE WHEN devices.role = 'ap' THEN devices.ssid ELSE COALESCE(NULLIF(EXCLUDED.ssid, ''), devices.ssid) END,
 							site_id = CASE WHEN devices.role = 'ap' THEN devices.site_id ELSE COALESCE(devices.site_id, EXCLUDED.site_id) END,
-							role = CASE WHEN devices.role = 'ap' THEN devices.role ELSE 'sta' END,
-							status = CASE WHEN devices.role = 'ap' THEN devices.status ELSE 'online' END,
-							status_reason = CASE WHEN devices.role = 'ap' THEN devices.status_reason ELSE NULL END,
-							last_seen = CASE WHEN devices.role = 'ap' THEN devices.last_seen ELSE NOW() END
+							role = CASE WHEN devices.role = 'ap' THEN devices.role ELSE 'sta' END
 					RETURNING id, (xmax = 0) AS inserted
 				`, []any{&newID, &inserted}, peerMAC, ipToStore, hostname, model, plat, flv, fw, apID, apMAC.String, ssid, apSiteID)
 			}
@@ -484,21 +476,17 @@ func (p *Poller) updateSTAsInDB(apID int64, peers []*stats.PeerStats, ipChanges 
 }
 
 func (p *Poller) markMissingSTAsOffline(apID int64, associatedMACs []string) {
-	// Use a case-insensitive match for safety when legacy rows have uppercase MACs.
-	// An empty list reaches this function only after the empty-snapshot debounce has
-	// confirmed two consecutive authoritative empty AP responses.
+	// Missing association is transient operational state. Query stable child
+	// identities but do not write status back to the inventory table.
 	rows, err := p.db.Query(`
-		UPDATE devices
-		SET status = 'offline',
-		    status_reason = 'not_associated'
+		SELECT id, COALESCE(lower(mac), ''), COALESCE(host(ip_address), ''), COALESCE(site_id, 0)
+		FROM devices
 		WHERE parent_id = $1
 		  AND role = 'sta'
 		  AND NOT (lower(mac) = ANY($2::text[]))
-		  AND (status IS DISTINCT FROM 'offline' OR status_reason IS DISTINCT FROM 'not_associated')
-		RETURNING id, COALESCE(lower(mac), ''), COALESCE(host(ip_address), ''), COALESCE(site_id, 0)
 	`, apID, pq.Array(associatedMACs))
 	if err != nil {
-		logDBExecError(dbCtxForDevice(apID, "mark_missing_stas_offline"), err, "UPDATE devices ... RETURNING", []any{apID, associatedMACs}, nil)
+		logDBExecError(dbCtxForDevice(apID, "mark_missing_stas_offline"), err, "SELECT child devices", []any{apID, associatedMACs}, nil)
 		return
 	}
 	defer rows.Close()
@@ -511,8 +499,8 @@ func (p *Poller) markMissingSTAsOffline(apID int64, associatedMACs []string) {
 			continue
 		}
 		p.store.BindIdentityByMAC(mac, ip, int(id), siteID)
-		p.store.SetStatusByMAC(mac, ip, stats.StatusOffline, "not_associated", "", false)
-		if p.wsHub != nil {
+		_, changed := p.store.SetStatusByMACChanged(mac, ip, stats.StatusOffline, "not_associated", "", false)
+		if changed && p.wsHub != nil {
 			p.wsHub.BroadcastDeviceUpdate(int(id), ip, map[string]any{
 				"id": id, "status": "offline", "db_status": "offline", "status_reason": "not_associated",
 			})
@@ -521,4 +509,5 @@ func (p *Poller) markMissingSTAsOffline(apID int64, associatedMACs []string) {
 	if err := rows.Err(); err != nil {
 		p.logDebug("markMissingSTAsOffline: iterate children of AP %d: %v", apID, err)
 	}
+
 }

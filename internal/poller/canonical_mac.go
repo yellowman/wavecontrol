@@ -171,8 +171,7 @@ func (p *Poller) handleMACMismatch(job pollJob, api string, observed []string) p
 		})
 	}
 
-	// Persist status_reason to DB, but do NOT touch last_seen.
-	dbExecIgnoreCtx(p.db, dbCtxForJob(job, api+"_mac_mismatch"), `UPDATE devices SET status = 'unknown', status_reason = $2 WHERE id = $1`, job.DeviceID, "mac_mismatch")
+	// Persist durable mismatch evidence, not runtime status.
 	p.persistIdentityMismatch(job, api, expected, observed, errMsg)
 	p.updateChildrenStatus(job.DeviceID, "unknown")
 

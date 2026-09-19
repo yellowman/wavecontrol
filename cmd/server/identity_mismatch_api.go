@@ -130,13 +130,13 @@ func (a *API) LearnDeviceMAC(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	var oldMAC, ipAddr, statusReason, role, hostname sql.NullString
+	var oldMAC, ipAddr, role, hostname sql.NullString
 	var parentID sql.NullInt64
 	err = tx.QueryRowContext(r.Context(), `
-		SELECT lower(mac), host(ip_address), status_reason, role, hostname, parent_id
+		SELECT lower(mac), host(ip_address), role, hostname, parent_id
 		FROM devices
 		WHERE id = $1
-		FOR UPDATE`, id).Scan(&oldMAC, &ipAddr, &statusReason, &role, &hostname, &parentID)
+		FOR UPDATE`, id).Scan(&oldMAC, &ipAddr, &role, &hostname, &parentID)
 	if err == sql.ErrNoRows {
 		http.Error(w, "device not found", http.StatusNotFound)
 		return
@@ -164,14 +164,6 @@ func (a *API) LearnDeviceMAC(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if !strings.EqualFold(statusReason.String, "mac_mismatch") {
-		writeJSONStatus(w, http.StatusConflict, map[string]any{
-			"error":         "device_not_in_mac_mismatch",
-			"status_reason": statusReason.String,
-		})
 		return
 	}
 
@@ -252,7 +244,7 @@ func (a *API) LearnDeviceMAC(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := tx.ExecContext(r.Context(), `
 		UPDATE devices
-		SET mac = $2, status = 'unknown', status_reason = NULL, updated_at = NOW()
+		SET mac = $2, updated_at = NOW()
 		WHERE id = $1`, id, newCanon); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

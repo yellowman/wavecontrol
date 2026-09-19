@@ -804,64 +804,63 @@ func (p *Poller) discoverSTAs(apIP string, creds Credentials) ([]STAInfo, error)
 // 4. Sleep until next interval
 ```
 
-### State-Transition Database Pattern
+### Inventory-Only Device Database Pattern
 
-**Principle**: Database writes only occur on state changes, not on every poll cycle.
+**Principle**: the `devices` table is durable inventory/configuration, not a telemetry store.
 
-This pattern dramatically reduces database I/O - with 5000 devices at 30-second polls, this eliminates ~600,000 unnecessary writes per hour.
+Live availability, status reasons, uptime, CPU/RAM/temperature, radio metrics, peer
+association state, counters, and other polling results live in the in-memory stats
+store and are broadcast over WebSocket. A process restart intentionally starts device
+status at `unknown` until fresh polls arrive; stale database status must never be
+used as a fallback.
 
-#### What Triggers a Database Write
+#### What Triggers a `devices` Row Write
 
 | Event | Database Action |
 |-------|-----------------|
-| Device comes online (was offline/unknown) | `UPDATE status='online', last_seen=NOW()` |
-| Device goes offline (was online) | `UPDATE status='offline', last_seen=NOW()` |
-| Hostname changes | `UPDATE hostname=?` |
-| Firmware changes | `UPDATE firmware=?, firmware_version=?` |
-| Other static info changes | Update via `IS DISTINCT FROM` check |
+| Device/IP/MAC identity changes | Update the changed inventory field |
+| Parent AP / SSID / role changes | Update durable hierarchy/configuration |
+| Hostname/model/platform/flavor/firmware changes | Update only when `IS DISTINCT FROM` the stored value |
+| Site / operator configuration changes | Persist the operator-owned value |
+| Device first discovered | Insert its inventory row |
+| Coarse availability checkpoint | Batch-update `last_seen` at most about once per hour |
 
-#### What Does NOT Trigger a Database Write
+#### What Does NOT Trigger a `devices` Row Write
 
 | Event | Where Data Lives |
 |-------|------------------|
-| Successful poll (device already online) | Memory store only |
-| Stats refresh (CPU, memory, signal, rates) | Memory store only |
-| Peer list update | Memory store only |
-| Real-time counters | Memory store only |
+| Online/offline/unknown transition | In-memory stats store + WebSocket |
+| Status reason / poll error | In-memory stats store + WebSocket |
+| Successful poll | In-memory stats store |
+| CPU, RAM, temperature, uptime | In-memory stats store |
+| Signal, rates, capacity, MCS, airtime | In-memory stats store |
+| Peer association/disassociation | In-memory stats store + WebSocket |
+| Firmware upgrade runtime state | Job records + in-memory/WebSocket state |
 
-#### Implementation Pattern
+The legacy `devices.status` and `devices.status_reason` columns remain only for schema
+compatibility. Polling code must not read or write them.
 
-```go
-// Update memory store - returns true if state changed (offline->online)
-becameOnline := store.Update(ip, deviceStats)
+#### Coarse Last-Available Persistence
 
-// Only write to DB on state transition
-if becameOnline {
-    db.Exec(`UPDATE devices SET status = 'online', last_seen = NOW() WHERE id = $1`, deviceID)
-}
+`last_seen` is the one polling-derived value retained in `devices`. It is deliberately
+low-frequency: an hourly wall-clock task takes the in-memory last-seen snapshot and
+performs one batch update using each device's actual in-memory timestamp. Rows whose
+durable timestamp was updated within roughly the previous hour are skipped; an offline
+device can therefore eventually persist its exact final availability time without any
+per-poll writes.
 
-// For failures - SetOffline returns true if state changed (online->offline)
-becameOffline := store.SetOffline(ip, errorMessage)
-if becameOffline {
-    db.Exec(`UPDATE devices SET status = 'offline', last_seen = NOW() WHERE id = $1`, deviceID)
-}
-```
+This keeps a useful "last available" marker across restarts without turning PostgreSQL
+or its WAL into a 30-second telemetry sink. The live API may return a newer in-memory
+`last_seen` while the process is running without persisting it immediately.
 
-#### Periodic Batch Sync
+This rule applies uniformly to Wave, LTU, airMAX AC/M, and AirFiber.
 
-For crash recovery, a periodic batch sync runs every ~10 minutes:
-- Syncs `last_seen` timestamps to database
-- Ensures `status` column matches memory state
-- Single bulk query instead of per-device writes
-
-```go
-// Every 20 poll cycles (~10 min at 30s interval)
-if cleanupCounter%20 == 0 {
-    p.batchSyncToDB()
-}
-```
-
-This pattern applies uniformly to all device types: Wave, LTU, airMAX AC/M, AirFiber.
+**GPS persistence:** poller-learned AirMAX GPS coordinates are fill-once inventory.
+Once durable `gps_lat/gps_lon` are populated, ordinary polling does not rewrite
+them for GPS jitter or physical relocation. While the process is running, the API
+overlays current live GPS from memory. After a restart, the durable coordinates
+are shown until a successful poll provides the live overlay. Durable location
+changes should be explicit inventory actions rather than telemetry side effects.
 
 ### Device Identification
 
@@ -887,7 +886,7 @@ To prevent this, the poller enforces a **canonical MAC** per poll job:
   - Other observed MACs are informational and are included in logs/context.
 - If the device returns a MAC candidate set and **none match the expected/job MAC**, wavecontrol treats this as a data quality issue:
   - Do **not** apply the stats/peers update to the expected device
-  - Mark the expected device `status=unknown`, `status_reason=mac_mismatch`
+  - Mark the expected device unknown with reason `mac_mismatch` **in memory/WebSocket state only**
   - Do **not** advance `last_seen` for the expected device (we did not see it)
   - Persist `device_identity_mismatches` with expected MAC, observed MAC candidates, observed IP, source, timestamp, and last error
   - Broadcast a WebSocket patch containing `identity_mismatch` context for the selected detail pane
@@ -900,12 +899,12 @@ A MAC mismatch is never auto-healed. AP or directly managed STA replacement must
 The operator may resolve a confirmed AP or managed STA swap through `POST /api/wavecontrol/devices/{id}/learn-mac`. The server must:
 
 1. Require editor/administrator permission.
-2. Verify the device is still in `status_reason=mac_mismatch`.
-3. Verify a persisted identity-mismatch row exists for the device.
+2. Verify a persisted `device_identity_mismatches` row exists for the device.
+3. Verify its expected MAC still matches the current inventory MAC.
 4. Verify the requested new MAC is one of the observed MAC candidates.
 5. Verify the observed IP still matches the device row IP.
 6. Reject the request if the observed MAC already exists on another device row.
-7. Update the device MAC, clear mismatch state, remove stale in-memory stats, write changelog, broadcast a WebSocket patch, and queue a refresh. For AP rows only, rewrite child `parent_mac` references from the old AP MAC to the new AP MAC; for STA rows, keep the AP association unchanged.
+7. Update the device MAC, clear the mismatch record and stale in-memory stats, write changelog, broadcast a WebSocket patch, and queue a refresh. For AP rows only, rewrite child `parent_mac` references from the old AP MAC to the new AP MAC; for STA rows, keep the AP association unchanged.
 
 #### Identification Flow
 

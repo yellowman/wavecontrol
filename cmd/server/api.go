@@ -421,7 +421,7 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 		       d.hostname, d.product, d.model, d.platform, d.flavor, d.firmware, d.firmware_version,
 		       d.parent_id,
 		       lower(d.parent_mac) AS parent_mac,
-		       d.status, d.status_reason, d.last_seen, d.role, d.managed, d.alertable, d.alert_silenced_until, d.alert_notes, d.ssid, d.frequency, d.channel_width, d.gps_lat, d.gps_lon,
+		       d.last_seen, d.role, d.managed, d.alertable, d.alert_silenced_until, d.alert_notes, d.ssid, d.frequency, d.channel_width, d.gps_lat, d.gps_lon,
 		       d.antenna_model, d.antenna_override, d.antenna_azimuth_deg, d.antenna_downtilt_deg, d.antenna_electrical_downtilt_deg, d.antenna_beamwidth_h_deg, d.antenna_beamwidth_v_deg,
 		       d.radius_m, d.tech, d.down_mbps, d.up_mbps, d.latency_ms, d.bizres,
 		       d.site_id, s.name as site_name, r.name as region_name
@@ -441,7 +441,7 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var id int64
-		var mac, ipAddr, hostname, product, model, platform, flavor, fw, fwVer, parentMAC, dbStatus, dbStatusReason, role, ssid sql.NullString
+		var mac, ipAddr, hostname, product, model, platform, flavor, fw, fwVer, parentMAC, role, ssid sql.NullString
 		var managed, alertable bool
 		var alertSilencedUntil sql.NullTime
 		var alertNotes sql.NullString
@@ -457,7 +457,7 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 		var tech sql.NullInt64
 		var bizres sql.NullString
 		if rows.Scan(&id, &mac, &ipAddr, &hostname, &product, &model, &platform, &flavor, &fw, &fwVer,
-			&parentID, &parentMAC, &dbStatus, &dbStatusReason, &lastSeen, &role, &managed, &alertable, &alertSilencedUntil, &alertNotes, &ssid, &frequency, &channelWidth, &gpsLat, &gpsLon,
+			&parentID, &parentMAC, &lastSeen, &role, &managed, &alertable, &alertSilencedUntil, &alertNotes, &ssid, &frequency, &channelWidth, &gpsLat, &gpsLon,
 			&antennaModel, &antennaOverride, &antennaAzimuthDeg, &antennaDowntiltDeg, &antennaElectricalDowntiltDeg, &antennaBeamH, &antennaBeamV,
 			&radiusM, &tech, &downMbps, &upMbps, &latencyMS, &bizres,
 			&siteID, &siteName, &regionName) != nil {
@@ -469,12 +469,12 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 		d := map[string]any{"id": id, "mac": mac.String, "ip_address": ipHost, "hostname": hostname.String,
 			"product": product.String, "model": model.String, "platform": platform.String, "flavor": flavor.String,
 			"firmware": fw.String, "firmware_version": fwVer.String,
-			// Persisted DB status (source of truth when we have no live stats)
-			"db_status":        dbStatus.String,
-			"db_status_reason": dbStatusReason.String,
-			// Live/computed status defaults to DB status and may be overridden below
-			"status":        dbStatus.String,
-			"status_reason": dbStatusReason.String,
+			// Runtime status is memory-only. db_status remains a browser
+			// compatibility alias and is never loaded from PostgreSQL.
+			"db_status":        "unknown",
+			"db_status_reason": "",
+			"status":           "unknown",
+			"status_reason":    "",
 			"role":          role.String,
 			"managed":       managed,
 			"alertable":     alertable,
@@ -572,15 +572,12 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 
 		if liveStats != nil {
 			d["online"] = liveStats.Online
-			// Prefer live tri-state status over DB status
 			d["status"] = string(liveStats.Status)
-			if liveStats.StatusReason != "" {
-				d["status_reason"] = liveStats.StatusReason
-			} else {
-				// Clear stale DB reasons when device is currently healthy
-				if liveStats.Online {
-					d["status_reason"] = ""
-				}
+			d["db_status"] = string(liveStats.Status)
+			d["status_reason"] = liveStats.StatusReason
+			d["db_status_reason"] = liveStats.StatusReason
+			if !liveStats.LastSeen.IsZero() {
+				d["last_seen"] = liveStats.LastSeen
 			}
 			d["uptime"] = liveStats.Uptime
 			d["peer_count"] = liveStats.PeerCount
@@ -639,9 +636,6 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 			if liveStats.Config != nil {
 				d["config"] = liveStats.Config
 			}
-		} else {
-			// No live stats - set online based on db_status for consistent client-side checking
-			d["online"] = dbStatus.String == "online"
 		}
 		devices = append(devices, d)
 	}
@@ -1118,7 +1112,6 @@ func (a *API) upsertDiscoveredDevice(device *DeviceInfo, ip, username, password 
 				site_id = COALESCE($11, devices.site_id),
 				managed = TRUE,
 				alertable = TRUE,
-				status = 'online',
 				last_seen = NOW(),
 				username = $12,
 				password = $13
@@ -1130,8 +1123,8 @@ func (a *API) upsertDiscoveredDevice(device *DeviceInfo, ip, username, password 
 		}
 	case selErr == sql.ErrNoRows:
 		err := a.DB.QueryRow(`
-			INSERT INTO devices (mac, ip_address, hostname, product, model, platform, flavor, firmware, firmware_version, site_id, managed, alertable, status, last_seen, username, password)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, TRUE, 'online', NOW(), $11, $12)
+			INSERT INTO devices (mac, ip_address, hostname, product, model, platform, flavor, firmware, firmware_version, site_id, managed, alertable, last_seen, username, password)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, TRUE, NOW(), $11, $12)
 			RETURNING id
 		`, mac, ip, hostname, product, model, platform, flavor, firmware, firmwareVersion, siteID, username, storedPassword).Scan(&id)
 		if err != nil {
@@ -1404,7 +1397,7 @@ func (a *API) loadCredentials() (apCreds, staCreds []Credential) {
 
 func (a *API) GetDevice(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	var mac, ipAddr, hostname, product, model, platform, flavor, fw, fwVer, parentMAC, dbStatus, dbStatusReason sql.NullString
+	var mac, ipAddr, hostname, product, model, platform, flavor, fw, fwVer, parentMAC sql.NullString
 	var managed, alertable bool
 	var alertSilencedUntil sql.NullTime
 	var alertNotes sql.NullString
@@ -1418,18 +1411,18 @@ func (a *API) GetDevice(w http.ResponseWriter, r *http.Request) {
 	var lastSeen sql.NullTime
 	err := a.DB.QueryRow(`SELECT mac, host(ip_address), hostname, product, model, platform, flavor, firmware, firmware_version,
 		managed, alertable, alert_silenced_until, alert_notes,
-		parent_id, parent_mac, status, status_reason, last_seen,
+		parent_id, parent_mac, last_seen,
 		antenna_model, antenna_override, antenna_azimuth_deg, antenna_downtilt_deg, antenna_electrical_downtilt_deg, antenna_beamwidth_h_deg, antenna_beamwidth_v_deg,
 		radius_m, tech, down_mbps, up_mbps, latency_ms, bizres
 		FROM devices WHERE id = $1`, id).
-		Scan(&mac, &ipAddr, &hostname, &product, &model, &platform, &flavor, &fw, &fwVer, &managed, &alertable, &alertSilencedUntil, &alertNotes, &parentID, &parentMAC, &dbStatus, &dbStatusReason, &lastSeen,
+		Scan(&mac, &ipAddr, &hostname, &product, &model, &platform, &flavor, &fw, &fwVer, &managed, &alertable, &alertSilencedUntil, &alertNotes, &parentID, &parentMAC, &lastSeen,
 			&antennaModel, &antennaOverride, &antennaAzimuthDeg, &antennaDowntiltDeg, &antennaElectricalDowntiltDeg, &antennaBeamH, &antennaBeamV,
 			&radiusM, &tech, &downMbps, &upMbps, &latencyMS, &bizres)
 	if err == sql.ErrNoRows {
 		http.Error(w, "not found", 404)
 		return
 	}
-	d := map[string]any{"id": id, "mac": mac.String, "ip_address": ipAddr.String, "hostname": hostname.String, "product": product.String, "model": model.String, "platform": platform.String, "flavor": flavor.String, "firmware": fw.String, "firmware_version": fwVer.String, "db_status": dbStatus.String, "db_status_reason": dbStatusReason.String, "status": dbStatus.String, "status_reason": dbStatusReason.String, "managed": managed, "alertable": alertable, "alert_notes": alertNotes.String}
+	d := map[string]any{"id": id, "mac": mac.String, "ip_address": ipAddr.String, "hostname": hostname.String, "product": product.String, "model": model.String, "platform": platform.String, "flavor": flavor.String, "firmware": fw.String, "firmware_version": fwVer.String, "db_status": "unknown", "db_status_reason": "", "status": "unknown", "status_reason": "", "managed": managed, "alertable": alertable, "alert_notes": alertNotes.String}
 
 	// Optional antenna modeling fields
 	d["antenna_model"] = antennaModel.String
@@ -1494,6 +1487,14 @@ func (a *API) GetDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	if liveStats != nil {
 		d["live_stats"] = liveStats
+		d["online"] = liveStats.Online
+		d["status"] = string(liveStats.Status)
+		d["db_status"] = string(liveStats.Status)
+		d["status_reason"] = liveStats.StatusReason
+		d["db_status_reason"] = liveStats.StatusReason
+		if !liveStats.LastSeen.IsZero() {
+			d["last_seen"] = liveStats.LastSeen
+		}
 	}
 	a.attachIdentityMismatch(d, id)
 	writeJSON(w, d)
@@ -6092,13 +6093,14 @@ func (a *API) DryRunOperation(w http.ResponseWriter, r *http.Request) {
 			Compatible: true,
 		}
 
-		// Get device info from database
-		var ip, hostname, product, firmware, flavor, status string
+		// Get durable inventory only. Runtime eligibility comes exclusively
+		// from the in-memory stats store.
+		var ip, mac, hostname, product, firmware, flavor string
 		err := a.DB.QueryRow(`
-			SELECT host(ip_address), COALESCE(hostname, ''), COALESCE(product, ''), 
-			       COALESCE(firmware, ''), COALESCE(flavor, ''), COALESCE(status, 'unknown')
+			SELECT host(ip_address), lower(mac), COALESCE(hostname, ''), COALESCE(product, ''),
+			       COALESCE(firmware, ''), COALESCE(flavor, '')
 			FROM devices WHERE id = $1
-		`, deviceID).Scan(&ip, &hostname, &product, &firmware, &flavor, &status)
+		`, deviceID).Scan(&ip, &mac, &hostname, &product, &firmware, &flavor)
 
 		if err != nil {
 			result.Compatible = false
@@ -6112,15 +6114,13 @@ func (a *API) DryRunOperation(w http.ResponseWriter, r *http.Request) {
 		result.CurrentVer = firmware
 		result.Flavor = flavor
 
-		// Check device is online using stats store (real-time) or database status (fallback)
-		online := false
-		if stats := a.Stats.Get(ip); stats != nil {
-			online = stats.Online
-		} else {
-			online = status == "online"
-		}
-
-		if !online {
+		// No live sample means the device is not eligible yet; never revive
+		// stale status from the inventory row after a restart.
+		live := a.Stats.GetByMAC(mac)
+		if live == nil {
+			result.Compatible = false
+			result.Issues = append(result.Issues, "Device has no live status")
+		} else if !live.Online {
 			result.Compatible = false
 			result.Issues = append(result.Issues, "Device is offline")
 		}

@@ -982,6 +982,13 @@ func (s *Store) BindIdentityByMAC(mac, ip string, deviceID, siteID int) {
 }
 
 func (s *Store) SetStatusByMAC(mac, ip string, status DeviceStatus, reason, errMsg string, markSeen bool) bool {
+	leftOnline, _ := s.SetStatusByMACChanged(mac, ip, status, reason, errMsg, markSeen)
+	return leftOnline
+}
+
+// SetStatusByMACChanged updates live status and reports both whether the device
+// left online state and whether the externally visible status/reason changed.
+func (s *Store) SetStatusByMACChanged(mac, ip string, status DeviceStatus, reason, errMsg string, markSeen bool) (bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1003,11 +1010,12 @@ func (s *Store) SetStatusByMAC(mac, ip string, status DeviceStatus, reason, errM
 		}
 	}
 	if key == "" {
-		return false
+		return false, false
 	}
 
 	ds, ok := s.devices[key]
-	if !ok || ds == nil {
+	created := !ok || ds == nil
+	if created {
 		ds = &DeviceStats{}
 		s.devices[key] = ds
 	}
@@ -1046,6 +1054,9 @@ func (s *Store) SetStatusByMAC(mac, ip string, status DeviceStatus, reason, errM
 		}
 	}
 
+	prevReason := ds.StatusReason
+	changed := created || prevStatus != status || prevReason != reason
+
 	ds.Status = status
 	ds.DBStatus = string(ds.Status)
 	ds.StatusReason = reason
@@ -1059,7 +1070,7 @@ func (s *Store) SetStatusByMAC(mac, ip string, status DeviceStatus, reason, errM
 		ds.LastSeen = time.Now()
 	}
 
-	return prevStatus == StatusOnline && status != StatusOnline
+	return prevStatus == StatusOnline && status != StatusOnline, changed
 }
 
 // SetStatus sets a device's status using an IP address (legacy helper).
@@ -1382,20 +1393,6 @@ func (s *Store) LastSeenBatch() map[string]time.Time {
 	for _, stats := range s.devices {
 		if stats.MAC != "" {
 			result[stats.MAC] = stats.LastSeen
-		}
-	}
-	return result
-}
-
-// OnlineStatusBatch returns MAC -> Online for all devices (for DB sync)
-func (s *Store) OnlineStatusBatch() map[string]bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	result := make(map[string]bool, len(s.devices))
-	for _, stats := range s.devices {
-		if stats.MAC != "" {
-			result[stats.MAC] = stats.Online
 		}
 	}
 	return result

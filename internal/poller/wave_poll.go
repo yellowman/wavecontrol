@@ -56,7 +56,6 @@ func (p *Poller) pollDeviceWave(job pollJob) pollResult {
 				if leftOnline {
 					p.updateChildrenStatus(job.DeviceID, "unknown")
 				}
-				dbExecIgnoreCtx(p.db, dbCtxForJob(job, "wave_mark_unknown_auth"), `UPDATE devices SET status = 'unknown', status_reason = $2, last_seen = NOW() WHERE id = $1`, job.DeviceID, reason)
 				return pollFailed
 			}
 		}
@@ -81,7 +80,6 @@ func (p *Poller) pollDeviceWave(job pollJob) pollResult {
 		if leftOnline {
 			p.updateChildrenStatus(job.DeviceID, "unknown")
 		}
-		dbExecIgnoreCtx(p.db, dbCtxForJob(job, "wave_mark_unknown_stats_failed"), `UPDATE devices SET status = 'unknown', status_reason = $2, last_seen = NOW() WHERE id = $1`, job.DeviceID, "stats_failed")
 		return pollFailed // We authenticated, so it's a Wave device, but stats failed
 	}
 
@@ -380,17 +378,10 @@ func (p *Poller) pollDeviceWave(job pollJob) pollResult {
 	// Only write to DB on state transition or hostname change (not every poll)
 	if becameOnline {
 		p.clearIdentityMismatch(job.DeviceID)
-		// Device came online - update status in DB
-		if hostnameChanged {
-			dbExecIgnoreCtx(p.db, dbCtxForJob(job, "wave_mark_online"), `UPDATE devices SET status = 'online', status_reason = NULL, last_seen = NOW(), hostname = $2 WHERE id = $1`, job.DeviceID, deviceStats.Hostname)
-		} else {
-			dbExecIgnoreCtx(p.db, dbCtxForJob(job, "wave_mark_online"), `UPDATE devices SET status = 'online', status_reason = NULL, last_seen = NOW() WHERE id = $1`, job.DeviceID)
-		}
-	} else if hostnameChanged {
-		// Already online but hostname changed
-		dbExecIgnoreCtx(p.db, dbCtxForJob(job, "wave_update_hostname"), `UPDATE devices SET hostname = $2 WHERE id = $1`, job.DeviceID, deviceStats.Hostname)
 	}
-	// If already online and nothing changed, no DB write needed
+	if hostnameChanged {
+		dbExecIgnoreCtx(p.db, dbCtxForJob(job, "wave_update_hostname"), `UPDATE devices SET hostname = $2 WHERE id = $1 AND hostname IS DISTINCT FROM $2`, job.DeviceID, deviceStats.Hostname)
+	}
 
 	// Check if static info changed (firmware, additional hostname sources)
 	p.checkStaticInfo(client, baseURL, token, job.DeviceID, job.MAC)
