@@ -475,11 +475,11 @@ func (a *API) ListDevices(w http.ResponseWriter, r *http.Request) {
 			"db_status_reason": "",
 			"status":           "unknown",
 			"status_reason":    "",
-			"role":          role.String,
-			"managed":       managed,
-			"alertable":     alertable,
-			"alert_notes":   alertNotes.String,
-			"ssid":          ssid.String}
+			"role":             role.String,
+			"managed":          managed,
+			"alertable":        alertable,
+			"alert_notes":      alertNotes.String,
+			"ssid":             ssid.String}
 		if parentID.Valid {
 			d["parent_id"] = parentID.Int64
 		} else {

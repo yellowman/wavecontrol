@@ -60,7 +60,6 @@ func TestBindIdentityByMACCanClearSiteIdentity(t *testing.T) {
 	}
 }
 
-
 func TestSetStatusByMACChangedReportsVisibleStateChanges(t *testing.T) {
 	store := NewStore()
 	const mac = "28:70:4e:e1:e8:b5"
